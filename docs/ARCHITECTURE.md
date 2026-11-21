@@ -27,6 +27,7 @@ flowchart TD
     subgraph Plugins["业务子插件 nativePC/plugins/mhw_rng/*.dll"]
         Insp["rng_inspector.dll (静态调用点词典 / 统计导出 / 通用注入)"]
         Size["rng_size.dll (怪物体型换算 / 按MonsterID分流)"]
+        Endemic["rng_endemic.dll (环境生物大小金档位与档内尺寸控制)"]
         Custom["第三方扩展插件"]
     end
 
@@ -49,6 +50,7 @@ flowchart TD
 | 插件 SDK 头文件 | *(仅编译期依赖，无需链接 `.lib`)* | [mhw_rng_api.h](../include/mhw_rng_api.h) | C ABI 数据结构、`MhwRngHostApi` 函数指针表与导出约定 |
 | 官方插件：`inspector` | `nativePC\plugins\mhw_rng\rng_inspector.dll` | [inspector_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-inspector/blob/main/inspector_plugin.cpp) | 详见《`rng_inspector` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-inspector/blob/main/README.md)) |
 | 官方插件：`size` | `nativePC\plugins\mhw_rng\rng_size.dll` | [size_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-size/blob/main/size_plugin.cpp) | 详见《`rng_size` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-size/blob/main/README.md)) |
+| 官方插件：`endemic` | `nativePC\plugins\mhw_rng\rng_endemic.dll` | [endemic_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-endemic/blob/main/endemic_plugin.cpp) | 详见《`rng_endemic` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-endemic/blob/main/README.md)) |
 
 ---
 
@@ -273,5 +275,5 @@ cl.exe /nologo /std:c++17 /O2 /EHsc /MT /utf-8 /I "include" rng_meal.cpp /LD /Fe
 - `$rng rawfix` / `rawseed` / `rawbypass` / `rawclear`：在不加载任何插件的情况下直接按数值 RVA 操作指定槽位。
 
 ### 2. 构建与脱机回归测试
-- 运行 [build.bat](../build.bat)：使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll` 与 `build\mhw_rng\rng_size.dll`。
-- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 Hook，验证 8 线程并发流隔离、`Epoch` 重置、复合条件槽分流、真实 `cSizeTable::getSizeMultiplier` 机器码下的按怪体型分流与零权重行跳过、以及影拷贝热重载时源 DLL 的可写状态。
+- 运行 [build.bat](../build.bat)：使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll` 与 `build\mhw_rng\rng_endemic.dll`。
+- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 Hook，验证 8 线程并发流隔离、`Epoch` 重置、复合条件槽分流、真实 `cSizeTable::getSizeMultiplier` 机器码下的按怪体型分流与零权重行跳过、真实环境生物尺寸函数（`0x141669AC0` / `0x14166CCC0` / `0x140672F90`）下的大小金与共享调用方隔离、以及影拷贝热重载时源 DLL 的可写状态。

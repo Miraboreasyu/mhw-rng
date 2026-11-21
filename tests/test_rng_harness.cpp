@@ -7,7 +7,10 @@
 //   5. Verifies Bug #2 Fix: Restricted "Mew are Number One!" (`黄金奖杯`) `cSizeTable` where leading rows
 //      `88%..99%` have `weight = 0` — proves `$rng size min`, `$rng size 0`, `$rng fix size min`, and
 //      `$rng fix size 0` NEVER return illegal `88%` (`0.0f <= 0.0f`) and always land on `100%` (first legal row)!
-//   6. Verifies Zero-Lock Shadow-Copy Hot-Reload (`ReloadSingle` + `UnloadSingle`)!
+//   6. Verifies Official Plugin #3 (`rng_endemic.dll`): Real MHW 15.23 `0x141669AC0 -> 0x14166CCC0`
+//      crown tier + intra-tier interpolation, per-species `ec059` / `ec059_02` / `ec051_00` routing,
+//      live `rAnimalSize` `exact` scale/cm solver, and shared `0x140672F90` non-endemic caller isolation!
+//   7. Verifies Zero-Lock Shadow-Copy Hot-Reload (`ReloadSingle` + `UnloadSingle`)!
 #ifndef MHW_RNG_EXPORTS
 #define MHW_RNG_EXPORTS
 #endif
@@ -33,6 +36,8 @@ using TestNrandFn  = std::uint32_t(__fastcall*)(std::uint32_t*);
 using TestSphereFn = float*(__fastcall*)(std::uint32_t*, float*);
 // Executes `fn_r9(holder_rcx, tblIdx_rdx)` with non-volatile `RBX = monster_r8`, reproducing `FUN_141ccfb70`!
 using CallWithMonsterRbxFn = std::uint32_t(__fastcall*)(void* holder, std::uint32_t* tblIdxPtr, void* monster, void* targetFn);
+using EndemicCaptureRollFn = std::uint32_t(__fastcall*)(std::int32_t animalId, std::int32_t animalType, float* outScale);
+using SharedFloatRangeFn   = float(__fastcall*)(float minVal, float maxVal);
 
 volatile std::uint32_t g_antiTailCallSink = 0;
 std::vector<std::string> g_capturedChatLines;
@@ -104,8 +109,16 @@ int main(int argc, char** argv) {
     const auto base = reinterpret_cast<std::uintptr_t>(img);
     const auto end  = base + kImageSize;
 
-    // Populate `.rdata` float constant `0x142F173C4` = `100.0f / 2^32` used by `cSizeTable::getSizeMultiplier`
+    // Populate `.rdata` float constants used by `cSizeTable::getSizeMultiplier`,
+    // `FUN_14166ccc0`, `0x141669AC0`, and `FUN_140672f90`:
     *reinterpret_cast<float*>(base + 0x2F173C4U) = 100.0f / 4294967296.0f;
+    *reinterpret_cast<float*>(base + 0x2F12798U) = 1.0f / 4294967296.0f;
+    *reinterpret_cast<float*>(base + 0x2E4FE48U) = 1.192092896e-7f; // FLT_EPSILON
+    *reinterpret_cast<float*>(base + 0x2E4FE58U) = 1.0f;            // __0f
+    *reinterpret_cast<float*>(base + 0x2F127C4U) = 1000.0f;
+    *reinterpret_cast<float*>(base + 0x2F17850U) = -1000.0f;
+    *reinterpret_cast<float*>(base + 0x2F0F354U) = 0.01f;
+    *reinterpret_cast<float*>(base + 0x2F16EC4U) = 100.0f;
 
     // Emit 15-byte x64 ABI thunk reproducing `FUN_141ccfb70` (`RBX = Monster*` -> `call FUN_140f5f760`):
     //   53             push rbx
@@ -198,16 +211,16 @@ int main(int argc, char** argv) {
     }
     std::printf("[OK] 8-thread stream isolation & O(1) Epoch rewind verified!\n");
 
-    // 2. Load Official Plugins (`rng_inspector.dll` + `rng_size.dll`) via Shadow-Copy Host
+    // 2. Load Official Plugins (`rng_inspector.dll` + `rng_size.dll` + `rng_endemic.dll`) via Shadow-Copy Host
     const std::string plugDir = buildDir + "\\mhw_rng";
 
     plugin_host::Init(base, end, plugDir, &CaptureChatSink);
     const std::size_t loadedCnt = plugin_host::LoadAllFromDirectory();
-    if (loadedCnt < 2U) {
-        std::printf("FAIL: Expected >= 2 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
+    if (loadedCnt < 3U) {
+        std::printf("FAIL: Expected >= 3 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
         return 1;
     }
-    std::printf("[OK] Shadow-copy loaded %zu official plugins (`inspector` + `size`)!\n", loadedCnt);
+    std::printf("[OK] Shadow-copy loaded %zu official plugins (`inspector` + `size` + `endemic`)!\n", loadedCnt);
 
     // 3. Build TWO real-world 38-row `cSizeTable`s:
     //    - Table 0 (`fullCrownTbl`): Standard Crown table (`88% .. 125%`, all 38 rows have `weight > 0`)
@@ -312,7 +325,120 @@ int main(int argc, char** argv) {
     plugin_host::DispatchPluginSubcommand("size", {"history"}, "history");
     std::printf("[OK] Wildcard `rajang* exact 116` matched both #91 (%u%%) & #92 (%u%%)!\n", exR1, exR2);
 
-    // 7. Verify Zero-Lock Shadow-Copy Hot-Reload + Inspector `dump` / `top` + Hot-Unload!
+    // 7. Verify Official Plugin #3 (`rng_endemic.dll`) on Real MHW 15.23 Endemic Size Machine Code:
+    //    `0x141669AC0 -> 0x14166CCC0 -> 0x142174E30` + `0x140672F90` shared-caller isolation!
+    alignas(16) static std::uint8_t synPlayer[0xB000]{};
+    alignas(16) static std::uint8_t synFoodSkills[0x1000]{};
+    alignas(16) static std::uint8_t synAnimalMgr[0xC00]{};
+    *reinterpret_cast<void**>(synPlayer + 0xAE40U) = synFoodSkills;
+    *reinterpret_cast<void**>(base + 0x500ECA0U)   = synPlayer;
+    *reinterpret_cast<void**>(base + 0x5012938U)   = synAnimalMgr;
+
+    struct SyntheticAnimalRow {
+        std::uint8_t raw[0x60]{};
+        void Init(std::int32_t id, std::int32_t tp, float baseCm,
+                  std::int32_t probMode, std::int32_t sizeMode,
+                  float minS, float maxS,
+                  float rSmallHi, float rNormLo, float rNormHi, float rLargeLo,
+                  float smallProb, float largeProb) {
+            *reinterpret_cast<std::int32_t*>(raw + 0x08U) = id;
+            *reinterpret_cast<std::int32_t*>(raw + 0x0CU) = tp;
+            *reinterpret_cast<float*>(raw + 0x24U)        = baseCm;
+            *reinterpret_cast<std::int32_t*>(raw + 0x28U) = probMode;
+            *reinterpret_cast<std::int32_t*>(raw + 0x2CU) = sizeMode;
+            *reinterpret_cast<float*>(raw + 0x30U)        = minS;
+            *reinterpret_cast<float*>(raw + 0x34U)        = maxS;
+            *reinterpret_cast<float*>(raw + 0x38U)        = rSmallHi;
+            *reinterpret_cast<float*>(raw + 0x3CU)        = rNormLo;
+            *reinterpret_cast<float*>(raw + 0x40U)        = rNormHi;
+            *reinterpret_cast<float*>(raw + 0x44U)        = rLargeLo;
+            *reinterpret_cast<float*>(raw + 0x48U)        = smallProb;
+            *reinterpret_cast<float*>(raw + 0x4CU)        = largeProb;
+        }
+    };
+    alignas(16) static SyntheticAnimalRow animalRows[4]{};
+    // Range 0.80..1.25 (span=0.45): Mini=[0.80, 0.90], Normal=[0.91, 1.14], Giant=[1.15, 1.25]
+    animalRows[0].Init(0,  0, 20.0f, 1, 1, 0.80f, 1.25f, 0.222222f, 0.244444f, 0.755556f, 0.777778f, 0.03f, 0.03f);
+    animalRows[1].Init(59, 0, 20.0f, 1, 1, 0.80f, 1.25f, 0.222222f, 0.244444f, 0.755556f, 0.777778f, 0.03f, 0.03f);
+    animalRows[2].Init(59, 2, 20.0f, 1, 1, 0.80f, 1.25f, 0.222222f, 0.244444f, 0.755556f, 0.777778f, 0.03f, 0.03f);
+    animalRows[3].Init(51, 0, 20.0f, 1, 1, 0.80f, 1.25f, 0.222222f, 0.244444f, 0.755556f, 0.777778f, 0.03f, 0.03f);
+
+    void* animalRowPtrs[4] = { &animalRows[0], &animalRows[1], &animalRows[2], &animalRows[3] };
+    alignas(16) static std::uint8_t synAnimalSize[0x100]{};
+    *reinterpret_cast<std::uint32_t*>(synAnimalSize + 0xB8U) = 4U;
+    *reinterpret_cast<void***>(synAnimalSize + 0xC8U)        = animalRowPtrs;
+    *reinterpret_cast<void**>(base + 0x5012740U)             = synAnimalSize;
+
+    const auto fnEndemicCapture = reinterpret_cast<EndemicCaptureRollFn>(base + 0x1669AC0U);
+    const auto fnSharedRange    = reinterpret_cast<SharedFloatRangeFn>(base + 0x0672F90U);
+
+    // 7a. Global Mini / Giant / Normal crown locks
+    float outScale = 0.0f;
+    plugin_host::DispatchPluginSubcommand("endemic", {"mini"}, "mini");
+    const std::uint32_t crMini = fnEndemicCapture(59, 0, &outScale);
+    if (crMini != 2U || std::fabs(outScale - 0.80f) > 0.015f) {
+        std::printf("FAIL [endemic mini]: expected crown=2 scale=0.80, got crown=%u scale=%.3f\n", crMini, outScale);
+        return 1;
+    }
+
+    plugin_host::DispatchPluginSubcommand("endemic", {"giant"}, "giant");
+    const std::uint32_t crGiant = fnEndemicCapture(59, 0, &outScale);
+    if (crGiant != 1U || std::fabs(outScale - 1.25f) > 0.015f) {
+        std::printf("FAIL [endemic giant]: expected crown=1 scale=1.25, got crown=%u scale=%.3f\n", crGiant, outScale);
+        return 1;
+    }
+
+    // 7b. Verify shared `FUN_140672f90` non-endemic caller guard while `$rng endemic giant` is active!
+    const float nonEndemicVal = fnSharedRange(10.0f, 20.0f);
+    if (nonEndemicVal <= 10.01f || nonEndemicVal >= 19.99f) {
+        std::printf("FAIL [endemic guard]: non-endemic caller of 0x140672F90 was skewed to %.4f!\n", nonEndemicVal);
+        return 1;
+    }
+
+    plugin_host::DispatchPluginSubcommand("endemic", {"normal"}, "normal");
+    const std::uint32_t crNorm = fnEndemicCapture(59, 0, &outScale);
+    if (crNorm != 0U || outScale < 0.90f || outScale > 1.15f) {
+        std::printf("FAIL [endemic normal]: expected crown=0 scale in [0.91,1.14], got crown=%u scale=%.3f\n", crNorm, outScale);
+        return 1;
+    }
+
+    // 7c. Per-species conditional routing (`ec059` family = giant, `ec059_02` override = mini, `ec051_00` unlocked)
+    plugin_host::DispatchPluginSubcommand("endemic", {"clear"}, "clear");
+    plugin_host::DispatchPluginSubcommand("endemic", {"ec059", "giant"}, "ec059 giant");
+    plugin_host::DispatchPluginSubcommand("endemic", {"ec059_02", "mini"}, "ec059_02 mini");
+
+    float sc59_00 = 0.0f, sc59_02 = 0.0f, sc51_00 = 0.0f;
+    const std::uint32_t c59_00 = fnEndemicCapture(59, 0, &sc59_00);
+    const std::uint32_t c59_02 = fnEndemicCapture(59, 2, &sc59_02);
+    const std::uint32_t c51_00 = fnEndemicCapture(51, 0, &sc51_00);
+    if (c59_00 != 1U || std::fabs(sc59_00 - 1.25f) > 0.015f ||
+        c59_02 != 2U || std::fabs(sc59_02 - 0.80f) > 0.015f ||
+        c51_00 != 0U) {
+        std::printf("FAIL [endemic species]: ec059_00=(%u,%.2f) ec059_02=(%u,%.2f) ec051_00=(%u,%.2f)\n",
+                    c59_00, sc59_00, c59_02, sc59_02, c51_00, sc51_00);
+        return 1;
+    }
+
+    // 7d. Live `rAnimalSize` exact scale (`1.20x`) and exact cm (`23.6cm` on 20cm base -> `1.18x`)
+    plugin_host::DispatchPluginSubcommand("endemic", {"clear"}, "clear");
+    plugin_host::DispatchPluginSubcommand("endemic", {"exact", "1.20x"}, "exact 1.20x");
+    const std::uint32_t cExScale = fnEndemicCapture(59, 0, &outScale);
+    if (cExScale != 1U || std::fabs(outScale - 1.20f) > 0.015f) {
+        std::printf("FAIL [endemic exact 1.20x]: got crown=%u scale=%.3f\n", cExScale, outScale);
+        return 1;
+    }
+    plugin_host::DispatchPluginSubcommand("endemic", {"exact", "23.6cm"}, "exact 23.6cm");
+    const std::uint32_t cExCm = fnEndemicCapture(59, 0, &outScale);
+    if (cExCm != 1U || std::fabs(outScale - 1.18f) > 0.015f) {
+        std::printf("FAIL [endemic exact 23.6cm]: got crown=%u scale=%.3f\n", cExCm, outScale);
+        return 1;
+    }
+    plugin_host::DispatchPluginSubcommand("endemic", {"history"}, "history");
+    plugin_host::DispatchPluginSubcommand("endemic", {"clear"}, "clear");
+    std::printf("[OK] Endemic Life plugin verified on real 0x141669AC0/0x14166CCC0/0x140672F90 machine code (guard=%.3f)!\n",
+                nonEndemicVal);
+
+    // 8. Verify Zero-Lock Shadow-Copy Hot-Reload + Inspector `dump` / `top` + Hot-Unload!
     const std::string srcSizeDll = plugDir + "\\rng_size.dll";
     HANDLE hWriteCheck = ::CreateFileA(srcSizeDll.c_str(), GENERIC_READ | GENERIC_WRITE,
                                        FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);

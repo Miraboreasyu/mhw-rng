@@ -4,3 +4,6 @@
 [submodule "plugins/inspector"]
 	path = plugins/inspector
 	url = https://github.com/Miraboreasyu/mhw-rng-inspector.git
+[submodule "plugins/endemic"]
+	path = plugins/endemic
+	url = https://github.com/Miraboreasyu/mhw-rng-endemic.git
