@@ -458,12 +458,15 @@ int main(int argc, char** argv) {
     {
         struct SynThkSegment {
             std::uint8_t raw[0x80]{};
-            void InitRandom(std::uint32_t ctrlKind, std::int32_t wt, std::int32_t targetFile, std::int32_t targetNode) {
+            void InitRandom(std::uint32_t ctrlKind, std::int32_t wt, std::int32_t targetFile, std::int32_t targetNode,
+                            const void* localTarget = nullptr) {
                 std::memset(raw, 0, sizeof(raw));
                 *reinterpret_cast<std::uint32_t*>(raw + 0x00U) = ctrlKind;
                 *reinterpret_cast<std::int32_t*>(raw + 0x0CU)  = wt;
                 *reinterpret_cast<std::int32_t*>(raw + 0x28U)  = targetFile;
                 *reinterpret_cast<std::int32_t*>(raw + 0x2CU)  = targetNode;
+                *reinterpret_cast<std::uintptr_t*>(raw + 0x30U) =
+                    localTarget ? reinterpret_cast<std::uintptr_t>(localTarget) : static_cast<std::uintptr_t>(-1LL);
             }
             void InitEndSentinel(std::int32_t nodeArrIdx) {
                 std::memset(raw, 0, sizeof(raw));
@@ -658,6 +661,51 @@ int main(int argc, char** argv) {
             return 1;
         }
         plugin_host::DispatchPluginSubcommand("fatalis", {"far", "single"}, "far single");
+
+        // Verify 1-hop local wrapper resolution & Frame 0 return stack unwind (FatalisAdaptive instrumented THK):
+        alignas(16) static SynThkSegment wrap179[4]{}, wrap220[4]{}, wrap184[4]{}, wrap282[4]{};
+        alignas(16) static SynThkSegment node77Wrapped[64]{}, node81[4]{};
+        auto fillWrapper = [](SynThkSegment* w, std::int32_t targetNodeId, std::int32_t wrapArrIdx) {
+            w[0].InitRandom(0x00U, 0, -1, -1); // Telemetry marker
+            w[1].InitRandom(0x00U, 0, 55, targetNodeId);
+            w[2].InitRandom(0x800U, 0, -1, -1);
+            w[3].InitEndSentinel(wrapArrIdx);
+        };
+        fillWrapper(wrap179, 179, 2938);
+        fillWrapper(wrap220, 220, 2939);
+        fillWrapper(wrap184, 184, 2940);
+        fillWrapper(wrap282, 282, 2941);
+        node77Wrapped[1].InitRandom(0x40, 31, -1, -1, wrap179);
+        node77Wrapped[2].InitRandom(0xC0, 16, -1, -1, wrap220);
+        node77Wrapped[4].InitRandom(0xC0, 29, -1, -1, wrap184); // Target via 1-hop wrapper
+        node77Wrapped[5].InitRandom(0xC0, 7,  -1, -1, wrap282);
+        node77Wrapped[9].InitRandom(0x80, 17, 55, 274);
+        node77Wrapped[62].InitEndSentinel(77);
+        node81[0].InitEndSentinel(81);
+
+        if (runThkNode(true, 0, 0, -1, 1, node77Wrapped) != 4) {
+            std::printf("FAIL [fatalis]: 1-hop wrapper resolution in node77Wrapped expected seg 4 (55:184)!\n");
+            return 1;
+        }
+        *reinterpret_cast<std::int32_t*>(mgr + 0x340U)  = 2;
+        *reinterpret_cast<const void**>(mgr + 0x200U)   = node75;
+        if (runThkNode(true, 1, 55, 2881, 9, node55_87) != 10) {
+            std::printf("FAIL [fatalis]: Frame 0 return stack unwind from wrapper 2881 -> node 75 expected ENDR (seg 10)!\n");
+            return 1;
+        }
+        *reinterpret_cast<const void**>(mgr + 0x200U)   = node81;
+        bool sawWrappedP2Cone = false, sawWrappedP2NoCone = false;
+        for (int k = 0; k < 24; ++k) {
+            const std::int32_t s = runThkNode(true, 1, 55, 2881, 9, node55_87);
+            if (s == 9) sawWrappedP2Cone = true;
+            if (s == 10) sawWrappedP2NoCone = true;
+        }
+        *reinterpret_cast<std::int32_t*>(mgr + 0x340U)  = 0;
+        *reinterpret_cast<const void**>(mgr + 0x200U)   = nullptr;
+        if (!sawWrappedP2Cone || !sawWrappedP2NoCone) {
+            std::printf("FAIL [fatalis]: Wrapper unwind for Phase 2 node 81 should stay unmodified!\n");
+            return 1;
+        }
 
         // Phase 2 isolation on `55[87]` (caller=81) and `idx=46` (seg=3): MUST produce natural mix of outcomes!
         bool saw55Cone = false, saw55NoCone = false;
