@@ -14,16 +14,17 @@
 2. **官方业务插件（以 Git Submodule 挂载于 `plugins/`）**
    - **[`mhw-rng-size`](https://github.com/Miraboreasyu/mhw-rng-size)**（`plugins/size` $\rightarrow$ `rng_size.dll`）：挂载 `0x169BA15` 同步回调，通过读取栈帧 `Monster*` 支持冰原全 71 种大型怪物按 `MonsterID` 条件分流、开区间 `[0x00000001U, 0xFFFFFF00U]` 零权重非法行规避，以及读取实时 `cSizeTable` 反算目标体型百分比。
    - **[`mhw-rng-endemic`](https://github.com/Miraboreasyu/mhw-rng-endemic)**（`plugins/endemic` $\rightarrow$ `rng_endemic.dll`）：挂载 `0x166CFE1`、`0x0672FBC`（按调用栈过滤）与 `0x1669CB6` 三处同步回调，覆盖环境生物地图刷新与捕获抽签，支持大小金档位固定、档内比例调节、按 `ecXXX_YY` 物种分流以及实时查 `rAnimalSize` 反算精确倍率/厘米尺寸。
+   - **[`mhw-rng-fatalis`](https://github.com/Miraboreasyu/mhw-rng-fatalis)**（`plugins/fatalis` $\rightarrow$ `rng_fatalis.dll`）：仅挂载 `0x1339C8C`（`cThinkMgr::updateThk`）一处同步回调，只读解析黑龙（`MonsterID == 101`）THK 行为树栈帧与候选分枝表，通过纯 RNG 反算控制黑龙一阶段二足全距离段出招（禁止衍生扇火与二/三阶段隔离）。
    - **[`mhw-rng-inspector`](https://github.com/Miraboreasyu/mhw-rng-inspector)**（`plugins/inspector` $\rightarrow$ `rng_inspector.dll`）：提供 1,697 处静态调用点与 793 个外层函数区间的兜底词典，以及 `top`、`find`、`names`、`list`、`info`、`dump`、`fix`、`seq`、`slotseed`、`bypass`、`clear` 命令。
 
 ## 克隆与构建
 
 ```bash
-# 包含三个官方插件 submodule 一起克隆
+# 包含官方插件 submodule 一起克隆
 git clone --recursive https://github.com/Miraboreasyu/mhw-rng.git
 ```
 
-- 构建全部模块：执行 [`build.bat`](build.bat)，产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll` 与 `build\mhw_rng\rng_endemic.dll`。
+- 构建全部模块：执行 [`build.bat`](build.bat)，产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll` 与 `build\mhw_rng\rng_fatalis.dll`。
 - 运行脱机回归测试：执行 [`run_tests.bat`](run_tests.bat)（需要提供解壳后的 15.23 `.text` 段文件 `text_1523.bin`，可通过命令行参数或环境变量 `MHW_TEXT_BIN` 指定）。
 
 ## 技术文档导航
@@ -31,4 +32,5 @@ git clone --recursive https://github.com/Miraboreasyu/mhw-rng.git
 - 核心框架与插件 SDK 规范：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（头文件定义：[include/mhw_rng_api.h](include/mhw_rng_api.h)）
 - 官方插件 `rng_size` 技术文档：[plugins/size/README.md](plugins/size/README.md)（独立仓库：[Miraboreasyu/mhw-rng-size](https://github.com/Miraboreasyu/mhw-rng-size)）
 - 官方插件 `rng_endemic` 技术文档：[plugins/endemic/README.md](plugins/endemic/README.md)（独立仓库：[Miraboreasyu/mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic)）
+- 官方插件 `rng_fatalis` 技术文档：[plugins/fatalis/README.md](plugins/fatalis/README.md)（独立仓库：[Miraboreasyu/mhw-rng-fatalis](https://github.com/Miraboreasyu/mhw-rng-fatalis)）
 - 官方插件 `rng_inspector` 技术文档：[plugins/inspector/README.md](plugins/inspector/README.md)（独立仓库：[Miraboreasyu/mhw-rng-inspector](https://github.com/Miraboreasyu/mhw-rng-inspector)）

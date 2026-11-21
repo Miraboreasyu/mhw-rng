@@ -211,16 +211,16 @@ int main(int argc, char** argv) {
     }
     std::printf("[OK] 8-thread stream isolation & O(1) Epoch rewind verified!\n");
 
-    // 2. Load Official Plugins (`rng_inspector.dll` + `rng_size.dll` + `rng_endemic.dll`) via Shadow-Copy Host
+    // 2. Load Official Plugins (`rng_inspector.dll` + `rng_size.dll` + `rng_endemic.dll` + `rng_fatalis.dll`) via Shadow-Copy Host
     const std::string plugDir = buildDir + "\\mhw_rng";
 
     plugin_host::Init(base, end, plugDir, &CaptureChatSink);
     const std::size_t loadedCnt = plugin_host::LoadAllFromDirectory();
-    if (loadedCnt < 3U) {
-        std::printf("FAIL: Expected >= 3 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
+    if (loadedCnt < 4U) {
+        std::printf("FAIL: Expected >= 4 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
         return 1;
     }
-    std::printf("[OK] Shadow-copy loaded %zu official plugins (`inspector` + `size` + `endemic`)!\n", loadedCnt);
+    std::printf("[OK] Shadow-copy loaded %zu official plugins (`inspector` + `size` + `endemic` + `fatalis`)!\n", loadedCnt);
 
     // 3. Build TWO real-world 38-row `cSizeTable`s:
     //    - Table 0 (`fullCrownTbl`): Standard Crown table (`88% .. 125%`, all 38 rows have `weight > 0`)
@@ -438,7 +438,239 @@ int main(int argc, char** argv) {
     std::printf("[OK] Endemic Life plugin verified on real 0x141669AC0/0x14166CCC0/0x140672F90 machine code (guard=%.3f)!\n",
                 nonEndemicVal);
 
-    // 8. Verify Zero-Lock Shadow-Copy Hot-Reload + Inspector `dump` / `top` + Hot-Unload!
+    // 8. Verify Official Plugin #4 (`rng_fatalis.dll`) on Real MHW 15.23 `0x14133A850 -> cThinkMgr::updateThk (0x141339640)` Machine Code!
+    {
+        struct SynThkSegment {
+            std::uint8_t raw[0x80]{};
+            void InitRandom(std::uint32_t ctrlKind, std::int32_t wt, std::int32_t targetFile, std::int32_t targetNode) {
+                std::memset(raw, 0, sizeof(raw));
+                *reinterpret_cast<std::uint32_t*>(raw + 0x00U) = ctrlKind;
+                *reinterpret_cast<std::int32_t*>(raw + 0x0CU)  = wt;
+                *reinterpret_cast<std::int32_t*>(raw + 0x28U)  = targetFile;
+                *reinterpret_cast<std::int32_t*>(raw + 0x2CU)  = targetNode;
+            }
+            void InitEndSentinel(std::int32_t nodeArrIdx) {
+                std::memset(raw, 0, sizeof(raw));
+                *reinterpret_cast<std::uint32_t*>(raw + 0x00U) = 0x01U;
+                *reinterpret_cast<std::int32_t*>(raw + 0x24U)  = 10000 + nodeArrIdx;
+                *reinterpret_cast<std::int32_t*>(raw + 0x28U)  = -1;
+                *reinterpret_cast<std::int32_t*>(raw + 0x2CU)  = -1;
+            }
+        };
+
+        static const std::uint8_t* g_lastChosenSeg = nullptr;
+        auto preSegCapture = +[](const std::uint8_t* segPtr, std::uint8_t* mgrPtr, void*) -> std::uint8_t {
+            g_lastChosenSeg = segPtr;
+            *(mgrPtr + 0x560U) = 1U; // Causes `ProcessTHKSegment` to return `-4` cleanly!
+            return 1U;
+        };
+
+        alignas(16) static std::uint8_t synThinkEm[0x800]{};
+        alignas(16) static std::uint8_t monFatalis[0x12300]{};
+        std::memset(synThinkEm, 0, sizeof(synThinkEm));
+        std::memset(monFatalis, 0, sizeof(monFatalis));
+
+        *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 101U; // Fatalis (`em013`)
+        std::uint8_t* mgr = synThinkEm + 0x20U;
+        *reinterpret_cast<std::uintptr_t*>(synThinkEm + 0x00U) = base + 0x324F320U; // `cThinkEm::vft`
+        *reinterpret_cast<void**>(synThinkEm + 0x08U)          = monFatalis;
+        *reinterpret_cast<std::uintptr_t*>(mgr + 0x00U)        = base + 0x324F438U; // `cThinkMgr::vft`
+        *reinterpret_cast<void**>(mgr + 0x508U)                = monFatalis;
+        *reinterpret_cast<void**>(mgr + 0x510U) = reinterpret_cast<void*>(preSegCapture);
+
+        using ThkPrefetchTickFn = std::uint8_t(__fastcall*)(void* mgrPtr);
+        const auto fnThkTick = reinterpret_cast<ThkPrefetchTickFn>(base + 0x133A850U);
+
+        auto runThkNode = [&](std::uint32_t depth,
+                              std::int32_t thkFileIdx,
+                              std::int32_t callerNodeArrIdx,
+                              std::int32_t initialSegIdx,
+                              const SynThkSegment* nodeSegs) -> std::int32_t {
+            *(mgr + 0x38U)  = 0U;
+            *(mgr + 0x580U) = 0U;
+            *reinterpret_cast<std::uint32_t*>(mgr + 0x4F8U) = depth;
+            if (depth == 1U) {
+                *reinterpret_cast<std::int32_t*>(mgr + 0x364U) = callerNodeArrIdx;
+            }
+            std::uint8_t* frameBase = mgr + static_cast<std::uintptr_t>(depth) * 0x180U;
+            *reinterpret_cast<const void**>(frameBase + 0x350U)  = nodeSegs;
+            *reinterpret_cast<std::int32_t*>(frameBase + 0x358U) = initialSegIdx;
+            *reinterpret_cast<std::int32_t*>(frameBase + 0x35CU) = thkFileIdx;
+            g_lastChosenSeg = nullptr;
+            fnThkTick(mgr);
+            if (!g_lastChosenSeg) return -1;
+            const auto byteDiff = g_lastChosenSeg - reinterpret_cast<const std::uint8_t*>(nodeSegs);
+            return static_cast<std::int32_t>(byteDiff / 0x80);
+        };
+
+        // Construct authentic vanilla segment tables matching `em013_00.thk` & `em013_55.thk`
+        alignas(16) static SynThkSegment node75[64]{};
+        alignas(16) static SynThkSegment node76[64]{};
+        alignas(16) static SynThkSegment node77[64]{};
+        alignas(16) static SynThkSegment node78[64]{};
+        alignas(16) static SynThkSegment node79[8]{};
+        alignas(16) static SynThkSegment node18[28]{};
+        alignas(16) static SynThkSegment node14[70]{};
+        alignas(16) static SynThkSegment node46[78]{};
+        alignas(16) static SynThkSegment node55_87[18]{};
+
+        // Node 75 & 76 (<900): two sectors tested (seg 1 and seg 36), target 55:297 at +4 from start
+        auto fillCloseNode = [](SynThkSegment* arr, std::int32_t arrIdx) {
+            // Sector 0 (seg 1..9)
+            arr[1].InitRandom(0x40, 30, 55, 172);
+            arr[2].InitRandom(0xC0, 15, 55, 298);
+            arr[3].InitRandom(0xC0, 0,  55, 286);
+            arr[4].InitRandom(0xC0, 25, 55, 185);
+            arr[5].InitRandom(0xC0, 10, 55, 297); // Target: 孕吐
+            arr[8].InitRandom(0x80, 20, 55, 274);
+            // Sector 3 (seg 36..44)
+            arr[36].InitRandom(0x40, 20, 55, 172);
+            arr[37].InitRandom(0xC0, 15, 55, 298);
+            arr[39].InitRandom(0xC0, 15, 55, 185);
+            arr[40].InitRandom(0xC0, 10, 55, 297); // Target: 孕吐
+            arr[42].InitRandom(0xC0, 30, 55, 175);
+            arr[44].InitRandom(0x80, 10, 55, 274);
+            arr[62].InitEndSentinel(arrIdx);
+        };
+        fillCloseNode(node75, 75);
+        fillCloseNode(node76, 76);
+
+        // Node 77 (900..2000): front(seg 1..9 -> 55:184 at 4, 55:282 cone at 5), back(seg 13..22 -> 55:175 at 20), side(seg 26..34 & 50..57 -> 55:188 at 29 / 53)
+        node77[1].InitRandom(0x40, 23, 55, 179);
+        node77[2].InitRandom(0xC0, 17, 55, 220);
+        node77[4].InitRandom(0xC0, 25, 55, 184); // Front target (NO cone)
+        node77[5].InitRandom(0xC0, 10, 55, 282);
+        node77[7].InitRandom(0xC0, 20, 55, 193);
+        node77[9].InitRandom(0x80, 5,  55, 274);
+        node77[13].InitRandom(0x40, 20, 55, 179);
+        node77[14].InitRandom(0xC0, 15, 55, 220);
+        node77[16].InitRandom(0xC0, 20, 55, 184);
+        node77[20].InitRandom(0xC0, 25, 55, 175); // Back target (甩尾)
+        node77[22].InitRandom(0x80, 5,  55, 274);
+        node77[26].InitRandom(0x40, 20, 55, 179);
+        node77[27].InitRandom(0xC0, 15, 55, 220);
+        node77[29].InitRandom(0xC0, 20, 55, 188); // Side1 target (侧地毯)
+        node77[32].InitRandom(0xC0, 25, 55, 175);
+        node77[34].InitRandom(0x80, 5,  55, 274);
+        node77[50].InitRandom(0x40, 25, 55, 179);
+        node77[51].InitRandom(0xC0, 20, 55, 220);
+        node77[53].InitRandom(0xC0, 35, 55, 188); // Side2 target (侧地毯)
+        node77[55].InitRandom(0xC0, 15, 55, 193);
+        node77[57].InitRandom(0x80, 5,  55, 274);
+        node77[62].InitEndSentinel(77);
+
+        // Node 78 (2000..4500): front(seg 1..9 -> 55:184 at 4), side(seg 25..32 -> 55:188 at 28)
+        node78[1].InitRandom(0x40, 23, 55, 179);
+        node78[2].InitRandom(0xC0, 17, 55, 220);
+        node78[4].InitRandom(0xC0, 25, 55, 184); // Target (NO cone)
+        node78[5].InitRandom(0xC0, 10, 55, 282);
+        node78[7].InitRandom(0xC0, 20, 55, 193);
+        node78[9].InitRandom(0x80, 5,  55, 274);
+        node78[25].InitRandom(0x40, 25, 55, 179);
+        node78[26].InitRandom(0xC0, 20, 55, 220);
+        node78[28].InitRandom(0xC0, 35, 55, 188); // Side target
+        node78[30].InitRandom(0xC0, 15, 55, 193);
+        node78[32].InitRandom(0x80, 5,  55, 274);
+        node78[37].InitEndSentinel(78);
+
+        // Node 79 (>4500): seg 0 -> 55:179 (wt=35), seg 1 -> 55:220 (wt=30), seg 2 -> 55:215 (wt=35, ENDR=0x80)
+        node79[0].InitRandom(0x40, 35, 55, 179);
+        node79[1].InitRandom(0xC0, 30, 55, 220);
+        node79[2].InitRandom(0x80, 35, 55, 215);
+        node79[6].InitEndSentinel(79);
+
+        // Node 55[87] (under-breath follow-up): seg 9 RANDOM(35 -> LOC=88), seg 10 ENDR(65 -> no cone)
+        node55_87[9].InitRandom(0x40,  35, -1, -1);
+        node55_87[10].InitRandom(0x80, 65, -1, -1);
+        node55_87[16].InitEndSentinel(87);
+
+        // Node 18 (P1 15% extra charge): seg 7 RANDOM(15), seg 12 ENDR(85)
+        node18[7].InitRandom(0x40,  15, -1, -1);
+        node18[12].InitRandom(0x80, 85, -1, -1);
+        node18[26].InitEndSentinel(18);
+
+        // Node 14 (P1 stance switch): bipedal stay seg 22 RANDOM(10)/31 ENDR(90); L4 stand seg 49 RANDOM(10)/58 ENDR(90)
+        node14[22].InitRandom(0x40, 10, -1, -1);
+        node14[31].InitRandom(0x80, 90, -1, -1);
+        node14[49].InitRandom(0x40, 10, -1, -1);
+        node14[58].InitRandom(0x80, 90, -1, -1);
+        node14[69].InitEndSentinel(14);
+
+        // Node 46 (occluded): seg 3..7 = Phase 2 (must ignore), seg 53..56 = Phase 1 front (`55:184` at 55)
+        node46[3].InitRandom(0x40, 30, 55, 179);
+        node46[5].InitRandom(0xC0, 10, 55, 184);
+        node46[7].InitRandom(0x80, 60, 55, 270);
+        node46[53].InitRandom(0x40, 30, 55, 179);
+        node46[54].InitRandom(0xC0, 10, 55, 220);
+        node46[55].InitRandom(0xC0, 15, 55, 184);
+        node46[56].InitRandom(0x80, 45, 55, 215);
+        node46[76].InitEndSentinel(46);
+
+        plugin_host::DispatchPluginSubcommand("fatalis", {"on"}, "on");
+        if (runThkNode(0, 0, -1, 1,  node75) != 5  ||
+            runThkNode(0, 0, -1, 36, node76) != 40 ||
+            runThkNode(1, 55, 75, 9, node55_87) != 10 ||
+            runThkNode(0, 0, -1, 1,  node77) != 4  ||
+            runThkNode(0, 0, -1, 13, node77) != 20 ||
+            runThkNode(0, 0, -1, 26, node77) != 29 ||
+            runThkNode(0, 0, -1, 50, node77) != 53 ||
+            runThkNode(0, 0, -1, 1,  node78) != 4  ||
+            runThkNode(0, 0, -1, 25, node78) != 28 ||
+            runThkNode(0, 0, -1, 0,  node79) != 0  ||
+            runThkNode(0, 0, -1, 7,  node18) != 12 ||
+            runThkNode(0, 0, -1, 22, node14) != 31 ||
+            runThkNode(0, 0, -1, 49, node14) != 49 ||
+            runThkNode(0, 0, -1, 53, node46) != 55) {
+            std::printf("FAIL [fatalis]: Phase 1 bipedal move rule assertion failed!\n");
+            return 1;
+        }
+
+        plugin_host::DispatchPluginSubcommand("fatalis", {"far", "multi"}, "far multi");
+        if (runThkNode(0, 0, -1, 0, node79) != 1) {
+            std::printf("FAIL [fatalis]: `far multi` expected seg 1 (55:220)!\n");
+            return 1;
+        }
+        plugin_host::DispatchPluginSubcommand("fatalis", {"far", "single"}, "far single");
+
+        // Phase 2 isolation on `55[87]` (caller=81) and `idx=46` (seg=3): MUST produce natural mix of outcomes!
+        bool saw55Cone = false, saw55NoCone = false;
+        for (int k = 0; k < 24; ++k) {
+            const std::int32_t s = runThkNode(1, 55, 81, 9, node55_87);
+            if (s == 9) saw55Cone = true;
+            if (s == 10) saw55NoCone = true;
+        }
+        if (!saw55Cone || !saw55NoCone) {
+            std::printf("FAIL [fatalis]: Phase 2 `55[87]` caller=81 should not be locked!\n");
+            return 1;
+        }
+
+        // Non-Fatalis isolation (`MonsterID = 91`): MUST produce natural mix of outcomes on `node75`!
+        *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 91U;
+        bool sawNonTarget = false;
+        for (int k = 0; k < 24; ++k) {
+            if (runThkNode(0, 0, -1, 1, node75) != 5) sawNonTarget = true;
+        }
+        *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 101U;
+        if (!sawNonTarget) {
+            std::printf("FAIL [fatalis]: Non-Fatalis (MonsterID=91) was unexpectedly locked!\n");
+            return 1;
+        }
+
+        plugin_host::DispatchPluginSubcommand("fatalis", {"history"}, "history");
+        plugin_host::DispatchPluginSubcommand("fatalis", {"status"}, "status");
+        plugin_host::DispatchPluginSubcommand("fatalis", {"off"}, "off");
+        bool sawUnlockedFatalis = false;
+        for (int k = 0; k < 24; ++k) {
+            if (runThkNode(0, 0, -1, 1, node75) != 5) sawUnlockedFatalis = true;
+        }
+        if (!sawUnlockedFatalis) {
+            std::printf("FAIL [fatalis]: `$rng fatalis off` failed to restore vanilla rolls!\n");
+            return 1;
+        }
+        std::printf("[OK] Fatalis Phase 1 pure-RNG controller verified on real 0x14133A850 -> 0x141339640 machine code!\n");
+    }
+
+    // 9. Verify Zero-Lock Shadow-Copy Hot-Reload + Inspector `dump` / `top` + Hot-Unload!
     const std::string srcSizeDll = plugDir + "\\rng_size.dll";
     HANDLE hWriteCheck = ::CreateFileA(srcSizeDll.c_str(), GENERIC_READ | GENERIC_WRITE,
                                        FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -466,7 +698,7 @@ int main(int argc, char** argv) {
     }
     std::printf("[OK] Hot-unload verified: %s\n", unloadMsg.c_str());
 
-    // 9. Verify `sChat::DispatchChatEntry` Standalone Chaining + Unchained-Overwrite Detection & Self-Healing!
+    // 10. Verify `sChat::DispatchChatEntry` Standalone Chaining + Unchained-Overwrite Detection & Self-Healing!
     {
         const std::uintptr_t chatSite = base + mhw::kRvaSChatDispatchEntry;
         void* origA = nullptr;
@@ -533,7 +765,7 @@ int main(int argc, char** argv) {
         std::printf("[OK] sChat::DispatchChatEntry chaining + unchained-overwrite detection & self-heal verified!\n");
     }
 
-    // 10. Verify `randUnitSphere` & clean shutdown
+    // 11. Verify `randUnitSphere` & clean shutdown
     float v3[3]{};
     CallSphereSite(fnSphere, sInst, v3);
     const float norm = std::sqrt(v3[0] * v3[0] + v3[1] * v3[1] + v3[2] * v3[2]);
