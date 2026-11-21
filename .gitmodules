@@ -1,0 +1,6 @@
+[submodule "plugins/size"]
+	path = plugins/size
+	url = https://github.com/Miraboreasyu/mhw-rng-size.git
+[submodule "plugins/inspector"]
+	path = plugins/inspector
+	url = https://github.com/Miraboreasyu/mhw-rng-inspector.git
