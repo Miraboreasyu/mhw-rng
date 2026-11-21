@@ -783,6 +783,50 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // Verify Enraged Combat (`thkFileIdx = 4`, `THK_04`) covers BOTH P1 Bipedal & P1 Quadruped identically to `f=0`,
+        // while unrelated slot (`thkFileIdx = 11`, Mount) remains untouched vanilla!
+        if (runThkNode(true, 0, 4, -1, 1,  node75) != 5  ||
+            runThkNode(true, 0, 4, -1, 1,  node77) != 4  ||
+            runThkNode(true, 0, 4, -1, 13, node77) != 20 ||
+            runThkNode(true, 0, 4, -1, 26, node77) != 29 ||
+            runThkNode(true, 0, 4, -1, 1,  node78) != 4  ||
+            runThkNode(true, 0, 4, -1, 0,  node79) != 0  ||
+            runThkNode(true, 0, 4, -1, 1,  node104) != 3  ||
+            runThkNode(true, 0, 4, -1, 1,  node109) != 3  ||
+            runThkNode(true, 0, 4, -1, 1,  node105) != 3  ||
+            runThkNode(true, 0, 4, -1, 31, node105) != 33 ||
+            runThkNode(true, 0, 4, -1, 28, node110) != 30 ||
+            runThkNode(true, 0, 4, -1, 1,  node107) != 1  ||
+            runThkNode(true, 0, 4, -1, 0,  node108) != 0  ||
+            runThkNode(true, 0, 4, -1, 2,  node47)  != 2) {
+            std::printf("FAIL [fatalis]: Enraged (`thkFileIdx=4`) P1 rule assertion failed!\n");
+            return 1;
+        }
+        int enr217 = 0, enr277 = 0;
+        for (int k = 0; k < 60; ++k) {
+            const std::int32_t s = runThkNode(true, 0, 4, -1, 1, node110);
+            if (s == 3) ++enr217;
+            else if (s == 4) ++enr277;
+            else {
+                std::printf("FAIL [fatalis]: Enraged (`f=4`) quad 50/50 got unexpected seg %d!\n", s);
+                return 1;
+            }
+        }
+        if (enr217 < 15 || enr217 > 45 || enr277 < 15 || enr277 > 45) {
+            std::printf("FAIL [fatalis]: Enraged (`f=4`) quad 50/50 balance out of range (%d vs %d)!\n", enr217, enr277);
+            return 1;
+        }
+        bool sawMountVarA = false, sawMountVarB = false;
+        for (int k = 0; k < 24; ++k) {
+            const std::int32_t sm = runThkNode(true, 0, 11, -1, 1, node75);
+            if (sm == 5) sawMountVarA = true;
+            else sawMountVarB = true;
+        }
+        if (!sawMountVarA || !sawMountVarB) {
+            std::printf("FAIL [fatalis]: Unrelated slot `thkFileIdx=11` should stay unmodified!\n");
+            return 1;
+        }
+
         plugin_host::DispatchPluginSubcommand("fatalis", {"far", "multi"}, "far multi");
         if (runThkNode(true, 0, 0, -1, 0, node79) != 1 ||
             runThkNode(true, 0, 0, -1, 1, node107) != 2 ||
