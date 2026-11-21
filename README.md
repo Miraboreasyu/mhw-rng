@@ -32,5 +32,5 @@ git clone --recursive https://github.com/Miraboreasyu/mhw-rng.git
 - 核心框架与插件 SDK 规范：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（头文件定义：[include/mhw_rng_api.h](include/mhw_rng_api.h)）
 - 官方插件 `rng_size` 技术文档：[plugins/size/README.md](plugins/size/README.md)（独立仓库：[Miraboreasyu/mhw-rng-size](https://github.com/Miraboreasyu/mhw-rng-size)）
 - 官方插件 `rng_endemic` 技术文档：[plugins/endemic/README.md](plugins/endemic/README.md)（独立仓库：[Miraboreasyu/mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic)）
-- 官方插件 `rng_thk` 技术文档：[plugins/thk/README.md](plugins/thk/README.md)（独立仓库：[Miraboreasyu/mhw-rng-thk](https://github.com/Miraboreasyu/mhw-rng-thk)）
+- 官方插件 `rng_thk` 技术文档：[plugins/thk/README.md](plugins/thk/README.md)（独立仓库：[Miraboreasyu/mhw-rng-thk](https://github.com/Miraboreasyu/mhw-rng-thk)）| THK `.txt` 预设语法与编写指南：[plugins/thk/PRESET_GUIDE.md](plugins/thk/PRESET_GUIDE.md)
 - 官方插件 `rng_inspector` 技术文档：[plugins/inspector/README.md](plugins/inspector/README.md)（独立仓库：[Miraboreasyu/mhw-rng-inspector](https://github.com/Miraboreasyu/mhw-rng-inspector)）
