@@ -132,11 +132,27 @@ int main(int argc, char** argv) {
         0x53, 0x48, 0x83, 0xEC, 0x20, 0x49, 0x8B, 0xD8,
         0x41, 0xFF, 0xD1, 0x48, 0x83, 0xC4, 0x20, 0x5B, 0xC3
     };
+    // Emits 26-byte ABI thunk matching `cThinkEm::update` (0x14132B7B0) stack frame before `0x14132B82C`:
+    //   void CallEmThinkUpdate(void* thinkEm_rcx, void* monster_rdx, void* target_r8 /* base + 0x132B82C */)
+    static constexpr std::uint8_t kEmThinkUpdateThunk[] = {
+        0x53,                         // push rbx
+        0x56,                         // push rsi
+        0x57,                         // push rdi
+        0x48, 0x83, 0xEC, 0x40,       // sub  rsp, 40h
+        0x48, 0x89, 0x6C, 0x24, 0x68, // mov  [rsp+68h], rbp
+        0x4C, 0x89, 0x74, 0x24, 0x70, // mov  [rsp+70h], r14
+        0x48, 0x8B, 0xF1,             // mov  rsi, rcx
+        0x48, 0x8B, 0xFA,             // mov  rdi, rdx
+        0x41, 0xFF, 0xE0              // jmp  r8
+    };
     auto* thunkMem = static_cast<std::uint8_t*>(
         ::VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
     if (!thunkMem) return 1;
     std::memcpy(thunkMem, kRbxCallerThunk, sizeof(kRbxCallerThunk));
+    std::memcpy(thunkMem + 0x100U, kEmThinkUpdateThunk, sizeof(kEmThinkUpdateThunk));
     const auto callSizeWithMonster = reinterpret_cast<CallWithMonsterRbxFn>(thunkMem);
+    using EmThinkUpdateThunkFn = void(__fastcall*)(void* thinkEm, void* monster, void* targetAddr);
+    const auto callEmThinkUpdate = reinterpret_cast<EmThinkUpdateThunkFn>(thunkMem + 0x100U);
 
     if (!hook::InitArena(base, end)) return 1;
 
@@ -479,9 +495,11 @@ int main(int argc, char** argv) {
         *reinterpret_cast<void**>(mgr + 0x510U) = reinterpret_cast<void*>(preSegCapture);
 
         using ThkPrefetchTickFn = std::uint8_t(__fastcall*)(void* mgrPtr);
-        const auto fnThkTick = reinterpret_cast<ThkPrefetchTickFn>(base + 0x133A850U);
+        const auto fnThkTick      = reinterpret_cast<ThkPrefetchTickFn>(base + 0x133A850U);
+        void* const fnEmTickMid   = reinterpret_cast<void*>(base + 0x132B82CU);
 
-        auto runThkNode = [&](std::uint32_t depth,
+        auto runThkNode = [&](bool usePrimaryEmTick,
+                              std::uint32_t depth,
                               std::int32_t thkFileIdx,
                               std::int32_t callerNodeArrIdx,
                               std::int32_t initialSegIdx,
@@ -497,7 +515,13 @@ int main(int argc, char** argv) {
             *reinterpret_cast<std::int32_t*>(frameBase + 0x358U) = initialSegIdx;
             *reinterpret_cast<std::int32_t*>(frameBase + 0x35CU) = thkFileIdx;
             g_lastChosenSeg = nullptr;
-            fnThkTick(mgr);
+            if (usePrimaryEmTick) {
+                // `synThinkEm + 0x38..0x44` must be 0 so `cThinkEm::update` post-switch cleanly skips.
+                std::memset(synThinkEm + 0x38U, 0, 0x10U);
+                callEmThinkUpdate(synThinkEm, monFatalis, fnEmTickMid);
+            } else {
+                fnThkTick(mgr);
+            }
             if (!g_lastChosenSeg) return -1;
             const auto byteDiff = g_lastChosenSeg - reinterpret_cast<const std::uint8_t*>(nodeSegs);
             return static_cast<std::int32_t>(byteDiff / 0x80);
@@ -607,26 +631,29 @@ int main(int argc, char** argv) {
         node46[76].InitEndSentinel(46);
 
         plugin_host::DispatchPluginSubcommand("fatalis", {"on"}, "on");
-        if (runThkNode(0, 0, -1, 1,  node75) != 5  ||
-            runThkNode(0, 0, -1, 36, node76) != 40 ||
-            runThkNode(1, 55, 75, 9, node55_87) != 10 ||
-            runThkNode(0, 0, -1, 1,  node77) != 4  ||
-            runThkNode(0, 0, -1, 13, node77) != 20 ||
-            runThkNode(0, 0, -1, 26, node77) != 29 ||
-            runThkNode(0, 0, -1, 50, node77) != 53 ||
-            runThkNode(0, 0, -1, 1,  node78) != 4  ||
-            runThkNode(0, 0, -1, 25, node78) != 28 ||
-            runThkNode(0, 0, -1, 0,  node79) != 0  ||
-            runThkNode(0, 0, -1, 7,  node18) != 12 ||
-            runThkNode(0, 0, -1, 22, node14) != 31 ||
-            runThkNode(0, 0, -1, 49, node14) != 49 ||
-            runThkNode(0, 0, -1, 53, node46) != 55) {
-            std::printf("FAIL [fatalis]: Phase 1 bipedal move rule assertion failed!\n");
-            return 1;
+        // Test BOTH primary caller (`0x132B83D`, `cThinkEm::update`) AND prefetch caller (`0x133A876`, `FUN_14133a850`)!
+        for (bool usePrimary : {true, false}) {
+            if (runThkNode(usePrimary, 0, 0, -1, 1,  node75) != 5  ||
+                runThkNode(usePrimary, 0, 0, -1, 36, node76) != 40 ||
+                runThkNode(usePrimary, 1, 55, 75, 9, node55_87) != 10 ||
+                runThkNode(usePrimary, 0, 0, -1, 1,  node77) != 4  ||
+                runThkNode(usePrimary, 0, 0, -1, 13, node77) != 20 ||
+                runThkNode(usePrimary, 0, 0, -1, 26, node77) != 29 ||
+                runThkNode(usePrimary, 0, 0, -1, 50, node77) != 53 ||
+                runThkNode(usePrimary, 0, 0, -1, 1,  node78) != 4  ||
+                runThkNode(usePrimary, 0, 0, -1, 25, node78) != 28 ||
+                runThkNode(usePrimary, 0, 0, -1, 0,  node79) != 0  ||
+                runThkNode(usePrimary, 0, 0, -1, 7,  node18) != 12 ||
+                runThkNode(usePrimary, 0, 0, -1, 22, node14) != 31 ||
+                runThkNode(usePrimary, 0, 0, -1, 49, node14) != 49 ||
+                runThkNode(usePrimary, 0, 0, -1, 53, node46) != 55) {
+                std::printf("FAIL [fatalis]: Phase 1 bipedal move rule assertion failed (primary=%d)!\n", usePrimary ? 1 : 0);
+                return 1;
+            }
         }
 
         plugin_host::DispatchPluginSubcommand("fatalis", {"far", "multi"}, "far multi");
-        if (runThkNode(0, 0, -1, 0, node79) != 1) {
+        if (runThkNode(true, 0, 0, -1, 0, node79) != 1) {
             std::printf("FAIL [fatalis]: `far multi` expected seg 1 (55:220)!\n");
             return 1;
         }
@@ -635,7 +662,7 @@ int main(int argc, char** argv) {
         // Phase 2 isolation on `55[87]` (caller=81) and `idx=46` (seg=3): MUST produce natural mix of outcomes!
         bool saw55Cone = false, saw55NoCone = false;
         for (int k = 0; k < 24; ++k) {
-            const std::int32_t s = runThkNode(1, 55, 81, 9, node55_87);
+            const std::int32_t s = runThkNode(true, 1, 55, 81, 9, node55_87);
             if (s == 9) saw55Cone = true;
             if (s == 10) saw55NoCone = true;
         }
@@ -648,7 +675,7 @@ int main(int argc, char** argv) {
         *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 91U;
         bool sawNonTarget = false;
         for (int k = 0; k < 24; ++k) {
-            if (runThkNode(0, 0, -1, 1, node75) != 5) sawNonTarget = true;
+            if (runThkNode(true, 0, 0, -1, 1, node75) != 5) sawNonTarget = true;
         }
         *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 101U;
         if (!sawNonTarget) {
@@ -657,17 +684,18 @@ int main(int argc, char** argv) {
         }
 
         plugin_host::DispatchPluginSubcommand("fatalis", {"history"}, "history");
+        plugin_host::DispatchPluginSubcommand("fatalis", {"diag"}, "diag");
         plugin_host::DispatchPluginSubcommand("fatalis", {"status"}, "status");
         plugin_host::DispatchPluginSubcommand("fatalis", {"off"}, "off");
         bool sawUnlockedFatalis = false;
         for (int k = 0; k < 24; ++k) {
-            if (runThkNode(0, 0, -1, 1, node75) != 5) sawUnlockedFatalis = true;
+            if (runThkNode(true, 0, 0, -1, 1, node75) != 5) sawUnlockedFatalis = true;
         }
         if (!sawUnlockedFatalis) {
             std::printf("FAIL [fatalis]: `$rng fatalis off` failed to restore vanilla rolls!\n");
             return 1;
         }
-        std::printf("[OK] Fatalis Phase 1 pure-RNG controller verified on real 0x14133A850 -> 0x141339640 machine code!\n");
+        std::printf("[OK] Fatalis Phase 1 pure-RNG controller verified on real 0x14132B838 & 0x14133A850 -> 0x141339640 machine code!\n");
     }
 
     // 9. Verify Zero-Lock Shadow-Copy Hot-Reload + Inspector `dump` / `top` + Hot-Unload!
