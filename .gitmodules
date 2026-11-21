@@ -7,6 +7,6 @@
 [submodule "plugins/endemic"]
 	path = plugins/endemic
 	url = https://github.com/Miraboreasyu/mhw-rng-endemic.git
-[submodule "plugins/fatalis"]
-	path = plugins/fatalis
-	url = https://github.com/Miraboreasyu/mhw-rng-fatalis.git
+[submodule "plugins/thk"]
+	path = plugins/thk
+	url = https://github.com/Miraboreasyu/mhw-rng-thk.git

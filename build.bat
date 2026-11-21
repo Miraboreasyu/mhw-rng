@@ -5,7 +5,7 @@
 ::   2. build\mhw_rng\rng_inspector.dll    -> nativePC\plugins\mhw_rng\rng_inspector.dll
 ::   3. build\mhw_rng\rng_size.dll         -> nativePC\plugins\mhw_rng\rng_size.dll
 ::   4. build\mhw_rng\rng_endemic.dll      -> nativePC\plugins\mhw_rng\rng_endemic.dll
-::   5. build\mhw_rng\rng_fatalis.dll      -> nativePC\plugins\mhw_rng\rng_fatalis.dll
+::   5. build\mhw_rng\rng_thk.dll          -> nativePC\plugins\mhw_rng\rng_thk.dll
 :: ============================================================================
 
 setlocal
@@ -104,18 +104,23 @@ cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo.
-echo ===== [5/5] Building Plugin: rng_fatalis.dll =====
+echo ===== [5/5] Building Plugin: rng_thk.dll =====
+if exist "%PLUGOUT%\rng_fatalis.dll" del /f /q "%PLUGOUT%\rng_fatalis.dll" >nul 2>&1
 cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
     /W4 /WX- /EHsc /MT ^
     /D "WIN32" /D "NDEBUG" /D "_WINDOWS" /D "_USRDLL" /D "NOMINMAX" ^
     /utf-8 ^
-    /I "%INCDIR%" ^
-    "%PLUGSRC%\fatalis\fatalis_plugin.cpp" ^
-    /Fe:"%PLUGOUT%\rng_fatalis.dll" ^
+    /I "%INCDIR%" /I "%PLUGSRC%\thk" ^
+    "%PLUGSRC%\thk\thk_plugin.cpp" ^
+    /Fe:"%PLUGOUT%\rng_thk.dll" ^
     /Fo:"%OUTDIR%\\" ^
     /LD ^
     /link kernel32.lib /OPT:REF /OPT:ICF ^
-    /OUT:"%PLUGOUT%\rng_fatalis.dll"
+    /OUT:"%PLUGOUT%\rng_thk.dll"
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+if not exist "%PLUGOUT%\thk_presets" mkdir "%PLUGOUT%\thk_presets"
+copy /y "%PLUGSRC%\thk\presets\fatalis_p1_nasty.txt" "%PLUGOUT%\thk_presets\fatalis_p1_nasty.txt" >nul
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo.

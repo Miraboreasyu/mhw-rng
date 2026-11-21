@@ -10,7 +10,7 @@ if not exist "%SRC_HDR%" (
     exit /b 1
 )
 
-for %%P in (size inspector endemic fatalis) do (
+for %%P in (size inspector endemic thk) do (
     if exist "%ROOT%plugins\%%P" (
         if not exist "%ROOT%plugins\%%P\include" mkdir "%ROOT%plugins\%%P\include"
         copy /y "%SRC_HDR%" "%ROOT%plugins\%%P\include\mhw_rng_api.h" >nul

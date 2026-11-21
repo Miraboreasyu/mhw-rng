@@ -454,7 +454,8 @@ int main(int argc, char** argv) {
     std::printf("[OK] Endemic Life plugin verified on real 0x141669AC0/0x14166CCC0/0x140672F90 machine code (guard=%.3f)!\n",
                 nonEndemicVal);
 
-    // 8. Verify Official Plugin #4 (`rng_fatalis.dll`) on Real MHW 15.23 `0x14133A850 -> cThinkMgr::updateThk (0x141339640)` Machine Code!
+    // 8. Verify Official Plugin #4 (`rng_thk.dll`: Fatalis Preset Facade + Generic THK Prober/Counter/Sequence Engine)
+    //    on Real MHW 15.23 `0x14132B838` & `0x14133A850 -> cThinkMgr::updateThk (0x141339640)` Machine Code!
     {
         struct SynThkSegment {
             std::uint8_t raw[0x80]{};
@@ -743,7 +744,165 @@ int main(int argc, char** argv) {
             std::printf("FAIL [fatalis]: `$rng fatalis off` failed to restore vanilla rolls!\n");
             return 1;
         }
-        std::printf("[OK] Fatalis Phase 1 pure-RNG controller verified on real 0x14132B838 & 0x14133A850 -> 0x141339640 machine code!\n");
+        std::printf("[OK] Fatalis Phase 1 preset via `$rng fatalis` verified on real 0x14132B838 & 0x14133A850 -> 0x141339640 machine code!\n");
+
+        // 8B. Verify Generic THK Engine Capabilities on Non-Fatalis Monster (MonsterID = 91, Rajang) & External Preset:
+        alignas(16) static SynThkSegment node12[16]{};
+        node12[1].InitRandom(0x40, 30, 55, 172); // seg 1 -> 55:172
+        node12[2].InitRandom(0xC0, 30, 55, 185); // seg 2 -> 55:185
+        node12[3].InitRandom(0x80, 40, 55, 297); // seg 3 -> 55:297
+        node12[8].InitEndSentinel(12);
+
+        // (1) Arbitrary Node Probing & Move Counting (`MonsterID = 91`, Rajang)
+        *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 91U;
+        plugin_host::DispatchPluginSubcommand("thk", {"probe", "on", "91"}, "probe on 91");
+        bool saw172 = false, sawOther91 = false;
+        for (int k = 0; k < 18; ++k) {
+            const std::int32_t s = runThkNode(true, 0, 0, -1, 1, node12);
+            if (s < 1 || s > 3) {
+                std::printf("FAIL [thk probe]: invalid candidate %d on node12!\n", s);
+                return 1;
+            }
+            if (s == 1) saw172 = true;
+            else sawOther91 = true;
+        }
+        if (!saw172 || !sawOther91) {
+            std::printf("FAIL [thk probe]: probe mode distorted natural Rajang (MonsterID=91) distribution!\n");
+            return 1;
+        }
+        plugin_host::DispatchPluginSubcommand("thk", {"nodes", "91"}, "nodes 91");
+        plugin_host::DispatchPluginSubcommand("thk", {"stats", "91"}, "stats 91");
+        plugin_host::DispatchPluginSubcommand("thk", {"probe", "log"}, "probe log");
+        plugin_host::DispatchPluginSubcommand("thk", {"probe", "off"}, "probe off");
+
+        // (2) Ordered Move Sequences (`loop`, `hold`, `once` with `vanilla` step)
+        plugin_host::DispatchPluginSubcommand("thk", {"reset"}, "reset");
+        plugin_host::DispatchPluginSubcommand("thk", {"seq", "91", "12", "1", "55:172,55:185,55:297", "loop"},
+                                             "seq 91 12 1 55:172,55:185,55:297 loop");
+        const std::int32_t expectedLoop[5] = {1, 2, 3, 1, 2};
+        for (int k = 0; k < 5; ++k) {
+            const std::int32_t got = runThkNode(true, 0, 0, -1, 1, node12);
+            if (got != expectedLoop[k]) {
+                std::printf("FAIL [thk seq loop]: step %d got seg %d, expected %d!\n", k, got, expectedLoop[k]);
+                return 1;
+            }
+        }
+
+        plugin_host::DispatchPluginSubcommand("thk", {"rule", "clear"}, "rule clear");
+        plugin_host::DispatchPluginSubcommand("thk", {"reset"}, "reset");
+        plugin_host::DispatchPluginSubcommand("thk", {"seq", "91", "12", "1", "55:297,55:172", "hold"},
+                                             "seq 91 12 1 55:297,55:172 hold");
+        const std::int32_t expectedHold[4] = {3, 1, 1, 1};
+        for (int k = 0; k < 4; ++k) {
+            const std::int32_t got = runThkNode(true, 0, 0, -1, 1, node12);
+            if (got != expectedHold[k]) {
+                std::printf("FAIL [thk seq hold]: step %d got seg %d, expected %d!\n", k, got, expectedHold[k]);
+                return 1;
+            }
+        }
+
+        plugin_host::DispatchPluginSubcommand("thk", {"rule", "clear"}, "rule clear");
+        plugin_host::DispatchPluginSubcommand("thk", {"reset"}, "reset");
+        plugin_host::DispatchPluginSubcommand("thk", {"seq", "91", "12", "1", "55:185,vanilla,55:297", "once"},
+                                             "seq 91 12 1 55:185,vanilla,55:297 once");
+        if (runThkNode(true, 0, 0, -1, 1, node12) != 2) {
+            std::printf("FAIL [thk seq once]: step 0 expected seg 2 (55:185)!\n");
+            return 1;
+        }
+        const std::int32_t vanillaMid = runThkNode(true, 0, 0, -1, 1, node12);
+        if (vanillaMid < 1 || vanillaMid > 3) {
+            std::printf("FAIL [thk seq once]: step 1 (vanilla) got invalid seg %d!\n", vanillaMid);
+            return 1;
+        }
+        if (runThkNode(true, 0, 0, -1, 1, node12) != 3) {
+            std::printf("FAIL [thk seq once]: step 2 expected seg 3 (55:297)!\n");
+            return 1;
+        }
+        bool sawPostOnceVarA = false, sawPostOnceVarB = false;
+        for (int k = 0; k < 24; ++k) {
+            const std::int32_t s = runThkNode(true, 0, 0, -1, 1, node12);
+            if (s == 1) sawPostOnceVarA = true;
+            else sawPostOnceVarB = true;
+        }
+        if (!sawPostOnceVarA || !sawPostOnceVarB) {
+            std::printf("FAIL [thk seq once]: expected vanilla restoration after `once` sequence!\n");
+            return 1;
+        }
+
+        // (3) Count-Gated Rule (`after=2 until=3`)
+        plugin_host::DispatchPluginSubcommand("thk", {"rule", "clear"}, "rule clear");
+        plugin_host::DispatchPluginSubcommand("thk", {"reset"}, "reset");
+        plugin_host::DispatchPluginSubcommand("thk", {"rule", "add", "91", "12", "1", "55:297", "after=2", "until=3"},
+                                             "rule add 91 12 1 55:297 after=2 until=3");
+        (void)runThkNode(true, 0, 0, -1, 1, node12); // hit #1 (uncontrolled)
+        if (runThkNode(true, 0, 0, -1, 1, node12) != 3 ||
+            runThkNode(true, 0, 0, -1, 1, node12) != 3) {
+            std::printf("FAIL [thk gate]: after=2 until=3 did not lock hits #2 and #3 to 55:297!\n");
+            return 1;
+        }
+        bool sawAfterGateA = false, sawAfterGateB = false;
+        for (int k = 0; k < 24; ++k) {
+            const std::int32_t s = runThkNode(true, 0, 0, -1, 1, node12);
+            if (s == 1 || s == 2) sawAfterGateA = true;
+            if (s == 3) sawAfterGateB = true;
+        }
+        if (!sawAfterGateA || !sawAfterGateB) {
+            std::printf("FAIL [thk gate]: hits >3 should return to natural vanilla variation!\n");
+            return 1;
+        }
+
+        // (4) External Plain-Text Preset Loading (`thk_presets\fatalis_p1_nasty.txt`)
+        plugin_host::DispatchPluginSubcommand("thk", {"clear"}, "clear");
+        *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 101U;
+        plugin_host::DispatchPluginSubcommand("thk", {"preset", "load", "fatalis_p1_nasty"},
+                                             "preset load fatalis_p1_nasty");
+        if (runThkNode(true, 0, 0, -1, 1,  node75) != 5  ||
+            runThkNode(true, 0, 0, -1, 1,  node77) != 4  ||
+            runThkNode(true, 0, 0, -1, 13, node77) != 20 ||
+            runThkNode(true, 0, 0, -1, 26, node77) != 29 ||
+            runThkNode(true, 1, 55, 75, 9, node55_87) != 10) {
+            std::printf("FAIL [thk preset]: external fatalis_p1_nasty preset did not match expected P1 targets!\n");
+            return 1;
+        }
+
+        // (5) Per-Monster-Instance Auto-Reset When Switching `Monster*` Pointer
+        alignas(16) static std::uint8_t monRajang2[0x12300]{};
+        std::memset(monRajang2, 0, sizeof(monRajang2));
+        *reinterpret_cast<std::uint32_t*>(monRajang2 + 0x12280U) = 91U;
+
+        plugin_host::DispatchPluginSubcommand("thk", {"clear"}, "clear");
+        plugin_host::DispatchPluginSubcommand("thk", {"seq", "91", "12", "1", "55:172,55:297", "hold"},
+                                             "seq 91 12 1 55:172,55:297 hold");
+        *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 91U;
+        if (runThkNode(true, 0, 0, -1, 1, node12) != 1 ||
+            runThkNode(true, 0, 0, -1, 1, node12) != 3) {
+            std::printf("FAIL [thk instance]: first Rajang instance did not play [1, 3]!\n");
+            return 1;
+        }
+        *reinterpret_cast<void**>(synThinkEm + 0x08U) = monRajang2;
+        *reinterpret_cast<void**>(mgr + 0x508U)       = monRajang2;
+        *(mgr + 0x38U)  = 0U;
+        *(mgr + 0x580U) = 0U;
+        *reinterpret_cast<std::uint32_t*>(mgr + 0x4F8U) = 0U;
+        *reinterpret_cast<const void**>(mgr + 0x350U)   = node12;
+        *reinterpret_cast<std::int32_t*>(mgr + 0x358U)  = 1;
+        *reinterpret_cast<std::int32_t*>(mgr + 0x35CU)  = 0;
+        std::memset(synThinkEm + 0x38U, 0, 0x10U);
+        g_lastChosenSeg = nullptr;
+        callEmThinkUpdate(synThinkEm, monRajang2, fnEmTickMid);
+        const std::int32_t raj2Step0 = g_lastChosenSeg
+            ? static_cast<std::int32_t>((g_lastChosenSeg - reinterpret_cast<const std::uint8_t*>(node12)) / 0x80)
+            : -1;
+        *reinterpret_cast<void**>(synThinkEm + 0x08U) = monFatalis;
+        *reinterpret_cast<void**>(mgr + 0x508U)       = monFatalis;
+        *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 101U;
+        if (raj2Step0 != 1) {
+            std::printf("FAIL [thk instance]: new Monster* instance expected step 0 (seg 1), got %d!\n", raj2Step0);
+            return 1;
+        }
+
+        plugin_host::DispatchPluginSubcommand("thk", {"clear"}, "clear");
+        std::printf("[OK] Generic THK probe/counter/sequence/preset/auto-reset engine verified on real 0x14132B838 machine code!\n");
     }
 
     // 9. Verify Zero-Lock Shadow-Copy Hot-Reload + Inspector `dump` / `top` + Hot-Unload!
