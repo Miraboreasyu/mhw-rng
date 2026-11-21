@@ -635,6 +635,7 @@ int main(int argc, char** argv) {
         node46[76].InitEndSentinel(46);
 
         plugin_host::DispatchPluginSubcommand("fatalis", {"on"}, "on");
+        plugin_host::DispatchPluginSubcommand("thk", {"preset", "tag", "bipedal_lock", "on"}, "preset tag bipedal_lock on");
         // Test BOTH primary caller (`0x132B83D`, `cThinkEm::update`) AND prefetch caller (`0x133A876`, `FUN_14133a850`)!
         for (bool usePrimary : {true, false}) {
             if (runThkNode(usePrimary, 0, 0, -1, 1,  node75) != 5  ||
@@ -655,10 +656,138 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        plugin_host::DispatchPluginSubcommand("thk", {"preset", "tag", "bipedal_lock", "off"}, "preset tag bipedal_lock off");
+
+        // Verify ALL Phase 1 Quadruped (`四足`) rules + 50/50 probabilistic split + Phase 2 isolation!
+        alignas(16) static SynThkSegment node104[26]{};
+        alignas(16) static SynThkSegment node109[22]{};
+        alignas(16) static SynThkSegment node105[54]{};
+        alignas(16) static SynThkSegment node110[49]{};
+        alignas(16) static SynThkSegment node107[26]{};
+        alignas(16) static SynThkSegment node108[8]{};
+        alignas(16) static SynThkSegment node47[36]{};
+        alignas(16) static SynThkSegment node115_p2[26]{};
+
+        // `node104` (0,500 未出蛇形咬): seg 1..5 -> 55:216 at seg 3
+        node104[1].InitRandom(0x40, 10, 55, 171);
+        node104[2].InitRandom(0xC0, 10, 55, 192);
+        node104[3].InitRandom(0xC0, 40, 55, 216); // Target: 蛇形咬
+        node104[4].InitRandom(0x80, 40, 55, 277);
+        node104[24].InitEndSentinel(104);
+
+        // `node109` (0,500 已出蛇形咬): seg 1..4 -> 55:277 at seg 3
+        node109[1].InitRandom(0x40, 10, 55, 171);
+        node109[2].InitRandom(0xC0, 45, 55, 192);
+        node109[3].InitRandom(0x80, 45, 55, 277); // Target: 后撤地毯火
+        node109[20].InitEndSentinel(109);
+
+        // `node105` (500,1000 未出蛇形咬): front(seg 1..5 -> 55:216 at 3), back(seg 31..35 -> 55:176 at 33)
+        node105[1].InitRandom(0x40, 35, 55, 177);
+        node105[2].InitRandom(0xC0, 20, 55, 217);
+        node105[3].InitRandom(0xC0, 10, 55, 216); // Front target: 蛇形咬
+        node105[4].InitRandom(0x80, 35, 55, 178);
+        node105[31].InitRandom(0x40, 10, 55, 177);
+        node105[32].InitRandom(0xC0, 20, 55, 217);
+        node105[33].InitRandom(0xC0, 20, 55, 176); // Back target: 尾砸
+        node105[34].InitRandom(0xC0, 30, 55, 216);
+        node105[35].InitRandom(0x80, 20, 55, 277);
+        node105[52].InitEndSentinel(105);
+
+        // `node110` (500,1000 已出蛇形咬): front(seg 1..4 -> 55:217 at 3 & 55:277 at 4), back(seg 28..31 -> 55:176 at 30)
+        node110[1].InitRandom(0x40, 40, 55, 177);
+        node110[2].InitRandom(0xC0, 35, 55, 178);
+        node110[3].InitRandom(0xC0, 20, 55, 217); // Front 50%: 蓄力火
+        node110[4].InitRandom(0x80, 5,  55, 277); // Front 50%: 后撤地毯火
+        node110[28].InitRandom(0x40, 45, 55, 177);
+        node110[29].InitRandom(0xC0, 10, 55, 217);
+        node110[30].InitRandom(0xC0, 20, 55, 176); // Back target: 尾砸
+        node110[31].InitRandom(0x80, 25, 55, 277);
+        node110[47].InitEndSentinel(110);
+
+        // `node107` (1500,5000): front(seg 1..4 -> 55:180 at 1, 55:221 at 2), back(seg 9..12 -> 55:180 at 9, 55:221 at 10)
+        node107[1].InitRandom(0x40, 25, 55, 180);
+        node107[2].InitRandom(0xC0, 20, 55, 221);
+        node107[3].InitRandom(0xC0, 35, 55, 192);
+        node107[4].InitRandom(0x80, 20, 55, 216);
+        node107[9].InitRandom(0x40,  25, 55, 180);
+        node107[10].InitRandom(0xC0, 20, 55, 221);
+        node107[11].InitRandom(0xC0, 35, 55, 192);
+        node107[12].InitRandom(0x80, 20, 55, 216);
+        node107[24].InitEndSentinel(107);
+
+        // `node108` (>5000): seg 0..3
+        node108[0].InitRandom(0x40, 35, 55, 180);
+        node108[1].InitRandom(0xC0, 25, 55, 221);
+        node108[2].InitRandom(0x80, 40, 55, 216);
+        node108[6].InitEndSentinel(108);
+
+        // `node47` occluded quadruped: P1 seg 2..5 (locked), P2 seg 26..29 (MUST stay vanilla)
+        node47[2].InitRandom(0x40,  30, 55, 180);
+        node47[3].InitRandom(0xC0,  10, 55, 221);
+        node47[4].InitRandom(0x80,  60, 55, 216);
+        node47[26].InitRandom(0x40, 30, 55, 180);
+        node47[27].InitRandom(0xC0, 30, 55, 221);
+        node47[28].InitRandom(0x80, 40, 55, 216);
+        node47[34].InitEndSentinel(47);
+
+        // `node115_p2` Phase 2 Quadruped (arrIdx=115, MUST NOT be controlled)
+        node115_p2[1].InitRandom(0x40, 10, 55, 171);
+        node115_p2[2].InitRandom(0xC0, 10, 55, 192);
+        node115_p2[3].InitRandom(0xC0, 40, 55, 216);
+        node115_p2[4].InitRandom(0x80, 40, 55, 277);
+        node115_p2[24].InitEndSentinel(115);
+
+        if (runThkNode(true, 0, 0, -1, 1,  node104) != 3  ||
+            runThkNode(true, 0, 0, -1, 1,  node109) != 3  ||
+            runThkNode(true, 0, 0, -1, 1,  node105) != 3  ||
+            runThkNode(true, 0, 0, -1, 31, node105) != 33 ||
+            runThkNode(true, 0, 0, -1, 28, node110) != 30 ||
+            runThkNode(true, 0, 0, -1, 1,  node107) != 1  ||
+            runThkNode(true, 0, 0, -1, 9,  node107) != 9  ||
+            runThkNode(true, 0, 0, -1, 0,  node108) != 0  ||
+            runThkNode(true, 0, 0, -1, 2,  node47)  != 2) {
+            std::printf("FAIL [fatalis]: Phase 1 quadruped deterministic rule assertion failed!\n");
+            return 1;
+        }
+
+        // Verify 50/50 split on `node110` front (`55:217` at seg 3, `55:277` at seg 4, zero bites `1/2`):
+        int cnt217 = 0, cnt277 = 0;
+        for (int k = 0; k < 100; ++k) {
+            const std::int32_t s = runThkNode(true, 0, 0, -1, 1, node110);
+            if (s == 3) ++cnt217;
+            else if (s == 4) ++cnt277;
+            else {
+                std::printf("FAIL [fatalis]: P1 quad 500~1500 front got unexpected seg %d (expected 3 or 4)!\n", s);
+                return 1;
+            }
+        }
+        if (cnt217 < 30 || cnt217 > 70 || cnt277 < 30 || cnt277 > 70) {
+            std::printf("FAIL [fatalis]: P1 quad 500~1500 50/50 balance out of range (217=%d, 277=%d)!\n",
+                        cnt217, cnt277);
+            return 1;
+        }
+
+        // Verify `node47` Phase 2 segment (`seg0=26`) & `node115` Phase 2 stay natural vanilla!
+        bool sawP2QuadVarA = false, sawP2QuadVarB = false;
+        bool sawOcclP2A = false, sawOcclP2B = false;
+        for (int k = 0; k < 24; ++k) {
+            const std::int32_t s115 = runThkNode(true, 0, 0, -1, 1, node115_p2);
+            if (s115 == 3) sawP2QuadVarA = true;
+            else sawP2QuadVarB = true;
+            const std::int32_t s47 = runThkNode(true, 0, 0, -1, 26, node47);
+            if (s47 == 26) sawOcclP2A = true;
+            else sawOcclP2B = true;
+        }
+        if (!sawP2QuadVarA || !sawP2QuadVarB || !sawOcclP2A || !sawOcclP2B) {
+            std::printf("FAIL [fatalis]: Phase 2 quadruped isolation check failed!\n");
+            return 1;
+        }
 
         plugin_host::DispatchPluginSubcommand("fatalis", {"far", "multi"}, "far multi");
-        if (runThkNode(true, 0, 0, -1, 0, node79) != 1) {
-            std::printf("FAIL [fatalis]: `far multi` expected seg 1 (55:220)!\n");
+        if (runThkNode(true, 0, 0, -1, 0, node79) != 1 ||
+            runThkNode(true, 0, 0, -1, 1, node107) != 2 ||
+            runThkNode(true, 0, 0, -1, 0, node108) != 1) {
+            std::printf("FAIL [fatalis]: `far multi` expected 55:220 on node79 & 55:221 on node107/108!\n");
             return 1;
         }
         plugin_host::DispatchPluginSubcommand("fatalis", {"far", "single"}, "far single");
@@ -901,8 +1030,29 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // (6) Weighted Random Choice (`A(w1)+B(w2)`) on Rajang (MonsterID=91)
         plugin_host::DispatchPluginSubcommand("thk", {"clear"}, "clear");
-        std::printf("[OK] Generic THK probe/counter/sequence/preset/auto-reset engine verified on real 0x14132B838 machine code!\n");
+        *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 91U;
+        plugin_host::DispatchPluginSubcommand("thk", {"rule", "add", "91", "12", "1", "55:172(50)+55:297(50)"},
+                                             "rule add 91 12 1 55:172(50)+55:297(50)");
+        int raj172 = 0, raj297 = 0;
+        for (int k = 0; k < 60; ++k) {
+            const std::int32_t s = runThkNode(true, 0, 0, -1, 1, node12);
+            if (s == 1) ++raj172;
+            else if (s == 3) ++raj297;
+            else {
+                std::printf("FAIL [thk weighted]: unexpected seg %d on 55:172(50)+55:297(50)!\n", s);
+                return 1;
+            }
+        }
+        if (raj172 < 15 || raj172 > 45 || raj297 < 15 || raj297 > 45) {
+            std::printf("FAIL [thk weighted]: 50/50 split skewed (%d vs %d)!\n", raj172, raj297);
+            return 1;
+        }
+        *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 101U;
+
+        plugin_host::DispatchPluginSubcommand("thk", {"clear"}, "clear");
+        std::printf("[OK] Generic THK probe/counter/sequence/weighted/preset/auto-reset engine verified on real 0x14132B838 machine code!\n");
     }
 
     // 9. Verify Zero-Lock Shadow-Copy Hot-Reload + Inspector `dump` / `top` + Hot-Unload!

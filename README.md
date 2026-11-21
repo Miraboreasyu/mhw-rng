@@ -14,7 +14,7 @@
 2. **官方业务插件（以 Git Submodule 挂载于 `plugins/`）**
    - **[`mhw-rng-size`](https://github.com/Miraboreasyu/mhw-rng-size)**（`plugins/size` $\rightarrow$ `rng_size.dll`）：挂载 `0x169BA15` 同步回调，通过读取栈帧 `Monster*` 支持冰原全 71 种大型怪物按 `MonsterID` 条件分流、开区间 `[0x00000001U, 0xFFFFFF00U]` 零权重非法行规避，以及读取实时 `cSizeTable` 反算目标体型百分比。
    - **[`mhw-rng-endemic`](https://github.com/Miraboreasyu/mhw-rng-endemic)**（`plugins/endemic` $\rightarrow$ `rng_endemic.dll`）：挂载 `0x166CFE1`、`0x0672FBC`（按调用栈过滤）与 `0x1669CB6` 三处同步回调，覆盖环境生物地图刷新与捕获抽签，支持大小金档位固定、档内比例调节、按 `ecXXX_YY` 物种分流以及实时查 `rAnimalSize` 反算精确倍率/厘米尺寸。
-   - **[`mhw-rng-thk`](https://github.com/Miraboreasyu/mhw-rng-thk)**（`plugins/thk` $\rightarrow$ `rng_thk.dll` + `thk_presets\fatalis_p1_nasty.txt`）：仅挂载 `0x1339C8C`（`cThinkMgr::updateThk`）一处同步回调，提供与具体怪物解耦的通用 THK 随机节点探测、按怪物实例的决策与出招计数、计数门控规则、有序出招序列与外部纯文本预设加载，并通过声明式预设与 `$rng fatalis` 快捷入口实现黑龙（`MonsterID == 101`）一阶段二足纯 RNG 控招。
+   - **[`mhw-rng-thk`](https://github.com/Miraboreasyu/mhw-rng-thk)**（`plugins/thk` $\rightarrow$ `rng_thk.dll` + `thk_presets\fatalis_p1_nasty.txt`）：仅挂载 `0x1339C8C`（`cThinkMgr::updateThk`）一处同步回调，提供与具体怪物解耦的通用 THK 随机节点探测、按怪物实例的决策与出招计数、计数门控规则、概率组合分枝、有序出招序列与外部纯文本预设加载，并通过声明式预设与 `$rng fatalis` 快捷入口实现黑龙（`MonsterID == 101`）一阶段二足+四足纯 RNG 控招。
    - **[`mhw-rng-inspector`](https://github.com/Miraboreasyu/mhw-rng-inspector)**（`plugins/inspector` $\rightarrow$ `rng_inspector.dll`）：提供 1,697 处静态调用点与 793 个外层函数区间的兜底词典，以及 `top`、`find`、`names`、`list`、`info`、`dump`、`fix`、`seq`、`slotseed`、`bypass`、`clear` 命令。
 
 ## 克隆与构建
