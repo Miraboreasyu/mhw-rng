@@ -155,7 +155,9 @@ std::string IniPath() {
 void InitLog() {
     std::lock_guard<std::mutex> lk(g_logMx);
     if (g_logFile) return;
-    const std::string path = DllDirectory() + "\\mhw_rng.log";
+    const std::string path     = DllDirectory() + "\\mhw_rng.log";
+    const std::string prevPath = DllDirectory() + "\\mhw_rng.prev.log";
+    ::MoveFileExA(path.c_str(), prevPath.c_str(), MOVEFILE_REPLACE_EXISTING);
     fopen_s(&g_logFile, path.c_str(), "w");
     if (g_logFile) {
         SYSTEMTIME st{};

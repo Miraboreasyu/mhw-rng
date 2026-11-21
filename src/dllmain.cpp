@@ -30,10 +30,13 @@ std::uintptr_t             g_exeBase          = 0;
 std::uintptr_t             g_exeEnd           = 0;
 app::Config                g_cfg{};
 
-ChatDispatchFn             g_origChatDispatch = nullptr;
-D3DPresentFn               g_origPresent      = nullptr;
-HHOOK                      g_kbHook           = nullptr;
-std::atomic<bool>          g_kbHookInstalled{false};
+void*                       g_origChatDispatchRaw = nullptr;
+void*                       g_origPresentRaw      = nullptr;
+std::uintptr_t              g_chatRelay           = 0;
+HHOOK                       g_kbHook           = nullptr;
+std::atomic<bool>           g_kbHookInstalled{false};
+std::atomic<bool>           g_detaching{false};
+thread_local std::uintptr_t tls_activeSChat    = 0;
 
 std::string TrimStr(const std::string& s) {
     std::size_t b = 0;
@@ -67,7 +70,10 @@ std::vector<std::string> SplitTokens(const std::string& s) {
 void PostChatSystemNoticeSEH(const char* utf8Text) noexcept {
     if (!g_cfg.showChatFeedback || !g_exeBase || !utf8Text || utf8Text[0] == '\0') return;
     __try {
-        const std::uintptr_t sChat = *reinterpret_cast<const std::uintptr_t*>(g_exeBase + mhw::kRvaSChatInstance);
+        std::uintptr_t sChat = *reinterpret_cast<const std::uintptr_t*>(g_exeBase + mhw::kRvaSChatInstance);
+        if (sChat < 0x100000ULL || sChat > 0x00007FFFFFFF0000ULL || (sChat & 0x7ULL) != 0) {
+            sChat = tls_activeSChat;
+        }
         if (sChat < 0x100000ULL || sChat > 0x00007FFFFFFF0000ULL || (sChat & 0x7ULL) != 0) return;
         const auto fnShow = reinterpret_cast<SChatShowMessageFn>(g_exeBase + mhw::kRvaSChatShowMessage);
         fnShow(sChat, utf8Text, 0.0f, 0xFFFFFFFFU, 0U);
@@ -417,12 +423,16 @@ void __fastcall Hook_ChatDispatch(std::uintptr_t sChat,
     char msgBuf[129]{};
     const bool hasLocalText = (isLocal != 0 && netMsg != 0) && ReadLocalChatMessageSEH(netMsg, msgBuf);
 
-    if (g_origChatDispatch) {
-        g_origChatDispatch(sChat, netMsg, targetChannel, isLocal);
+    if (const auto orig = reinterpret_cast<ChatDispatchFn>(
+            _InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(&g_origChatDispatchRaw), nullptr, nullptr))) {
+        orig(sChat, netMsg, targetChannel, isLocal);
     }
 
     if (hasLocalText) {
+        const std::uintptr_t prevSChat = tls_activeSChat;
+        tls_activeSChat = sChat;
         HandleRngChatCommand(msgBuf);
+        tls_activeSChat = prevSChat;
     }
 }
 
@@ -456,7 +466,9 @@ std::uint64_t __fastcall Hook_PresentForKbInit(std::uintptr_t d3dRender,
         g_kbHook = ::SetWindowsHookExW(WH_KEYBOARD, RngKeyboardProc, nullptr, ::GetCurrentThreadId());
         app::Log("init: optional hotkey WH_KEYBOARD installed on window thread (%p)", g_kbHook);
     }
-    return g_origPresent(d3dRender, a2, a3, a4);
+    const auto orig = reinterpret_cast<D3DPresentFn>(
+        _InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(&g_origPresentRaw), nullptr, nullptr));
+    return orig ? orig(d3dRender, a2, a3, a4) : 0ULL;
 }
 
 bool GetModuleSpan(HMODULE mod, std::uintptr_t& outBase, std::uintptr_t& outEnd) noexcept {
@@ -474,19 +486,39 @@ bool GetModuleSpan(HMODULE mod, std::uintptr_t& outBase, std::uintptr_t& outEnd)
 bool IsSiteReady(std::uintptr_t site, const std::uint8_t* expected, std::size_t len) noexcept {
     __try {
         const auto* p = reinterpret_cast<const std::uint8_t*>(site);
-        return std::memcmp(p, expected, len) == 0 || p[0] == 0xE9;
+        if (std::memcmp(p, expected, len) == 0) return true;
+        // If another plugin already installed a 5-byte E9 jump, verify any untouched tail bytes [5..len)
+        // so encrypted SteamStub garbage bytes starting with 0xE9 cannot produce a false positive.
+        if (p[0] == 0xE9) {
+            return (len <= 5U) || (std::memcmp(p + 5U, expected + 5U, len - 5U) == 0);
+        }
+        return false;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
 
-bool TryInstallHooks(HMODULE exe) {
+bool IsSChatInstanceReadySEH(std::uintptr_t exeBase) noexcept {
+    if (!exeBase) return false;
+    __try {
+        const std::uintptr_t p = *reinterpret_cast<const std::uintptr_t*>(exeBase + mhw::kRvaSChatInstance);
+        return p >= 0x100000ULL && p <= 0x00007FFFFFFF0000ULL && (p & 0x7ULL) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool TryInstallCoreRngHooks(HMODULE exe, std::uintptr_t& outBase, std::uintptr_t& outEnd) {
     std::uintptr_t base = 0, end = 0;
     if (!GetModuleSpan(exe, base, end)) return false;
 
-    if (!IsSiteReady(base + mhw::kRvaMtRandomNrand,      mhw::kPrologueMtRandomNrand,    sizeof(mhw::kPrologueMtRandomNrand)) ||
-        !IsSiteReady(base + mhw::kRvaMtRandomCtorSeed,   mhw::kPrologueMtRandomCtorSeed, sizeof(mhw::kPrologueMtRandomCtorSeed)) ||
-        !IsSiteReady(base + mhw::kRvaSChatDispatchEntry, mhw::kPrologueSChatDispatch,    sizeof(mhw::kPrologueSChatDispatch))) {
+    // Require all 5 core MtRandom sites + sChat::DispatchChatEntry to be unpacked before touching .text
+    if (!IsSiteReady(base + mhw::kRvaMtRandomNrand,       mhw::kPrologueMtRandomNrand,       sizeof(mhw::kPrologueMtRandomNrand)) ||
+        !IsSiteReady(base + mhw::kRvaMtRandomCtorSeed,    mhw::kPrologueMtRandomCtorSeed,    sizeof(mhw::kPrologueMtRandomCtorSeed)) ||
+        !IsSiteReady(base + mhw::kRvaMtRandomCtorDefault, mhw::kPrologueMtRandomCtorDefault, sizeof(mhw::kPrologueMtRandomCtorDefault)) ||
+        !IsSiteReady(base + mhw::kRvaMtRandomSrand,       mhw::kPrologueMtRandomSrand,       sizeof(mhw::kPrologueMtRandomSrand)) ||
+        !IsSiteReady(base + mhw::kRvaMtRandomSphere,      mhw::kPrologueMtRandomSphere,      sizeof(mhw::kPrologueMtRandomSphere)) ||
+        !IsSiteReady(base + mhw::kRvaSChatDispatchEntry,  mhw::kPrologueSChatDispatch,       sizeof(mhw::kPrologueSChatDispatch))) {
         return false;
     }
 
@@ -533,33 +565,10 @@ bool TryInstallHooks(HMODULE exe) {
                      sp.required ? "ERROR" : "warning",
                      sp.name,
                      reinterpret_cast<void*>(site));
-            if (sp.required) return false;
-        }
-    }
-
-    {
-        void* origChat = nullptr;
-        const std::uintptr_t chatSite = base + mhw::kRvaSChatDispatchEntry;
-        if (hook::PrepareDetour(chatSite,
-                                sizeof(mhw::kPrologueSChatDispatch),
-                                reinterpret_cast<void*>(&Hook_ChatDispatch),
-                                &origChat,
-                                mhw::kPrologueSChatDispatch)) {
-            g_origChatDispatch = reinterpret_cast<ChatDispatchFn>(origChat);
-            app::Log("init: prepared sChat::DispatchChatEntry @ %p -> tramp %p",
-                     reinterpret_cast<void*>(chatSite), origChat);
-        }
-    }
-
-    if (g_cfg.vkToggleTakeover != 0 || g_cfg.vkResetEpoch != 0) {
-        void* origPres = nullptr;
-        const std::uintptr_t presSite = base + mhw::kRvaD3DPresent;
-        if (hook::PrepareDetour(presSite,
-                                sizeof(mhw::kPrologueD3DPresent),
-                                reinterpret_cast<void*>(&Hook_PresentForKbInit),
-                                &origPres,
-                                mhw::kPrologueD3DPresent)) {
-            g_origPresent = reinterpret_cast<D3DPresentFn>(origPres);
+            if (sp.required) {
+                hook::ResetUnsealed();
+                return false;
+            }
         }
     }
 
@@ -567,13 +576,13 @@ bool TryInstallHooks(HMODULE exe) {
     g_exeEnd  = end;
 
     if (!hook::SealAndActivateAll()) {
-        app::Log("init: ERROR - SealAndActivateAll failed");
+        app::Log("init: warning - SealAndActivateAll detected concurrent patch or protect failure, will retry");
         g_exeBase = 0;
         g_exeEnd  = 0;
         return false;
     }
 
-    // Initialize Plugin Host & hot-load all plugins in `nativePC\plugins\mhw_rng\*.dll`!
+    // Initialize Plugin Host & auto-load sub-plugins BEFORE activating sChat::DispatchChatEntry
     plugin_host::Init(base, end, app::SubPluginDirectory(), &PostChatSystemNoticeSEH);
     std::size_t loadedPlugins = 0U;
     if (g_cfg.autoLoadPlugins) {
@@ -586,7 +595,65 @@ bool TryInstallHooks(HMODULE exe) {
              reinterpret_cast<void*>(hook::ArenaBase()),
              MhwRng_IsTakeoverEnabled() ? "ON" : "OFF",
              static_cast<unsigned long long>(MhwRng_GetMasterSeed()));
+    outBase = base;
+    outEnd  = end;
     return true;
+}
+
+bool InstallChatHookWithRetry(std::uintptr_t base, const char* tag) {
+    const std::uintptr_t chatSite = base + mhw::kRvaSChatDispatchEntry;
+    for (int retry = 0; retry < 20 && !g_detaching.load(std::memory_order_acquire); ++retry) {
+        bool wasChained = false;
+        std::uintptr_t chainedTarget = 0;
+        std::uintptr_t relay = 0;
+        if (hook::InstallStandaloneDetour5(chatSite,
+                                           reinterpret_cast<void*>(&Hook_ChatDispatch),
+                                           &g_origChatDispatchRaw,
+                                           mhw::kPrologueSChatDispatch,
+                                           &wasChained,
+                                           &chainedTarget,
+                                           &relay)) {
+            g_chatRelay = relay;
+            if (wasChained) {
+                app::Log("%s: hooked sChat::DispatchChatEntry @ %p (chained -> %p, tramp=%p)",
+                         tag,
+                         reinterpret_cast<void*>(chatSite),
+                         reinterpret_cast<void*>(chainedTarget),
+                         g_origChatDispatchRaw);
+            } else {
+                app::Log("%s: hooked sChat::DispatchChatEntry @ %p (vanilla, tramp=%p)",
+                         tag,
+                         reinterpret_cast<void*>(chatSite),
+                         g_origChatDispatchRaw);
+            }
+            return true;
+        }
+        ::Sleep(25);
+    }
+    app::Log("%s: ERROR - failed to hook sChat::DispatchChatEntry @ %p after retries",
+             tag, reinterpret_cast<void*>(chatSite));
+    return false;
+}
+
+void InstallOptionalPresentHookWithRetry(std::uintptr_t base) {
+    if (g_cfg.vkToggleTakeover == 0 && g_cfg.vkResetEpoch == 0) return;
+    const std::uintptr_t presSite = base + mhw::kRvaD3DPresent;
+    for (int retry = 0; retry < 20 && !g_detaching.load(std::memory_order_acquire); ++retry) {
+        bool wasChained = false;
+        std::uintptr_t chainedTarget = 0;
+        if (hook::InstallStandaloneDetour5(presSite,
+                                           reinterpret_cast<void*>(&Hook_PresentForKbInit),
+                                           &g_origPresentRaw,
+                                           mhw::kPrologueD3DPresent,
+                                           &wasChained,
+                                           &chainedTarget,
+                                           nullptr)) {
+            app::Log("init: hooked optional D3DPresent @ %p (%s)",
+                     reinterpret_cast<void*>(presSite), wasChained ? "chained" : "vanilla");
+            return;
+        }
+        ::Sleep(25);
+    }
 }
 
 DWORD WINAPI InitWorker(LPVOID) {
@@ -602,16 +669,55 @@ DWORD WINAPI InitWorker(LPVOID) {
     app::Log("init: MonsterHunterWorld.exe base = %p", exe);
     if (!exe) return 1;
 
-    for (int attempt = 0; attempt < 2400; ++attempt) {
-        if (TryInstallHooks(exe)) {
-            app::Log("init: microkernel ready! Type '%s' in game chat.", g_cfg.chatPrefix.c_str());
-            return 0;
+    // Phase 1: Install all 10 core RNG hooks + auto-load sub-plugins immediately on unpack
+    std::uintptr_t base = 0, end = 0;
+    bool coreReady = false;
+    for (int attempt = 0; attempt < 2400 && !g_detaching.load(std::memory_order_acquire); ++attempt) {
+        if (TryInstallCoreRngHooks(exe, base, end)) {
+            coreReady = true;
+            break;
         }
         ::Sleep(50);
     }
+    if (!coreReady) {
+        app::Log("init: timed out waiting for MonsterHunterWorld.exe unpack");
+        return 1;
+    }
 
-    app::Log("init: timed out waiting for MonsterHunterWorld.exe unpack");
-    return 1;
+    // Phase 2: Wait briefly for concurrent startup plugins (e.g. mhw_hfi.dll) to finish their
+    // 1-2ms attach-time hook installs on shared UI sites (sChat::DispatchChatEntry / D3DPresent),
+    // avoiding cross-DLL TOCTOU overwrites while still activating well before title/hub chat is reachable.
+    const DWORD settleStart = ::GetTickCount();
+    while (!g_detaching.load(std::memory_order_acquire)) {
+        const DWORD elapsed = ::GetTickCount() - settleStart;
+        if (elapsed >= 800U && (IsSChatInstanceReadySEH(base) || elapsed >= 3000U)) {
+            break;
+        }
+        ::Sleep(50);
+    }
+    if (g_detaching.load(std::memory_order_acquire)) return 0;
+
+    if (InstallChatHookWithRetry(base, "init")) {
+        app::Log("init: microkernel ready! Type '%s' in game chat.", g_cfg.chatPrefix.c_str());
+    }
+    InstallOptionalPresentHookWithRetry(base);
+
+    // Phase 3: Two lightweight post-install chain verifications (+1.5s and +4.0s) to self-heal
+    // in case a late-loading mod overwrote sChat::DispatchChatEntry without chaining.
+    const DWORD checkDelaysMs[2] = {1500U, 2500U};
+    const std::uintptr_t chatSite = base + mhw::kRvaSChatDispatchEntry;
+    for (DWORD delayMs : checkDelaysMs) {
+        for (DWORD slept = 0; slept < delayMs && !g_detaching.load(std::memory_order_acquire); slept += 100U) {
+            ::Sleep(100);
+        }
+        if (g_detaching.load(std::memory_order_acquire)) return 0;
+        if (g_chatRelay != 0 && hook::WasUnchainedOverwrite5(chatSite, g_chatRelay, mhw::kPrologueSChatDispatch)) {
+            app::Log("chat: detected unchained overwrite at %p, re-chaining...",
+                     reinterpret_cast<void*>(chatSite));
+            InstallChatHookWithRetry(base, "chat-rechain");
+        }
+    }
+    return 0;
 }
 
 } // namespace
@@ -619,10 +725,12 @@ DWORD WINAPI InitWorker(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_selfModule = module;
+        g_detaching.store(false, std::memory_order_release);
         ::DisableThreadLibraryCalls(module);
         HANDLE th = ::CreateThread(nullptr, 0, InitWorker, nullptr, 0, nullptr);
         if (th) ::CloseHandle(th);
     } else if (reason == DLL_PROCESS_DETACH && reserved == nullptr) {
+        g_detaching.store(true, std::memory_order_release);
         if (g_kbHook) {
             ::UnhookWindowsHookEx(g_kbHook);
             g_kbHook = nullptr;

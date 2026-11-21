@@ -466,7 +466,74 @@ int main(int argc, char** argv) {
     }
     std::printf("[OK] Hot-unload verified: %s\n", unloadMsg.c_str());
 
-    // 8. Verify `randUnitSphere` & clean shutdown
+    // 9. Verify `sChat::DispatchChatEntry` Standalone Chaining + Unchained-Overwrite Detection & Self-Healing!
+    {
+        const std::uintptr_t chatSite = base + mhw::kRvaSChatDispatchEntry;
+        void* origA = nullptr;
+        void* origB = nullptr;
+        bool chainedA = false, chainedB = false;
+        std::uintptr_t targetB = 0, relayA = 0, relayB = 0;
+
+        auto dummyChatA = +[](std::uintptr_t, std::uintptr_t, std::uint32_t, std::uint8_t) {};
+        auto dummyChatB = +[](std::uintptr_t, std::uintptr_t, std::uint32_t, std::uint8_t) {};
+
+        if (!hook::InstallStandaloneDetour5(chatSite, reinterpret_cast<void*>(dummyChatA), &origA,
+                                            mhw::kPrologueSChatDispatch, &chainedA, nullptr, &relayA) ||
+            chainedA) {
+            std::printf("FAIL [chat chain]: initial vanilla chat hook failed\n");
+            return 1;
+        }
+        if (hook::WasUnchainedOverwrite5(chatSite, relayA, mhw::kPrologueSChatDispatch)) {
+            std::printf("FAIL [chat chain]: false positive while relayA is at head\n");
+            return 1;
+        }
+
+        // Proper second plugin chains onto relayA -> WasUnchainedOverwrite5 MUST return false!
+        if (!hook::InstallStandaloneDetour5(chatSite, reinterpret_cast<void*>(dummyChatB), &origB,
+                                            mhw::kPrologueSChatDispatch, &chainedB, &targetB, &relayB) ||
+            !chainedB || targetB != relayA) {
+            std::printf("FAIL [chat chain]: second plugin failed to chain onto relayA\n");
+            return 1;
+        }
+        if (hook::WasUnchainedOverwrite5(chatSite, relayA, mhw::kPrologueSChatDispatch)) {
+            std::printf("FAIL [chat chain]: false positive on properly chained second plugin\n");
+            return 1;
+        }
+
+        // Simulate a racing unchained hook overwriting chatSite with a vanilla-trampoline relay
+        std::uint8_t fakeRelayBuf[64]{};
+        auto* fakePage = static_cast<std::uint8_t*>(
+            ::VirtualAlloc(reinterpret_cast<void*>((base - 0x20000ULL) & ~0xFFFFULL), 4096,
+                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (fakePage) {
+            std::memcpy(fakePage + 16U, mhw::kPrologueSChatDispatch, 5); // Vanilla trampoline (unchained!)
+            const auto fakeRel = static_cast<std::int32_t>(
+                static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(fakePage)) -
+                static_cast<std::int64_t>(chatSite + 5U));
+            fakeRelayBuf[0] = 0xE9;
+            std::memcpy(fakeRelayBuf + 1, &fakeRel, 4);
+            std::memcpy(reinterpret_cast<void*>(chatSite), fakeRelayBuf, 5);
+            if (!hook::WasUnchainedOverwrite5(chatSite, relayB, mhw::kPrologueSChatDispatch)) {
+                std::printf("FAIL [chat chain]: failed to detect unchained overwrite!\n");
+                return 1;
+            }
+            // Self-heal by re-chaining onto the unchained hook
+            void* origHeal = nullptr;
+            bool chainedHeal = false;
+            std::uintptr_t relayHeal = 0;
+            if (!hook::InstallStandaloneDetour5(chatSite, reinterpret_cast<void*>(dummyChatB), &origHeal,
+                                                mhw::kPrologueSChatDispatch, &chainedHeal, nullptr, &relayHeal) ||
+                !chainedHeal ||
+                hook::WasUnchainedOverwrite5(chatSite, relayHeal, mhw::kPrologueSChatDispatch)) {
+                std::printf("FAIL [chat chain]: self-heal re-chain failed!\n");
+                return 1;
+            }
+            ::VirtualFree(fakePage, 0, MEM_RELEASE);
+        }
+        std::printf("[OK] sChat::DispatchChatEntry chaining + unchained-overwrite detection & self-heal verified!\n");
+    }
+
+    // 10. Verify `randUnitSphere` & clean shutdown
     float v3[3]{};
     CallSphereSite(fnSphere, sInst, v3);
     const float norm = std::sqrt(v3[0] * v3[0] + v3[1] * v3[1] + v3[2] * v3[2]);
