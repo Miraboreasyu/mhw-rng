@@ -51,6 +51,10 @@ std::size_t                 g_asyncChatCount   = 0U;
 std::mutex                  g_asyncChatMx;
 std::atomic<std::uint32_t>  g_asyncChatPending{0U};
 
+std::atomic<bool>           g_startupNoticePending{false};
+char                        g_startupNoticeBuf[256]{};
+std::mutex                  g_startupNoticeMx;
+
 struct SavedRngSnapshot {
     std::string               name;
     std::vector<std::uint8_t> blob;
@@ -94,25 +98,87 @@ inline bool IsValidUserPtr(std::uintptr_t p) noexcept {
     return p >= 0x100000ULL && p <= 0x00007FFFFFFF0000ULL && (p & 0x7ULL) == 0ULL;
 }
 
-void PostChatSystemNoticeSEH(const char* utf8Text) noexcept {
-    if (!g_cfg.showChatFeedback || !g_exeBase || !utf8Text || utf8Text[0] == '\0') return;
+bool TryPostChatSystemNoticeSEH(const char* utf8Text) noexcept {
+    if (!g_cfg.showChatFeedback) return true;
+    if (!g_exeBase || !utf8Text || utf8Text[0] == '\0') return false;
     __try {
         std::uintptr_t sChat = *reinterpret_cast<const std::uintptr_t*>(g_exeBase + mhw::kRvaSChatInstance);
         if (!IsValidUserPtr(sChat)) {
             sChat = tls_activeSChat;
         }
-        if (!IsValidUserPtr(sChat)) return;
+        if (!IsValidUserPtr(sChat)) return false;
 
         // Verify sChat vftable and sMhGUI::Instance before entering sChat::ShowMessage
         // (sChat::ShowMessage locks sChat+0x08 then calls CreateSystemMessage which dereferences sMhGUI::Instance).
         const std::uintptr_t sChatVft = *reinterpret_cast<const std::uintptr_t*>(sChat);
         const std::uintptr_t sMhGui   = *reinterpret_cast<const std::uintptr_t*>(g_exeBase + mhw::kRvaSMhGuiInstance);
-        if (!IsValidUserPtr(sChatVft) || !IsValidUserPtr(sMhGui)) return;
+        if (!IsValidUserPtr(sChatVft) || !IsValidUserPtr(sMhGui)) return false;
 
         const auto fnShow = reinterpret_cast<SChatShowMessageFn>(g_exeBase + mhw::kRvaSChatShowMessage);
         fnShow(sChat, utf8Text, 0.0f, 0xFFFFFFFFU, 0U);
+        return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
+}
+
+void PostChatSystemNoticeSEH(const char* utf8Text) noexcept {
+    (void)TryPostChatSystemNoticeSEH(utf8Text);
+}
+
+bool IsPlayerInSceneSEH(std::uintptr_t exeBase) noexcept {
+    if (!exeBase) return false;
+    __try {
+        const std::uintptr_t root = *reinterpret_cast<const std::uintptr_t*>(exeBase + mhw::kRvaSPlayerRoot);
+        if (!IsValidUserPtr(root)) return false;
+        const std::uintptr_t ent = *reinterpret_cast<const std::uintptr_t*>(root + mhw::kOffPlayerRootEntity);
+        return IsValidUserPtr(ent);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void QueueStartupNoticeFmt(const char* fmt, ...) {
+    char buf[256]{};
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    app::Log("ui: %s", buf);
+    {
+        std::lock_guard<std::mutex> lk(g_startupNoticeMx);
+        std::memcpy(g_startupNoticeBuf, buf, sizeof(g_startupNoticeBuf));
+        g_startupNoticeBuf[sizeof(g_startupNoticeBuf) - 1U] = '\0';
+    }
+    g_startupNoticePending.store(true, std::memory_order_release);
+}
+
+bool TryFlushStartupNotice(std::uintptr_t sChatHint) noexcept {
+    if (!g_startupNoticePending.load(std::memory_order_acquire)) return true;
+    if (!g_cfg.showChatFeedback) {
+        g_startupNoticePending.store(false, std::memory_order_release);
+        return true;
+    }
+    if (!IsPlayerInSceneSEH(g_exeBase)) return false;
+
+    char msg[256]{};
+    {
+        std::lock_guard<std::mutex> lk(g_startupNoticeMx);
+        std::memcpy(msg, g_startupNoticeBuf, sizeof(msg));
+    }
+    if (msg[0] == '\0') {
+        g_startupNoticePending.store(false, std::memory_order_release);
+        return true;
+    }
+
+    const std::uintptr_t prevSChat = tls_activeSChat;
+    if (sChatHint != 0) tls_activeSChat = sChatHint;
+    const bool delivered = TryPostChatSystemNoticeSEH(msg);
+    tls_activeSChat = prevSChat;
+    if (delivered) {
+        g_startupNoticePending.store(false, std::memory_order_release);
+    }
+    return delivered;
 }
 
 void NotifyChatFmt(const char* fmt, ...) {
@@ -633,6 +699,9 @@ void __fastcall Hook_ChatDispatch(std::uintptr_t sChat,
 }
 
 void __fastcall Hook_SChatMove(std::uintptr_t sChat) {
+    if (g_startupNoticePending.load(std::memory_order_acquire)) {
+        TryFlushStartupNotice(sChat);
+    }
     if (g_asyncChatPending.load(std::memory_order_acquire) != 0U) {
         DrainAsyncChatOnMainThread(sChat, 4U);
     }
@@ -935,10 +1004,18 @@ DWORD WINAPI InitWorker(LPVOID) {
     }
     if (g_detaching.load(std::memory_order_acquire)) return 0;
 
-    if (InstallChatHookWithRetry(base, "init")) {
+    const bool chatOk = InstallChatHookWithRetry(base, "init");
+    if (chatOk) {
         app::Log("init: microkernel ready! Type '%s' in game chat.", g_cfg.chatPrefix.c_str());
+        const auto plugins = plugin_host::ListLoadedPlugins();
+        QueueStartupNoticeFmt(u8"[RNG] mhw_rng v3.0 已就绪（已载入 %zu 个插件 | 模式:%s | 输入 %s help）",
+                              plugins.size(),
+                              EngineModeLabelCn(MhwRng_GetEngineMode()),
+                              g_cfg.chatPrefix.c_str());
+    } else {
+        QueueStartupNoticeFmt(u8"[RNG] 警告：聊天指令钩子安装失败，详情见 mhw_rng.log");
     }
-    InstallSChatMoveHookWithRetry(base, "init");
+    const bool moveOk = InstallSChatMoveHookWithRetry(base, "init");
     InstallOptionalPresentHookWithRetry(base);
 
     // Phase 3: Two lightweight post-install chain verifications (+1.5s and +4.0s) to self-heal
@@ -960,6 +1037,14 @@ DWORD WINAPI InitWorker(LPVOID) {
             app::Log("chat: detected unchained overwrite at sChat::move %p, re-chaining...",
                      reinterpret_cast<void*>(moveSite));
             InstallSChatMoveHookWithRetry(base, "chatmove-rechain");
+        }
+    }
+
+    // Fallback delivery if sChat::move was not hooked: wait until player enters scene and post directly.
+    if (!moveOk && g_startupNoticePending.load(std::memory_order_acquire)) {
+        for (int i = 0; i < 150 && !g_detaching.load(std::memory_order_acquire); ++i) {
+            if (TryFlushStartupNotice(0)) break;
+            ::Sleep(200);
         }
     }
     return 0;

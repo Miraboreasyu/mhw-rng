@@ -1236,6 +1236,30 @@ int main(int argc, char** argv) {
             ::VirtualFree(fakePage, 0, MEM_RELEASE);
         }
         std::printf("[OK] sChat::DispatchChatEntry chaining + unchained-overwrite detection & self-heal verified!\n");
+        const std::uintptr_t poolLo10 = hook::ArenaBase() + 0x1000ULL;
+        const std::uintptr_t poolHi10 = hook::ArenaBase() + 0x10000ULL;
+        if (relayA < poolLo10 || relayA >= poolHi10 ||
+            relayB < poolLo10 || relayB >= poolHi10 ||
+            relayA == relayB) {
+            std::printf("FAIL [chat chain]: standalone pool placement invalid (base=%p, relayA=%p, relayB=%p)\n",
+                        reinterpret_cast<void*>(hook::ArenaBase()),
+                        reinterpret_cast<void*>(relayA),
+                        reinterpret_cast<void*>(relayB));
+            return 1;
+        }
+        MEMORY_BASIC_INFORMATION mbiP0{}, mbiA{}, mbiB{};
+        if (!::VirtualQuery(reinterpret_cast<LPCVOID>(hook::ArenaBase()), &mbiP0, sizeof(mbiP0)) ||
+            !::VirtualQuery(reinterpret_cast<LPCVOID>(relayA), &mbiA, sizeof(mbiA)) ||
+            !::VirtualQuery(reinterpret_cast<LPCVOID>(relayB), &mbiB, sizeof(mbiB)) ||
+            mbiP0.Protect != PAGE_EXECUTE_READ || mbiA.Protect != PAGE_EXECUTE_READ || mbiB.Protect != PAGE_EXECUTE_READ) {
+            std::printf("FAIL [chat chain]: Expected PAGE_EXECUTE_READ on Page0/A/B (0x%lX/0x%lX/0x%lX)\n",
+                        mbiP0.Protect, mbiA.Protect, mbiB.Protect);
+            return 1;
+        }
+        std::printf("[OK] Pre-reserved 64KB standalone W^X pool verified for sChat::DispatchChatEntry (Page0=%p, A=%p, B=%p)!\n",
+                    reinterpret_cast<void*>(hook::ArenaBase()),
+                    reinterpret_cast<void*>(relayA),
+                    reinterpret_cast<void*>(relayB));
     }
 
     // 11. Verify SDK v3.0 Microkernel Capabilities (Real `text_1523.bin` + MHW x64 Thunks)
@@ -2020,16 +2044,45 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 12. Verify `randUnitSphere` & clean shutdown
+    // 12. Verify `randUnitSphere`, pre-reserved 64 KB multi-page standalone W^X pool, & clean shutdown
     float v3[3]{};
     CallSphereSite(fnSphere, sInst, v3);
     const float norm = std::sqrt(v3[0] * v3[0] + v3[1] * v3[1] + v3[2] * v3[2]);
     if (std::fabs(norm - 1.0f) > 1e-4f) return 1;
 
+    // Verify InstallStandaloneDetour5 commits a page from the pre-reserved 64 KB boot pool for sChat::move
+    void* origMove = nullptr;
+    std::uintptr_t relayMove = 0;
+    bool chainedMove = true;
+    char errStandalone[128]{};
+    auto dummyMoveDetour = +[](std::uintptr_t) {};
+    if (!hook::InstallStandaloneDetour5(base + mhw::kRvaSChatMove,
+                                        reinterpret_cast<void*>(dummyMoveDetour),
+                                        &origMove,
+                                        mhw::kPrologueSChatMove,
+                                        &chainedMove, nullptr, &relayMove,
+                                        errStandalone, sizeof(errStandalone))) {
+        std::printf("FAIL [Standalone]: InstallStandaloneDetour5(sChat::move) failed (%s)\n", errStandalone);
+        return 1;
+    }
+    const std::uintptr_t poolLo = hook::ArenaBase() + 0x1000ULL;
+    const std::uintptr_t poolHi = hook::ArenaBase() + 0x10000ULL;
+    MEMORY_BASIC_INFORMATION mbiMove{};
+    if (relayMove < poolLo || relayMove >= poolHi || chainedMove ||
+        !::VirtualQuery(reinterpret_cast<LPCVOID>(relayMove), &mbiMove, sizeof(mbiMove)) ||
+        mbiMove.Protect != PAGE_EXECUTE_READ) {
+        std::printf("FAIL [Standalone]: sChat::move standalone pool verification failed (relay=%p, prot=0x%lX, chained=%d)\n",
+                    reinterpret_cast<void*>(relayMove), mbiMove.Protect, chainedMove);
+        return 1;
+    }
+    std::printf("[OK] sChat::move standalone W^X pool page verified (relay=%p)!\n",
+                reinterpret_cast<void*>(relayMove));
+
     plugin_host::ShutdownAll();
     hook::RemoveAllHooks();
     rng::Shutdown();
-    if (std::memcmp(img + mhw::kRvaMtRandomNrand, mhw::kPrologueMtRandomNrand, sizeof(mhw::kPrologueMtRandomNrand)) != 0) {
+    if (std::memcmp(img + mhw::kRvaMtRandomNrand, mhw::kPrologueMtRandomNrand, sizeof(mhw::kPrologueMtRandomNrand)) != 0 ||
+        std::memcmp(img + mhw::kRvaSChatMove, mhw::kPrologueSChatMove, sizeof(mhw::kPrologueSChatMove)) != 0) {
         std::printf("FAIL: RemoveAllHooks failed\n");
         return 1;
     }

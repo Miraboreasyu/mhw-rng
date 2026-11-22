@@ -13,30 +13,35 @@
 namespace hook {
 namespace {
 
-constexpr std::size_t kCodeArenaSize = 0x1000; // 4 KB PAGE_EXECUTE_READ arena (strict W^X)
-constexpr std::size_t kMaxDetours    = 24;
-constexpr std::size_t kMaxStandalone = 8;
+constexpr std::size_t   kCodePageSize      = 0x1000;  // 4 KB PAGE_EXECUTE_READ page (strict W^X)
+constexpr std::size_t   kArenaReservePages = 16;      // 64 KB single OS reservation: Page 0 core, Pages 1..15 standalone pool
+constexpr std::size_t   kArenaReserveSize  = kCodePageSize * kArenaReservePages;
+constexpr std::size_t   kMaxDetours        = 24;
+constexpr std::size_t   kMaxStandalone     = kArenaReservePages - 1U;
 
 struct DetourEntry {
     bool           valid             = false;
     bool           active            = false;
     bool           externallyChained = false;
+    bool           fromReservedPool  = false;
     std::uintptr_t site              = 0;
     std::uintptr_t relay             = 0;
     std::uint8_t   orig5[5]{};
     std::uint8_t   jmp5[5]{};
 };
 
-std::uintptr_t g_moduleLow       = 0;
-std::uintptr_t g_moduleHigh      = 0;
-std::uintptr_t g_codeArena       = 0;
-std::size_t    g_codeUsed        = 0;
-bool           g_sealed          = false;
+std::uintptr_t g_moduleLow        = 0;
+std::uintptr_t g_moduleHigh       = 0;
+std::uintptr_t g_arenaReserveBase = 0;
+std::uint32_t  g_reservedPageMask = 0; // Bit 0 = Page 0 core arena; bits 1..15 = standalone detour pages
+std::uintptr_t g_codeArena        = 0;
+std::size_t    g_codeUsed         = 0;
+bool           g_sealed           = false;
 DetourEntry    g_detours[kMaxDetours]{};
-std::size_t    g_detourCount     = 0;
+std::size_t    g_detourCount      = 0;
 
 DetourEntry    g_standalone[kMaxStandalone]{};
-std::size_t    g_standaloneCount = 0;
+std::size_t    g_standaloneCount  = 0;
 
 std::mutex     g_mx;
 
@@ -65,31 +70,39 @@ void EmitAbsJmp14(std::uint8_t* dst, std::uintptr_t target) noexcept {
     std::memcpy(dst + 6U, &t64, 8);
 }
 
-std::uintptr_t TryAllocReadWriteAt(std::uintptr_t addr, std::size_t size) noexcept {
-    void* p = ::VirtualAlloc(reinterpret_cast<void*>(addr), size,
-                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+std::uintptr_t TryAllocRegionAt(std::uintptr_t addr,
+                                std::size_t size,
+                                DWORD allocType,
+                                DWORD prot) noexcept {
+    void* p = ::VirtualAlloc(reinterpret_cast<void*>(addr), size, allocType, prot);
     return reinterpret_cast<std::uintptr_t>(p);
 }
 
-std::uintptr_t AllocNearPageRange(std::uintptr_t minAddr,
-                                  std::uintptr_t maxAddr,
-                                  std::uintptr_t anchor) noexcept {
-    if (maxAddr <= minAddr + kCodeArenaSize) return 0;
+std::uintptr_t ReserveNearRegion(std::uintptr_t minAddr,
+                                 std::uintptr_t maxAddr,
+                                 std::uintptr_t anchor,
+                                 std::size_t allocSize,
+                                 bool commitImmediately) noexcept {
+    if (allocSize == 0 || maxAddr <= minAddr + allocSize) return 0;
 
     SYSTEM_INFO si{};
     ::GetSystemInfo(&si);
-    const std::uintptr_t gran   = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000ULL;
-    const std::uintptr_t sysLo  = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
-    const std::uintptr_t sysHi  = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
+    const std::uintptr_t gran  = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000ULL;
+    const std::uintptr_t sysLo = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
+    const std::uintptr_t sysHi = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
 
     minAddr = (std::max<std::uintptr_t>)(minAddr, (std::max<std::uintptr_t>)(gran, sysLo));
     maxAddr = (std::min<std::uintptr_t>)(maxAddr, sysHi);
+    if (maxAddr <= minAddr + allocSize) return 0;
     if (anchor < minAddr) anchor = minAddr;
     if (anchor > maxAddr) anchor = maxAddr;
 
-    // 1. Scan downward from anchor using VirtualQuery (skips entire mapped modules/heaps in O(1))
+    const DWORD allocType = commitImmediately ? (MEM_RESERVE | MEM_COMMIT) : MEM_RESERVE;
+    const DWORD prot      = commitImmediately ? PAGE_READWRITE : PAGE_NOACCESS;
+
+    // 1. Scan downward from anchor using VirtualQuery (no arbitrary low iter cap under heavy VAD fragmentation)
     std::uintptr_t cur = anchor;
-    for (int iter = 0; iter < 4096 && cur > minAddr; ++iter) {
+    for (int iter = 0; iter < 1000000 && cur > minAddr; ++iter) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (::VirtualQuery(reinterpret_cast<LPCVOID>(cur - 1U), &mbi, sizeof(mbi)) == 0) {
             break;
@@ -99,11 +112,11 @@ std::uintptr_t AllocNearPageRange(std::uintptr_t minAddr,
         if (mbi.State == MEM_FREE) {
             const std::uintptr_t lo = (std::max)(minAddr, regBase);
             const std::uintptr_t hi = (std::min)(cur, regEnd);
-            if (hi >= lo + kCodeArenaSize) {
-                std::uintptr_t cand = (hi - kCodeArenaSize) & ~(gran - 1ULL);
+            if (hi >= lo + allocSize) {
+                std::uintptr_t cand = (hi - allocSize) & ~(gran - 1ULL);
                 for (int tries = 0; tries < 8 && cand >= lo; ++tries) {
-                    if (cand + kCodeArenaSize <= hi) {
-                        if (std::uintptr_t p = TryAllocReadWriteAt(cand, kCodeArenaSize)) {
+                    if (cand + allocSize <= hi) {
+                        if (std::uintptr_t p = TryAllocRegionAt(cand, allocSize, allocType, prot)) {
                             return p;
                         }
                     }
@@ -112,13 +125,13 @@ std::uintptr_t AllocNearPageRange(std::uintptr_t minAddr,
                 }
             }
         }
-        if (regBase <= minAddr) break;
+        if (regBase <= minAddr || regBase >= cur) break;
         cur = regBase;
     }
 
     // 2. Scan upward from anchor using VirtualQuery
     cur = anchor;
-    for (int iter = 0; iter < 4096 && cur + kCodeArenaSize <= maxAddr; ++iter) {
+    for (int iter = 0; iter < 1000000 && cur + allocSize <= maxAddr; ++iter) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (::VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0) {
             break;
@@ -129,8 +142,8 @@ std::uintptr_t AllocNearPageRange(std::uintptr_t minAddr,
             const std::uintptr_t lo = (std::max)(minAddr, regBase);
             const std::uintptr_t hi = (std::min)(maxAddr, regEnd);
             std::uintptr_t cand = (lo + gran - 1ULL) & ~(gran - 1ULL);
-            for (int tries = 0; tries < 8 && cand + kCodeArenaSize <= hi; ++tries) {
-                if (std::uintptr_t p = TryAllocReadWriteAt(cand, kCodeArenaSize)) {
+            for (int tries = 0; tries < 8 && cand + allocSize <= hi; ++tries) {
+                if (std::uintptr_t p = TryAllocRegionAt(cand, allocSize, allocType, prot)) {
                     return p;
                 }
                 cand += gran;
@@ -140,7 +153,53 @@ std::uintptr_t AllocNearPageRange(std::uintptr_t minAddr,
         cur = regEnd;
     }
 
+    // 3. Fallback: let the OS pick unaligned/sub-granularity free slots and validate [minAddr, maxAddr)
+    void* rejected[32]{};
+    int rejectedCount = 0;
+    std::uintptr_t chosen = 0;
+    for (int probe = 0; probe < 32; ++probe) {
+        void* p = ::VirtualAlloc(nullptr, allocSize, allocType, prot);
+        if (!p) break;
+        const auto addr = reinterpret_cast<std::uintptr_t>(p);
+        if (addr >= minAddr && addr + allocSize <= maxAddr) {
+            chosen = addr;
+            break;
+        }
+        rejected[rejectedCount++] = p;
+    }
+    for (int i = 0; i < rejectedCount; ++i) {
+        ::VirtualFree(rejected[i], 0, MEM_RELEASE);
+    }
+    return chosen;
+}
+
+std::uintptr_t AllocStandalonePageFromPool(std::uintptr_t site) noexcept {
+    if (!g_arenaReserveBase) return 0;
+    for (std::size_t idx = 1U; idx < kArenaReservePages; ++idx) {
+        if ((g_reservedPageMask & (1U << idx)) != 0U) continue;
+        const std::uintptr_t page = g_arenaReserveBase + idx * kCodePageSize;
+        if (!InRel32(site + 5U, page)) continue;
+        void* p = ::VirtualAlloc(reinterpret_cast<void*>(page), kCodePageSize,
+                                 MEM_COMMIT, PAGE_READWRITE);
+        if (!p) continue;
+        g_reservedPageMask |= (1U << idx);
+        return page;
+    }
     return 0;
+}
+
+void ReleaseStandalonePage(std::uintptr_t page, bool fromReservedPool) noexcept {
+    if (!page) return;
+    if (fromReservedPool) {
+        if (g_arenaReserveBase && page >= g_arenaReserveBase + kCodePageSize &&
+            page < g_arenaReserveBase + kArenaReserveSize) {
+            const std::size_t idx = (page - g_arenaReserveBase) / kCodePageSize;
+            ::VirtualFree(reinterpret_cast<void*>(page), kCodePageSize, MEM_DECOMMIT);
+            g_reservedPageMask &= ~(1U << idx);
+        }
+        return;
+    }
+    ::VirtualFree(reinterpret_cast<void*>(page), 0, MEM_RELEASE);
 }
 
 // Atomically replaces 5 bytes ONLY if the current 5 bytes still equal `expected5`.
@@ -302,13 +361,24 @@ bool InitArena(std::uintptr_t lo, std::uintptr_t hi) {
 
     const std::uintptr_t minAddr = (hi > 0x7E000000ULL) ? (hi - 0x7E000000ULL) : 0x10000ULL;
     const std::uintptr_t maxAddr = lo + 0x7E000000ULL;
-    g_codeArena = AllocNearPageRange(minAddr, maxAddr, lo);
-    if (!g_codeArena) return false;
+    const std::uintptr_t reserve = ReserveNearRegion(
+        minAddr, maxAddr, lo, kArenaReserveSize, /*commitImmediately=*/false);
+    if (!reserve) return false;
 
-    g_codeUsed    = 0;
-    g_sealed      = false;
-    g_detourCount = 0;
-    std::memset(reinterpret_cast<void*>(g_codeArena), 0xCC, kCodeArenaSize);
+    void* page0 = ::VirtualAlloc(reinterpret_cast<void*>(reserve), kCodePageSize,
+                                 MEM_COMMIT, PAGE_READWRITE);
+    if (!page0) {
+        ::VirtualFree(reinterpret_cast<void*>(reserve), 0, MEM_RELEASE);
+        return false;
+    }
+
+    g_arenaReserveBase = reserve;
+    g_codeArena        = reserve;
+    g_reservedPageMask = 1U;
+    g_codeUsed         = 0;
+    g_sealed           = false;
+    g_detourCount      = 0;
+    std::memset(reinterpret_cast<void*>(g_codeArena), 0xCC, kCodePageSize);
     return true;
 }
 
@@ -320,7 +390,7 @@ void ResetUnsealed() {
     g_codeUsed    = 0;
     g_detourCount = 0;
     std::memset(g_detours, 0, sizeof(g_detours));
-    std::memset(reinterpret_cast<void*>(g_codeArena), 0xCC, kCodeArenaSize);
+    std::memset(reinterpret_cast<void*>(g_codeArena), 0xCC, kCodePageSize);
 }
 
 bool PrepareDetour(std::uintptr_t site,
@@ -336,7 +406,7 @@ bool PrepareDetour(std::uintptr_t site,
     }
 
     const std::size_t alignedOff = (g_codeUsed + 63U) & ~std::size_t(63U);
-    if (alignedOff + 64U > kCodeArenaSize) return false;
+    if (alignedOff + 64U > kCodePageSize) return false;
 
     std::size_t used = 0;
     DetourEntry entry{};
@@ -356,11 +426,11 @@ bool SealAndActivateAll() {
     if (!g_codeArena || g_sealed || g_detourCount == 0) return false;
 
     DWORD oldProt = 0;
-    if (!::VirtualProtect(reinterpret_cast<void*>(g_codeArena), kCodeArenaSize,
+    if (!::VirtualProtect(reinterpret_cast<void*>(g_codeArena), kCodePageSize,
                           PAGE_EXECUTE_READ, &oldProt)) {
         return false;
     }
-    ::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<void*>(g_codeArena), kCodeArenaSize);
+    ::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<void*>(g_codeArena), kCodePageSize);
     g_sealed = true;
 
     for (std::size_t i = 0; i < g_detourCount; ++i) {
@@ -377,12 +447,12 @@ bool SealAndActivateAll() {
             }
             // Unseal & reset arena so next retry re-prepares cleanly against the updated bytes
             DWORD tmp = 0;
-            if (::VirtualProtect(reinterpret_cast<void*>(g_codeArena), kCodeArenaSize, PAGE_READWRITE, &tmp)) {
+            if (::VirtualProtect(reinterpret_cast<void*>(g_codeArena), kCodePageSize, PAGE_READWRITE, &tmp)) {
                 g_sealed      = false;
                 g_codeUsed    = 0;
                 g_detourCount = 0;
                 std::memset(g_detours, 0, sizeof(g_detours));
-                std::memset(reinterpret_cast<void*>(g_codeArena), 0xCC, kCodeArenaSize);
+                std::memset(reinterpret_cast<void*>(g_codeArena), 0xCC, kCodePageSize);
             }
             return false;
         }
@@ -419,15 +489,21 @@ bool InstallStandaloneDetour5(std::uintptr_t site,
         return false;
     }
 
-    // Allocate a dedicated W^X page within +-2GB of `site` (not full module span)
-    const std::uintptr_t minAddr = (site > 0x7E000000ULL) ? (site - 0x7E000000ULL) : 0x10000ULL;
-    const std::uintptr_t maxAddr = site + 0x7E000000ULL;
-    const std::uintptr_t page    = AllocNearPageRange(minAddr, maxAddr, site);
+    // Prefer a pre-reserved page in the 64 KB boot pool (0 extra VA, immune to late +-2GB exhaustion).
+    bool fromPool = false;
+    std::uintptr_t page = AllocStandalonePageFromPool(site);
+    if (page != 0) {
+        fromPool = true;
+    } else {
+        const std::uintptr_t minAddr = (site > 0x7E000000ULL) ? (site - 0x7E000000ULL) : 0x10000ULL;
+        const std::uintptr_t maxAddr = site + 0x7E000000ULL;
+        page = ReserveNearRegion(minAddr, maxAddr, site, kCodePageSize, /*commitImmediately=*/true);
+    }
     if (!page) {
         setErr("alloc-near-failed");
         return false;
     }
-    std::memset(reinterpret_cast<void*>(page), 0xCC, kCodeArenaSize);
+    std::memset(reinterpret_cast<void*>(page), 0xCC, kCodePageSize);
 
     std::size_t used = 0;
     DetourEntry entry{};
@@ -438,17 +514,17 @@ bool InstallStandaloneDetour5(std::uintptr_t site,
     if (!EmitDetourSlot(site, 5U, detourFn, expected5, page, used, entry,
                         &trampPtr, &chained, &prevTarget)) {
         setErr("emit-mismatch");
-        ::VirtualFree(reinterpret_cast<void*>(page), 0, MEM_RELEASE);
+        ReleaseStandalonePage(page, fromPool);
         return false;
     }
 
     DWORD oldProt = 0;
-    if (!::VirtualProtect(reinterpret_cast<void*>(page), kCodeArenaSize, PAGE_EXECUTE_READ, &oldProt)) {
+    if (!::VirtualProtect(reinterpret_cast<void*>(page), kCodePageSize, PAGE_EXECUTE_READ, &oldProt)) {
         setErr("protect-page-failed");
-        ::VirtualFree(reinterpret_cast<void*>(page), 0, MEM_RELEASE);
+        ReleaseStandalonePage(page, fromPool);
         return false;
     }
-    ::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<void*>(page), kCodeArenaSize);
+    ::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<void*>(page), kCodePageSize);
 
     // Publish trampoline pointer atomically BEFORE patching `site` so any thread entering `detourFn`
     // immediately sees the valid trampoline; restore previous value if CAS detects a concurrent patch.
@@ -459,12 +535,13 @@ bool InstallStandaloneDetour5(std::uintptr_t site,
         setErr("cas-patch-failed");
         _InterlockedExchangePointer(reinterpret_cast<void* volatile*>(outOrigTrampoline), prevPublished);
         if (prevPublished == nullptr) {
-            ::VirtualFree(reinterpret_cast<void*>(page), 0, MEM_RELEASE);
+            ReleaseStandalonePage(page, fromPool);
         }
         return false;
     }
 
-    entry.active = true;
+    entry.active           = true;
+    entry.fromReservedPool = fromPool;
     g_standalone[g_standaloneCount++] = entry;
 
     if (outWasChained)    *outWasChained    = chained;
