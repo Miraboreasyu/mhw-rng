@@ -362,7 +362,9 @@ bool InstallStandaloneDetour5(std::uintptr_t site,
 
     if (!CompareAndPatch5BytesSafe(site, entry.orig5, entry.jmp5)) {
         _InterlockedExchangePointer(reinterpret_cast<void* volatile*>(outOrigTrampoline), prevPublished);
-        ::VirtualFree(reinterpret_cast<void*>(page), 0, MEM_RELEASE);
+        if (prevPublished == nullptr) {
+            ::VirtualFree(reinterpret_cast<void*>(page), 0, MEM_RELEASE);
+        }
         return false;
     }
 

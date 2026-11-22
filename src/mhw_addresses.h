@@ -125,6 +125,7 @@ constexpr std::uint8_t kPrologueSChatDispatch[5] = {
 // @ 0x141A540D0
 constexpr std::uintptr_t kRvaSChatShowMessage  = 0x1A540D0;
 constexpr std::uintptr_t kRvaSChatInstance     = 0x500CE70; // sChat*
+constexpr std::uintptr_t kRvaSMhGuiInstance    = 0x51C4640; // sMhGUI* (required non-null by sChat::CreateSystemMessage)
 
 constexpr std::size_t kOffChatNetMsgType       = 0x1B;      // int8_t (1 = typed, 2/3 = manual shoutout)
 constexpr std::size_t kOffChatNetMsgText       = 0x44;      // char[128] UTF-8

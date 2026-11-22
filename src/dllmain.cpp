@@ -37,6 +37,7 @@ HHOOK                       g_kbHook           = nullptr;
 std::atomic<bool>           g_kbHookInstalled{false};
 std::atomic<bool>           g_detaching{false};
 thread_local std::uintptr_t tls_activeSChat    = 0;
+thread_local bool           tls_inChatCmd      = false;
 
 std::string TrimStr(const std::string& s) {
     std::size_t b = 0;
@@ -67,14 +68,25 @@ std::vector<std::string> SplitTokens(const std::string& s) {
     return out;
 }
 
+inline bool IsValidUserPtr(std::uintptr_t p) noexcept {
+    return p >= 0x100000ULL && p <= 0x00007FFFFFFF0000ULL && (p & 0x7ULL) == 0ULL;
+}
+
 void PostChatSystemNoticeSEH(const char* utf8Text) noexcept {
     if (!g_cfg.showChatFeedback || !g_exeBase || !utf8Text || utf8Text[0] == '\0') return;
     __try {
         std::uintptr_t sChat = *reinterpret_cast<const std::uintptr_t*>(g_exeBase + mhw::kRvaSChatInstance);
-        if (sChat < 0x100000ULL || sChat > 0x00007FFFFFFF0000ULL || (sChat & 0x7ULL) != 0) {
+        if (!IsValidUserPtr(sChat)) {
             sChat = tls_activeSChat;
         }
-        if (sChat < 0x100000ULL || sChat > 0x00007FFFFFFF0000ULL || (sChat & 0x7ULL) != 0) return;
+        if (!IsValidUserPtr(sChat)) return;
+
+        // Verify sChat vftable and sMhGUI::Instance before entering sChat::ShowMessage
+        // (sChat::ShowMessage locks sChat+0x08 then calls CreateSystemMessage which dereferences sMhGUI::Instance).
+        const std::uintptr_t sChatVft = *reinterpret_cast<const std::uintptr_t*>(sChat);
+        const std::uintptr_t sMhGui   = *reinterpret_cast<const std::uintptr_t*>(g_exeBase + mhw::kRvaSMhGuiInstance);
+        if (!IsValidUserPtr(sChatVft) || !IsValidUserPtr(sMhGui)) return;
+
         const auto fnShow = reinterpret_cast<SChatShowMessageFn>(g_exeBase + mhw::kRvaSChatShowMessage);
         fnShow(sChat, utf8Text, 0.0f, 0xFFFFFFFFU, 0U);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -416,6 +428,23 @@ void HandleRngChatCommand(const std::string& rawMsg) {
                   toks[0].c_str());
 }
 
+void RunRngChatCommandSafe(const char* rawMsg) noexcept {
+    try {
+        HandleRngChatCommand(rawMsg);
+    } catch (...) {
+        app::Log("ui: caught C++ exception while executing chat command");
+    }
+}
+
+bool InvokeChatCommandSEH(const char* rawMsg) noexcept {
+    __try {
+        RunRngChatCommandSafe(rawMsg);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void __fastcall Hook_ChatDispatch(std::uintptr_t sChat,
                                   std::uintptr_t netMsg,
                                   std::uint32_t targetChannel,
@@ -428,11 +457,16 @@ void __fastcall Hook_ChatDispatch(std::uintptr_t sChat,
         orig(sChat, netMsg, targetChannel, isLocal);
     }
 
-    if (hasLocalText) {
+    if (hasLocalText && !tls_inChatCmd) {
+        tls_inChatCmd = true;
         const std::uintptr_t prevSChat = tls_activeSChat;
         tls_activeSChat = sChat;
-        HandleRngChatCommand(msgBuf);
+        const bool ok = InvokeChatCommandSEH(msgBuf);
         tls_activeSChat = prevSChat;
+        tls_inChatCmd = false;
+        if (!ok) {
+            app::Log("ui: caught SEH exception while executing chat command '%s'", msgBuf);
+        }
     }
 }
 
