@@ -30,6 +30,7 @@ flowchart TD
         Size["rng_size.dll (怪物体型换算 / 按MonsterID分流)"]
         Endemic["rng_endemic.dll (环境生物大小金档位与档内尺寸控制)"]
         Thk["rng_thk.dll (通用THK节点探测/计数/序列与预设引擎)"]
+        Steam["rng_steam.dll (蒸汽机实时按键提示与锁序示例)"]
         Custom["第三方扩展插件"]
     end
 
@@ -53,6 +54,7 @@ flowchart TD
 | 官方插件：`size` | `nativePC\plugins\mhw_rng\rng_size.dll` | [size_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-size/blob/main/size_plugin.cpp) | 详见《`rng_size` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-size/blob/main/README.md)) |
 | 官方插件：`endemic` | `nativePC\plugins\mhw_rng\rng_endemic.dll` | [endemic_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-endemic/blob/main/endemic_plugin.cpp) | 详见《`rng_endemic` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-endemic/blob/main/README.md)) |
 | 官方插件：`thk` | `nativePC\plugins\mhw_rng\rng_thk.dll` + `thk_presets\*.txt` | [thk_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-thk/blob/main/thk_plugin.cpp) | 详见《`rng_thk` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-thk/blob/main/README.md)) |
+| 官方插件：`steam` | `nativePC\plugins\mhw_rng\rng_steam.dll` | [steam_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-steam/blob/main/steam_plugin.cpp) | 详见《`rng_steam` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-steam/blob/main/README.md)) |
 
 ---
 
@@ -287,5 +289,5 @@ cl.exe /nologo /std:c++17 /O2 /EHsc /MT /utf-8 /I "include" rng_meal.cpp /LD /Fe
 - `$rng rawfix` / `rawseed` / `rawbypass` / `rawclear`：在不加载任何插件的情况下直接按数值 RVA 操作指定槽位。
 
 ### 2. 构建与脱机回归测试
-- 运行 [build.bat](../build.bat)：依次执行 `sync_plugin_sdks.bat` 与 `ml64` 汇编 [rng_trampolines.asm](../src/rng_trampolines.asm)，再使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
+- 运行 [build.bat](../build.bat)：依次执行 `sync_plugin_sdks.bat` 与 `ml64` 汇编 [rng_trampolines.asm](../src/rng_trampolines.asm)，再使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll`、`build\mhw_rng\rng_steam.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
 - 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证全部既有回归场景（8 线程隔离、`rng_size`、`rng_endemic`、`rng_thk`、影拷贝热重载与 `sChat` 链自愈）及 SDK v3.0 全部新增能力（非易失寄存器与原入参捕获、多插件 Hook 优先级链、`ObserveOnly` 与通配观测器、`FilterVanilla` 保底过滤、二进制快照恢复、生命周期事件、并发异步聊天投递、堆序列与 Tombstone 槽回收、动态透明包装与私有实例策略）。

@@ -10,3 +10,6 @@
 [submodule "plugins/thk"]
 	path = plugins/thk
 	url = https://github.com/Miraboreasyu/mhw-rng-thk.git
+[submodule "plugins/steam"]
+	path = plugins/steam
+	url = https://github.com/Miraboreasyu/mhw-rng-steam.git

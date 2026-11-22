@@ -6,6 +6,7 @@
 ::   3. build\mhw_rng\rng_size.dll         -> nativePC\plugins\mhw_rng\rng_size.dll
 ::   4. build\mhw_rng\rng_endemic.dll      -> nativePC\plugins\mhw_rng\rng_endemic.dll
 ::   5. build\mhw_rng\rng_thk.dll          -> nativePC\plugins\mhw_rng\rng_thk.dll
+::   6. build\mhw_rng\rng_steam.dll        -> nativePC\plugins\mhw_rng\rng_steam.dll
 :: ============================================================================
 
 setlocal
@@ -40,7 +41,7 @@ if exist "%ROOT%sync_plugin_sdks.bat" call "%ROOT%sync_plugin_sdks.bat"
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 if not exist "%PLUGOUT%" mkdir "%PLUGOUT%"
 
-echo ===== [1/5] Building RNG Microkernel (mhw_rng.dll) =====
+echo ===== [1/6] Building RNG Microkernel (mhw_rng.dll) =====
 ml64.exe /nologo /c /Fo"%OUTDIR%\rng_trampolines.obj" "%SRCDIR%\rng_trampolines.asm"
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
@@ -63,7 +64,7 @@ cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo.
-echo ===== [2/5] Building Plugin: rng_inspector.dll =====
+echo ===== [2/6] Building Plugin: rng_inspector.dll =====
 cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
     /W4 /WX- /EHsc /MT ^
     /D "WIN32" /D "NDEBUG" /D "_WINDOWS" /D "_USRDLL" /D "NOMINMAX" ^
@@ -78,7 +79,7 @@ cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo.
-echo ===== [3/5] Building Plugin: rng_size.dll =====
+echo ===== [3/6] Building Plugin: rng_size.dll =====
 cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
     /W4 /WX- /EHsc /MT ^
     /D "WIN32" /D "NDEBUG" /D "_WINDOWS" /D "_USRDLL" /D "NOMINMAX" ^
@@ -93,7 +94,7 @@ cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo.
-echo ===== [4/5] Building Plugin: rng_endemic.dll =====
+echo ===== [4/6] Building Plugin: rng_endemic.dll =====
 cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
     /W4 /WX- /EHsc /MT ^
     /D "WIN32" /D "NDEBUG" /D "_WINDOWS" /D "_USRDLL" /D "NOMINMAX" ^
@@ -108,7 +109,7 @@ cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo.
-echo ===== [5/5] Building Plugin: rng_thk.dll =====
+echo ===== [5/6] Building Plugin: rng_thk.dll =====
 if exist "%PLUGOUT%\rng_fatalis.dll" del /f /q "%PLUGOUT%\rng_fatalis.dll" >nul 2>&1
 cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
     /W4 /WX- /EHsc /MT ^
@@ -125,6 +126,21 @@ if %ERRORLEVEL% NEQ 0 exit /b 1
 
 if not exist "%PLUGOUT%\thk_presets" mkdir "%PLUGOUT%\thk_presets"
 copy /y "%PLUGSRC%\thk\presets\fatalis_p1_nasty.txt" "%PLUGOUT%\thk_presets\fatalis_p1_nasty.txt" >nul
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+echo.
+echo ===== [6/6] Building Plugin: rng_steam.dll =====
+cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
+    /W4 /WX- /EHsc /MT ^
+    /D "WIN32" /D "NDEBUG" /D "_WINDOWS" /D "_USRDLL" /D "NOMINMAX" ^
+    /utf-8 ^
+    /I "%INCDIR%" ^
+    "%PLUGSRC%\steam\steam_plugin.cpp" ^
+    /Fe:"%PLUGOUT%\rng_steam.dll" ^
+    /Fo:"%OUTDIR%\\" ^
+    /LD ^
+    /link kernel32.lib /OPT:REF /OPT:ICF ^
+    /OUT:"%PLUGOUT%\rng_steam.dll"
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 echo.

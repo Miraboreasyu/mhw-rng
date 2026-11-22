@@ -15,6 +15,7 @@
    - **[`mhw-rng-size`](https://github.com/Miraboreasyu/mhw-rng-size)**（`plugins/size` $\rightarrow$ `rng_size.dll`）：挂载 `0x169BA15` 同步回调，通过读取栈帧 `Monster*` 支持冰原全 71 种大型怪物按 `MonsterID` 条件分流、开区间 `[0x00000001U, 0xFFFFFF00U]` 零权重非法行规避，以及读取实时 `cSizeTable` 反算目标体型百分比。
    - **[`mhw-rng-endemic`](https://github.com/Miraboreasyu/mhw-rng-endemic)**（`plugins/endemic` $\rightarrow$ `rng_endemic.dll`）：挂载 `0x166CFE1`、`0x0672FBC`（按调用栈过滤）与 `0x1669CB6` 三处同步回调，覆盖环境生物地图刷新与捕获抽签，支持大小金档位固定、档内比例调节、按 `ecXXX_YY` 物种分流以及实时查 `rAnimalSize` 反算精确倍率/厘米尺寸。
    - **[`mhw-rng-thk`](https://github.com/Miraboreasyu/mhw-rng-thk)**（`plugins/thk` $\rightarrow$ `rng_thk.dll` + `thk_presets\fatalis_p1_nasty.txt`）：仅挂载 `0x1339C8C`（`cThinkMgr::updateThk`）一处同步回调，提供与具体怪物解耦的通用 THK 随机节点探测、按怪物实例的决策与出招计数、计数门控规则、概率组合分枝、有序出招序列与外部纯文本预设加载，并通过声明式预设与 `$rng fatalis` 快捷入口实现黑龙（`MonsterID == 101`）一阶段二足+四足纯 RNG 控招。
+   - **[`mhw-rng-steam`](https://github.com/Miraboreasyu/mhw-rng-steam)**（`plugins/steam` $\rightarrow$ `rng_steam.dll`）：挂载 `0x066679A` / `0x06667BB` / `0x05CA0A2`，在 `ObserveOnly` 与 `Takeover` 下均可实时解码蒸汽机三键顺序、红槽倍率与隐藏任意键必中保底并通过异步聊天队列提示，亦支持可选固定按键顺序（SDK v3.0 示例插件）。
    - **[`mhw-rng-inspector`](https://github.com/Miraboreasyu/mhw-rng-inspector)**（`plugins/inspector` $\rightarrow$ `rng_inspector.dll`）：提供 1,697 处静态调用点与 793 个外层函数区间的兜底词典，以及 `top`、`find`、`names`、`list`、`info`、`dump`、`fix`、`seq`、`slotseed`、`bypass`、`clear` 命令。
 
 ## 克隆与构建
@@ -24,7 +25,7 @@
 git clone --recursive https://github.com/Miraboreasyu/mhw-rng.git
 ```
 
-- 构建全部模块：执行 [`build.bat`](build.bat)，产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
+- 构建全部模块：执行 [`build.bat`](build.bat)，产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll`、`build\mhw_rng\rng_steam.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
 - 运行脱机回归测试：执行 [`run_tests.bat`](run_tests.bat)（需要提供解壳后的 15.23 `.text` 段文件 `text_1523.bin`，可通过命令行参数或环境变量 `MHW_TEXT_BIN` 指定）。
 
 ## 技术文档导航
@@ -33,4 +34,5 @@ git clone --recursive https://github.com/Miraboreasyu/mhw-rng.git
 - 官方插件 `rng_size` 技术文档：[plugins/size/README.md](plugins/size/README.md)（独立仓库：[Miraboreasyu/mhw-rng-size](https://github.com/Miraboreasyu/mhw-rng-size)）
 - 官方插件 `rng_endemic` 技术文档：[plugins/endemic/README.md](plugins/endemic/README.md)（独立仓库：[Miraboreasyu/mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic)）
 - 官方插件 `rng_thk` 技术文档：[plugins/thk/README.md](plugins/thk/README.md)（独立仓库：[Miraboreasyu/mhw-rng-thk](https://github.com/Miraboreasyu/mhw-rng-thk)）| THK `.txt` 预设语法与编写指南：[plugins/thk/PRESET_GUIDE.md](plugins/thk/PRESET_GUIDE.md)
+- 官方插件 `rng_steam` 技术文档：[plugins/steam/README.md](plugins/steam/README.md)（独立仓库：[Miraboreasyu/mhw-rng-steam](https://github.com/Miraboreasyu/mhw-rng-steam)）
 - 官方插件 `rng_inspector` 技术文档：[plugins/inspector/README.md](plugins/inspector/README.md)（独立仓库：[Miraboreasyu/mhw-rng-inspector](https://github.com/Miraboreasyu/mhw-rng-inspector)）

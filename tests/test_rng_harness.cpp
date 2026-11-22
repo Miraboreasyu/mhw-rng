@@ -111,6 +111,7 @@ __declspec(noinline) void CallSphereSite(TestSphereFn fn, std::uint32_t* sInst, 
 } // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("=== MHW RNG Microkernel v3.0 + Official Plugin Audit Suite ===\n");
 
     constexpr std::size_t kImageSize = 0x06000000ULL;
@@ -270,16 +271,16 @@ int main(int argc, char** argv) {
     }
     std::printf("[OK] 8-thread stream isolation & O(1) Epoch rewind verified!\n");
 
-    // 2. Load Official Plugins (`rng_inspector.dll` + `rng_size.dll` + `rng_endemic.dll` + `rng_fatalis.dll`) via Shadow-Copy Host
+    // 2. Load Official Plugins (`rng_inspector.dll` + `rng_size.dll` + `rng_endemic.dll` + `rng_thk.dll` + `rng_steam.dll`) via Shadow-Copy Host
     const std::string plugDir = buildDir + "\\mhw_rng";
 
     plugin_host::Init(base, end, plugDir, &CaptureChatSink, &CaptureAsyncChatSink);
     const std::size_t loadedCnt = plugin_host::LoadAllFromDirectory();
-    if (loadedCnt < 4U) {
-        std::printf("FAIL: Expected >= 4 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
+    if (loadedCnt < 5U) {
+        std::printf("FAIL: Expected >= 5 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
         return 1;
     }
-    std::printf("[OK] Shadow-copy loaded %zu official plugins (`inspector` + `size` + `endemic` + `fatalis`)!\n", loadedCnt);
+    std::printf("[OK] Shadow-copy loaded %zu official plugins (`inspector` + `size` + `endemic` + `thk` + `steam`)!\n", loadedCnt);
 
     // 3. Build TWO real-world 38-row `cSizeTable`s:
     //    - Table 0 (`fullCrownTbl`): Standard Crown table (`88% .. 125%`, all 38 rows have `weight > 0`)
@@ -1830,6 +1831,192 @@ int main(int argc, char** argv) {
                 return 1;
             }
             std::printf("[OK] V3-8: Reclaimable seq heap, tombstone slots, custom wrapper unwrap & instance policy verified!\n");
+        }
+
+        // V3-9: Verify Official Plugin #5 (`rng_steam.dll`) on Real MHW 15.23 `cSteamControl::start` & `FUN_1405ca060`
+        {
+            host->SetEngineMode(kMhwRngModeTakeover);
+            if (img[0x0666795U] != 0xE8 || img[0x06667B6U] != 0xE8 || img[0x05CA09DU] != 0xE8) {
+                std::printf("FAIL [V3-9]: Expected E8 calls at 0x0666795 / 0x06667B6 / 0x05CA09D in text_1523.bin!\n");
+                return 1;
+            }
+
+            // CallWithRbx(void* rbxVal_rcx, void* target_rdx)
+            // Target offsets `0x0666785` and `0x05CA096` are mid-function bodies (`RSP % 16 == 0` at entry),
+            // so `sub rsp, 20h` after two pushes ensures `RSP % 16 == 8` right before `call rdx`.
+            static constexpr std::uint8_t kSteamCallThunk[] = {
+                0x53,                         // push rbx
+                0x57,                         // push rdi
+                0x48, 0x83, 0xEC, 0x20,       // sub  rsp, 20h
+                0x48, 0x8B, 0xD9,             // mov  rbx, rcx
+                0xFF, 0xD2,                   // call rdx
+                0x48, 0x83, 0xC4, 0x20,       // add  rsp, 20h
+                0x5F,                         // pop  rdi
+                0x5B,                         // pop  rbx
+                0xC3                          // ret
+            };
+            std::memcpy(thunkMem + 0x200U, kSteamCallThunk, sizeof(kSteamCallThunk));
+            ::FlushInstructionCache(::GetCurrentProcess(), thunkMem + 0x200U, sizeof(kSteamCallThunk));
+            using CallWithRbxFn = void(__fastcall*)(void* rbxVal, void* targetAddr);
+            const auto callWithRbx = reinterpret_cast<CallWithRbxFn>(thunkMem + 0x200U);
+
+            const std::uint8_t origKeygenEnd = img[0x06667D6U];
+            const std::uint8_t origPityCmp   = img[0x05CA0B6U];
+            img[0x06667D6U] = 0xC3; // RET right after writing `order[0..2]` at `[rbx+8..0xA]`
+            img[0x05CA0B6U] = 0xC3; // RET right after `(r % 100)` inside `FUN_1405ca060`
+            ::FlushInstructionCache(::GetCurrentProcess(), img + 0x06667D6U, 1);
+            ::FlushInstructionCache(::GetCurrentProcess(), img + 0x05CA0B6U, 1);
+
+            alignas(16) static std::uint8_t fakeSteamCtrl[0x500]{};
+            std::memset(fakeSteamCtrl, 0, sizeof(fakeSteamCtrl));
+
+            // (a) Pure `ObserveOnly` hint accuracy across all 6 permutations + Red slot marker
+            // Seed synthetic `sInstance` in `img + 0x3FDEBD8` (zeros by default since only `.text` is loaded)
+            // so vanilla `MtRandom::nrand(sInst)` produces a real varying Xorshift128 stream.
+            const std::uint32_t savedSInst[4] = { sInst[0], sInst[1], sInst[2], sInst[3] };
+            sInst[0] = 0x12345678U;
+            sInst[1] = 0x9ABCDEF0U;
+            sInst[2] = 0x13579BDFU;
+            sInst[3] = 0x2468ACE0U;
+            host->SetEngineMode(kMhwRngModeObserveOnly);
+            g_capturedAsyncChatLines.clear();
+            auto formatExpectedKb = [](const std::uint8_t ord[3]) -> std::string {
+                static constexpr const char* kKb[3] = { "A", "W", "D" };
+                return std::string(kKb[ord[0]]) + " - " + kKb[ord[1]] + " - " + kKb[ord[2]];
+            };
+            bool seenPerms[6]{};
+            int seenPermCnt = 0;
+            bool sawRedMsg = false;
+            for (int r = 0; r < 200 && seenPermCnt < 6; ++r) {
+                fakeSteamCtrl[0x4A9U] = (r == 0) ? 1U : 0U;
+                const std::size_t prevN = g_capturedAsyncChatLines.size();
+                callWithRbx(fakeSteamCtrl, img + 0x0666785U);
+                if (g_capturedAsyncChatLines.size() != prevN + 1U) {
+                    img[0x06667D6U] = origKeygenEnd;
+                    img[0x05CA0B6U] = origPityCmp;
+                    std::printf("FAIL [V3-9a]: Expected 1 async chat hint per ObserveOnly round!\n");
+                    return 1;
+                }
+                const std::uint8_t* ord = fakeSteamCtrl + 8;
+                const std::string expKb = formatExpectedKb(ord);
+                const std::string& msg  = g_capturedAsyncChatLines.back();
+                if (msg.find(expKb) == std::string::npos) {
+                    img[0x06667D6U] = origKeygenEnd;
+                    img[0x05CA0B6U] = origPityCmp;
+                    std::printf("FAIL [V3-9a]: Observed hint `%s` mismatched real order `%s`!\n",
+                                msg.c_str(), expKb.c_str());
+                    return 1;
+                }
+                if (r == 0) {
+                    sawRedMsg = (msg.find(u8"[红槽!]") != std::string::npos);
+                }
+                static constexpr std::uint8_t kPermTbl[6][3] = {
+                    {0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}
+                };
+                for (int p = 0; p < 6; ++p) {
+                    if (!seenPerms[p] &&
+                        ord[0] == kPermTbl[p][0] && ord[1] == kPermTbl[p][1] && ord[2] == kPermTbl[p][2]) {
+                        seenPerms[p] = true;
+                        ++seenPermCnt;
+                    }
+                }
+            }
+            if (seenPermCnt != 6 || !sawRedMsg) {
+                img[0x06667D6U] = origKeygenEnd;
+                img[0x05CA0B6U] = origPityCmp;
+                std::printf("FAIL [V3-9a]: ObserveOnly saw %d/6 perms, red=%d\n", seenPermCnt, sawRedMsg);
+                return 1;
+            }
+
+            // (b) `Takeover` mode sequence lock for all 6 permutations + `r2` alias
+            host->SetEngineMode(kMhwRngModeTakeover);
+            struct LockCase { const char* arg; std::uint8_t b0, b1, b2; };
+            static constexpr LockCase kLockCases[] = {
+                { "awd", 0, 1, 2 }, { "adw", 0, 2, 1 },
+                { "wad", 1, 0, 2 }, { "wda", 1, 2, 0 },
+                { "daw", 2, 0, 1 }, { "dwa", 2, 1, 0 },
+                { "r2",  0, 1, 2 }
+            };
+            fakeSteamCtrl[0x4A9U] = 0U;
+            for (const auto& lc : kLockCases) {
+                plugin_host::DispatchPluginSubcommand("steam", {"lock", lc.arg}, std::string("lock ") + lc.arg);
+                g_capturedAsyncChatLines.clear();
+                callWithRbx(fakeSteamCtrl, img + 0x0666785U);
+                if (fakeSteamCtrl[8] != lc.b0 || fakeSteamCtrl[9] != lc.b1 || fakeSteamCtrl[10] != lc.b2 ||
+                    g_capturedAsyncChatLines.empty() ||
+                    g_capturedAsyncChatLines.back().find(u8"[锁序]") == std::string::npos) {
+                    img[0x06667D6U] = origKeygenEnd;
+                    img[0x05CA0B6U] = origPityCmp;
+                    std::printf("FAIL [V3-9b]: `$rng steam lock %s` produced [%u,%u,%u]!\n",
+                                lc.arg, fakeSteamCtrl[8], fakeSteamCtrl[9], fakeSteamCtrl[10]);
+                    return 1;
+                }
+            }
+
+            // Verify bare `$rng steam lock` (no args) defaults to `A - W - D` ({0, 1, 2})
+            plugin_host::DispatchPluginSubcommand("steam", {"lock", "off"}, "lock off");
+            plugin_host::DispatchPluginSubcommand("steam", {"lock"}, "lock");
+            g_capturedAsyncChatLines.clear();
+            callWithRbx(fakeSteamCtrl, img + 0x0666785U);
+            if (fakeSteamCtrl[8] != 0 || fakeSteamCtrl[9] != 1 || fakeSteamCtrl[10] != 2 ||
+                g_capturedAsyncChatLines.empty() ||
+                g_capturedAsyncChatLines.back().find(u8"[锁序]") == std::string::npos) {
+                img[0x06667D6U] = origKeygenEnd;
+                img[0x05CA0B6U] = origPityCmp;
+                std::printf("FAIL [V3-9b]: bare `$rng steam lock` did not default to [0,1,2] (got [%u,%u,%u])!\n",
+                            fakeSteamCtrl[8], fakeSteamCtrl[9], fakeSteamCtrl[10]);
+                return 1;
+            }
+
+            // (c) Hidden guaranteed-win pity alert (`0x05CA0A2`)
+            g_capturedAsyncChatLines.clear();
+            *reinterpret_cast<std::uint32_t*>(fakeSteamCtrl + 0x4A4U) = 100U;
+            callWithRbx(fakeSteamCtrl + 0x4A4U, img + 0x05CA096U);
+            const bool sawPity100 = (!g_capturedAsyncChatLines.empty() &&
+                                     g_capturedAsyncChatLines.back().find(u8"隐藏必中保底") != std::string::npos);
+            g_capturedAsyncChatLines.clear();
+            *reinterpret_cast<std::uint32_t*>(fakeSteamCtrl + 0x4A4U) = 0U;
+            callWithRbx(fakeSteamCtrl + 0x4A4U, img + 0x05CA096U);
+            const bool cleanPity0 = g_capturedAsyncChatLines.empty();
+            if (!sawPity100 || !cleanPity0) {
+                img[0x06667D6U] = origKeygenEnd;
+                img[0x05CA0B6U] = origPityCmp;
+                std::printf("FAIL [V3-9c]: auto-win check failed (pity100=%d clean0=%d)\n", sawPity100, cleanPity0);
+                return 1;
+            }
+
+            // (d) Lifecycle ClearAllRules clears lock, style switch, on/off, and hot-reload
+            host->ClearAllRules();
+            plugin_host::DispatchPluginSubcommand("steam", {"style", "cn"}, "style cn");
+            g_capturedAsyncChatLines.clear();
+            callWithRbx(fakeSteamCtrl, img + 0x0666785U);
+            const bool cnOk = (!g_capturedAsyncChatLines.empty() &&
+                               g_capturedAsyncChatLines.back().find(u8"[锁序]") == std::string::npos &&
+                               (g_capturedAsyncChatLines.back().find(u8"左 - ") != std::string::npos ||
+                                g_capturedAsyncChatLines.back().find(u8"中 - ") != std::string::npos ||
+                                g_capturedAsyncChatLines.back().find(u8"右 - ") != std::string::npos));
+
+            plugin_host::DispatchPluginSubcommand("steam", {"off"}, "off");
+            g_capturedAsyncChatLines.clear();
+            callWithRbx(fakeSteamCtrl, img + 0x0666785U);
+            const bool offOk = g_capturedAsyncChatLines.empty();
+
+            plugin_host::DispatchPluginSubcommand("steam", {"on"}, "on");
+            std::string steamReloadMsg;
+            const bool steamReloadOk = plugin_host::LoadOrReloadSingle("steam", steamReloadMsg);
+
+            img[0x06667D6U] = origKeygenEnd;
+            img[0x05CA0B6U] = origPityCmp;
+            ::FlushInstructionCache(::GetCurrentProcess(), img + 0x06667D6U, 1);
+            ::FlushInstructionCache(::GetCurrentProcess(), img + 0x05CA0B6U, 1);
+            std::memcpy(sInst, savedSInst, sizeof(savedSInst));
+
+            if (!cnOk || !offOk || !steamReloadOk) {
+                std::printf("FAIL [V3-9d]: cn=%d off=%d reload=%d (%s)\n",
+                            cnOk, offOk, steamReloadOk, steamReloadMsg.c_str());
+                return 1;
+            }
+            std::printf("[OK] V3-9: `rng_steam.dll` ObserveOnly hints (6/6 perms + red), lock (all 6 perms), pity & reload verified on real MHW code!\n");
         }
     }
 
