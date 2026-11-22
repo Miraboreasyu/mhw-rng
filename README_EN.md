@@ -1,0 +1,192 @@
+# MIRA
+
+> **M**IRA **I**ntercepts **R**NG **A**PIs
+
+RNG Manipulation Framework for Monster Hunter: World – Iceborne (Steam 15.23 / Build 15539686)
+
+[简体中文](README.md) | English
+
+---
+
+MIRA (runtime core: `nativePC\plugins\mhw_rng.dll`) is an in-game RNG observation, override, and conditional routing framework built on a **microkernel + hot-reloadable plugin architecture**. Loaded via Stracker's Loader, it lets players and researchers control monster crown sizes, endemic life scales, monster THK AI decisions, and Steamworks draws directly from in-game chat (`$rng`, also accepting `$rng_<subcmd>`), without Cheat Engine, game restarts, or modifying `.thk` or asset files.
+
+> [!NOTE]
+> This framework and its official plugins are intended for single-player practice, mechanics testing, and reverse-engineering research. Do not use them in public multiplayer lobbies.
+
+---
+
+## 1. How It Works: Microkernel & RNG Capabilities
+
+### Why a Microkernel + Composite Slot Table
+
+In vanilla MHW:I, monster AI, size rolls, endemic life spawns, Steamworks shuffles, particles, and UI effects all share the single global `MtRandom::sInstance` across multiple worker threads. Any variation in framerate or visual effects shifts the shared PRNG state, making a raw global seed insufficient for reproducible behavior.
+
+MIRA separates low-level hook installation, slot state management, and plugin hosting into a domain-agnostic microkernel (`mhw_rng.dll`), while keeping all game-specific memory parsing and rules inside hot-reloadable plugin DLLs (`nativePC\plugins\mhw_rng\*.dll`):
+
+```mermaid
+flowchart LR
+    Game["MonsterHunterWorld.exe 15.23 (10 PRNG Entries)"]
+    Kernel["MIRA Microkernel (mhw_rng.dll: W^X Pool + MASM Regs + 16K Slots + Hook Chains)"]
+    PlugSize["rng_size.dll"]
+    PlugEnd["rng_endemic.dll"]
+    PlugThk["rng_thk.dll"]
+    PlugSteam["rng_steam.dll"]
+    PlugInsp["rng_inspector.dll"]
+    PlugCustom["Custom Plugins"]
+
+    Game -->|"5-byte E9 Detour + Chaining"| Kernel
+    Kernel <-->|"SDK v3.0 C ABI (Pre / Post / FilterVanilla / Observer)"| PlugSize
+    Kernel <-->|"SDK v3.0 C ABI"| PlugEnd
+    Kernel <-->|"SDK v3.0 C ABI"| PlugThk
+    Kernel <-->|"SDK v3.0 C ABI"| PlugSteam
+    Kernel <-->|"Fallback Meta + Stats"| PlugInsp
+    Kernel <-->|"Single Header mhw_rng_api.h"| PlugCustom
+```
+
+### RNG Manipulation Capabilities Provided by the Microkernel
+
+1. **10-Entry PRNG Interception & Register Capture**
+   - Hooks all 10 PRNG entries in the 15.23 `.text` segment: `MtRandom` (`nrand`, `ctor(seed)`, `ctor_default`, `srand`, `randUnitSphere`), `mt19937` (`envelope_range`, `heap_init`, `heap_draw`), `std::_Random_device`, and `CRT_rand`.
+   - MASM x64 entry thunks preserve all 8 non-volatile caller GPRs (`RBX/RBP/RSI/RDI/R12..R15`), the caller stack return slot, and original call arguments (`seed`, `minVal`/`maxVal`, etc.), enabling plugins to inspect active `Monster*`, species entries, THK states, or `cSteamControl*` without extra hooks.
+   - Pre-reserves a contiguous **64 KB (`16 × 4 KB`)** strict W^X (`PAGE_EXECUTE_READ`) trampoline pool in Phase 1: Page 0 holds the 10 core RNG detours, and Pages 1..15 serve Phase 2 standalone detours (`sChat::DispatchChatEntry`, `sChat::move`, optional `D3DPresent`), with cross-mod `E9` chaining and Phase 3 (`+1.5s` / `+4.0s`) unchained-overwrite self-healing.
+
+2. **16,384-Slot `(CondID, CallSiteRVA)` Stream Isolation**
+   - Isolates deterministic streams per call site and plugin-defined `CondID` in a tombstone-capable hash table so unrelated monsters or conditions never perturb each other.
+   - Supports 5 slot modes: `MasterDerived`, `CustomSeed` (64-bit per-slot seed), `FixedValue` (constant `uint32_t`), `Sequence` (`Loop` / `HoldLast` / `FallbackDerived`, with reclaimable heap storage for `> 8` items), and `Bypass` (original vanilla function).
+
+3. **3-State Global Engine Mode**
+   - `on` (`Takeover`): applies slot overrides and plugin hooks.
+   - `observe` (`ObserveOnly`): executes vanilla RNG for 100% unmodified outputs while maintaining call counters and firing `kMhwRngHookObserveOnly` / global observers.
+   - `off` (`Off`): directly calls original vanilla functions without entering slot lookup.
+
+4. **`O(1)` Epoch Reset & Binary State Snapshots**
+   - `$rng reset` increments the global `Epoch` to rewind all derived streams and zero per-round counters in `O(1)`.
+   - `$rng save [name]` / `$rng restore [name]` / `$rng saves` capture and restore full-table binary snapshots verified with `'MRSS'` magic and CRC32.
+
+5. **Plugin Arbitration Pipeline**
+   - Push-mode condition switching (`SetActiveCondition`), prioritized multi-plugin Hook chains (up to 8 hooks per RVA), `FilterVanilla` post-draw inspection/clamping, global wildcard observers, main-thread async chat queueing via `sChat::move`, and lifecycle event broadcasts.
+
+---
+
+## 2. Official Plugins (Hot-Reloadable)
+
+Plugins placed in `nativePC\plugins\mhw_rng\*.dll` are loaded through shadow copies inside `.hotload\` before `LoadLibrary`. Source DLL files on disk remain unlocked while the game is running, allowing you to recompile and run `$rng reload <name>` (or `$rng load` / `$rng unload`) without restarting MHW.
+
+| Plugin | Output DLL | Hook RVA(s) | Capabilities & Example Commands | Repo & Docs |
+| :--- | :--- | :--- | :--- | :--- |
+| **`size`** | `rng_size.dll` | `0x169BA15` | Per-`MonsterID` crown and size control for all 71 large monsters; safe open interval `[0x00000001U, 0xFFFFFF00U]` skips zero-weight disabled rows; live `cSizeTable` inverse solving (`exact`). Examples: `$rng size furious_rajang min`, `$rng size rajang* exact 116` | [mhw-rng-size](https://github.com/Miraboreasyu/mhw-rng-size) \| [README](plugins/size/README.md) |
+| **`endemic`** | `rng_endemic.dll` | `0x166CFE1` / `0x0672FBC` / `0x1669CB6` | Covers both map spawn and capture size rolls, filters shared float helpers by caller return address, supports crown tiers, per-`ecXXX_YY` rules, and live `rAnimalSize` scale/cm solving. Examples: `$rng endemic max`, `$rng endemic ec059_02 exact 25.5cm` | [mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic) \| [README](plugins/endemic/README.md) |
+| **`thk`** | `rng_thk.dll` + `thk_presets\*.txt` | `0x1339C8C` | Pure-RNG THK AI node probing, per-monster move/decision counters, count-gated rules, weighted branch splits, move sequences, and hot-reloadable `.txt` presets; includes Fatalis Phase 1 bipedal + quadruped preset (`f=0,4`). Examples: `$rng fatalis on`, `$rng thk probe on 91` | [mhw-rng-thk](https://github.com/Miraboreasyu/mhw-rng-thk) \| [README](plugins/thk/README.md) \| [PRESET_GUIDE](plugins/thk/PRESET_GUIDE.md) |
+| **`steam`** | `rng_steam.dll` (`1.1.0`) | `0x066679A` / `0x06667BB` / `0x05CA0A2` | Real-time Steamworks 3-key order, red round, and hidden-pity decoding in both `ObserveOnly` and `Takeover`; optional sequence lock (bare `$rng steam lock` defaults to `awd`); default `verbose off` keeps locked rounds and pity triggers quiet (`$rng steam verbose on` enables them). Also serves as the SDK v3.0 showcase | [mhw-rng-steam](https://github.com/Miraboreasyu/mhw-rng-steam) \| [README](plugins/steam/README.md) |
+| **`inspector`** | `rng_inspector.dll` | None (zero hot-path overhead) | Static fallback dictionary of 1,697 call sites and 793 outer function ranges, live activity ranking/export, and scale-aware value injection; can be unloaded at runtime via `$rng unload inspector`. Examples: `$rng top`, `$rng dump`, `$rng fix meal 0` | [mhw-rng-inspector](https://github.com/Miraboreasyu/mhw-rng-inspector) \| [README](plugins/inspector/README.md) |
+
+### Installation & Core Commands
+
+1. **Prerequisite**: Install [Stracker's Loader](https://www.nexusmods.com/monsterhunterworld/mods/1982).
+2. **Deploy files** under the game's `nativePC\plugins\` directory:
+   - `nativePC\plugins\mhw_rng.dll`
+   - `nativePC\plugins\mhw_rng.ini`
+   - `nativePC\plugins\mhw_rng\rng_size.dll`, `rng_endemic.dll`, `rng_thk.dll`, `rng_steam.dll`, `rng_inspector.dll`
+   - `nativePC\plugins\mhw_rng\thk_presets\fatalis_p1_nasty.txt`
+3. **Verify**: Once in-game chat initializes, MIRA posts `[RNG] mhw_rng v3.0 已就绪（...）`.
+
+Core built-in commands (prefix configurable via `ChatPrefix` in [mhw_rng.ini](mhw_rng.ini)):
+
+| Command | Description |
+| :--- | :--- |
+| `$rng` / `$rng status` | Show engine mode, active seed, epoch, loaded plugin count, and active rules |
+| `$rng help` | List core commands and all loaded plugin subcommands |
+| `$rng on` / `$rng observe` / `$rng off` | Switch between Takeover, ObserveOnly (vanilla RNG), and Off |
+| `$rng seed <u64>` / `$rng reset` | Set 64-bit master seed or reset epoch counters/streams |
+| `$rng save [name]` / `$rng restore [name]` / `$rng saves` | Capture, restore, or list in-memory RNG state snapshots |
+| `$rng plugins` / `load <name>` / `unload <name>` / `reload [name]` | Inspect, load, unload, or hot-reload plugins (bare `reload` also reloads `mhw_rng.ini`) |
+| `$rng clearall` | Clear all slot overrides and broadcast `kMhwRngEventClearAllRules` to plugins |
+
+---
+
+## 3. Plugin SDK v3.0 & Build Guide
+
+MIRA exposes a single-header C ABI via [include/mhw_rng_api.h](include/mhw_rng_api.h) (`kMhwRngApiVersion == 3`), requiring **no `.lib` import library** to compile plugins.
+
+### 1. Exports & `MhwRngHostApi` Overview
+
+Each plugin DLL exports up to 3 C entry points:
+- `const MhwRngPluginDescriptor* MhwRngPlugin_GetInfo()`
+- `bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPluginId selfId)`
+- `void MhwRngPlugin_Shutdown()` *(optional; invoked after hooks, in-flight calls, subcommands, and slot rules are cleaned up)*
+
+Key `MhwRngHostApi` capabilities:
+
+| Group | Key APIs | Purpose |
+| :--- | :--- | :--- |
+| Global Control | `SetEngineMode` / `GetEngineMode` / `SetMasterSeed` / `ResetEpoch` | Control 3-state engine mode, seed, and epoch |
+| Conditions & Slots | `SetActiveCondition` / `SetCondMasterDerived` / `SetCondCustomSeed` / `SetCondFixedValue` / `SetCondSequence` / `SetCondBypass` / `ReleaseCondSlot` | Push condition routing, per-`(rva, condId)` slot configuration, and tombstone slot reclamation |
+| Hooks & Observers | `RegisterSlotHook` / `RegisterSlotHookEx` / `RegisterGlobalObserver` / `RegisterLifecycleHook` | Prioritized Pre/Post/`FilterVanilla` hook chains, wildcard observers, and lifecycle notifications |
+| Context & Wrappers | `MhwRngDrawContext` (`callerRegs`, `origArg1/2`, `origMinVal/MaxVal`, `origReturnRva`) / `RegisterTransparentWrapper` / `SetInstancePolicy` | Read preserved entry GPRs and original arguments, unwrap custom wrappers, and configure private `MtRandom` policy |
+| Snapshots | `GetCondSlotInfo` / `SnapshotActiveSlots` / `RestoreSlotState` / `CaptureStateBlob` / `RestoreStateBlob` | Inspect slot state or capture/restore CRC32-checked binary blobs |
+| Chat & Metadata | `RegisterSubcommand` / `RegisterSiteMeta` / `SetFallbackMetaResolver` / `ChatPrintAsync` / `ChatPrintfAsync` / `Log` | Register `$rng <subcmd>` handlers, format site telemetry, and emit thread-safe async chat notices |
+
+### 2. Minimal Plugin Example
+
+For a complete SDK v3.0 reference covering `RegisterSlotHookEx`, `ObserveOnly`, MASM register reads (`rbx`/`rdi`), async chat notices, and lifecycle hooks, see [plugins/steam/steam_plugin.cpp](plugins/steam/steam_plugin.cpp). Minimal starter skeleton:
+
+```cpp
+#include "mhw_rng_api.h"
+
+namespace {
+const MhwRngHostApi* g_host   = nullptr;
+MhwRngPluginId       g_selfId = 0;
+
+constexpr std::uint32_t kRvaMealTrigger = 0x0F99246U; // Felyne food skill activation (u32 % 100)
+
+void __fastcall Cmd_Meal(int argc, const char* const* argv, const char*, void*) {
+    if (argc >= 1 && argv[0][0] == '0') {
+        g_host->ClearSlotAllConditions(kRvaMealTrigger);
+        g_host->ChatPrint(u8"[meal] Restored default food skill RNG");
+        return;
+    }
+    g_host->SetCondFixedValue(g_selfId, kRvaMealTrigger, 0U, 0U);
+    g_host->ChatPrint(u8"[meal] Fixed food skill roll remainder to 0");
+}
+
+const MhwRngPluginDescriptor kDesc = {
+    kMhwRngApiVersion, "meal", u8"Meal Trigger Sample Plugin", "1.0.0", u8"Fixed food skill activation"
+};
+} // namespace
+
+MHW_RNG_PLUGIN_EXPORT const MhwRngPluginDescriptor* MhwRngPlugin_GetInfo() { return &kDesc; }
+
+MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPluginId selfId) {
+    if (!host || host->apiVersion != kMhwRngApiVersion) return false;
+    g_host   = host;
+    g_selfId = selfId;
+    host->RegisterSiteMeta(selfId, kRvaMealTrigger, "meal.trigger", u8"Food skill roll", nullptr, nullptr);
+    host->RegisterSubcommand(selfId, "meal", "$rng meal [1|0]", u8"Fix or restore food skill roll", &Cmd_Meal, nullptr);
+    return true;
+}
+
+MHW_RNG_PLUGIN_EXPORT void MhwRngPlugin_Shutdown() { g_host = nullptr; g_selfId = 0; }
+```
+
+Compile in an MSVC x64 developer shell:
+
+```bat
+cl.exe /nologo /std:c++17 /O2 /EHsc /MT /utf-8 /I "include" rng_meal.cpp /LD /Fe:"nativePC\plugins\mhw_rng\rng_meal.dll"
+```
+
+Load in-game via `$rng load meal`, then rebuild and run `$rng reload meal` for iterative updates.
+
+### 3. Build & Offline Regression Suite
+
+```bash
+git clone --recursive https://github.com/Miraboreasyu/mhw-rng.git
+```
+
+- **Build all modules**: run [`build.bat`](build.bat) to sync plugin SDK headers and build `build\mhw_rng.dll`, `build\mhw_rng\rng_*.dll`, and `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`.
+- **Run offline tests**: run [`run_tests.bat`](run_tests.bat) (requires an unpacked 15.23 `.text` dump `text_1523.bin` via CLI argument or `MHW_TEXT_BIN`) to exercise all 10 W^X hooks, 8-thread isolation, all 5 official plugins, and SDK v3.0 behavior against real machine code.
+
+### 4. Documentation Index
+
+- Core Architecture & SDK Specification: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Public Header & Config: [include/mhw_rng_api.h](include/mhw_rng_api.h) | [mhw_rng.ini](mhw_rng.ini)
+- Official Plugin Docs: [size](plugins/size/README.md) | [endemic](plugins/endemic/README.md) | [thk](plugins/thk/README.md) ([Preset Guide](plugins/thk/PRESET_GUIDE.md)) | [steam](plugins/steam/README.md) | [inspector](plugins/inspector/README.md)
