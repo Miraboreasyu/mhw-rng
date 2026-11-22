@@ -54,8 +54,9 @@ flowchart LR
    - Isolates deterministic streams per call site and plugin-defined `CondID` in a tombstone-capable hash table so unrelated monsters or conditions never perturb each other.
    - Supports 5 slot modes: `MasterDerived`, `CustomSeed` (64-bit per-slot seed), `FixedValue` (constant `uint32_t`), `Sequence` (`Loop` / `HoldLast` / `FallbackDerived`, with reclaimable heap storage for `> 8` items), and `Bypass` (original vanilla function).
 
-3. **3-State Global Engine Mode**
-   - `on` (`Takeover`): applies slot overrides and plugin hooks.
+3. **4-State Global Engine Mode & Save-Seed Protection**
+   - `selective` (`Selective`, default): intercepts only slots with active overrides or plugin hooks; all untouched gameplay sites and save-persisted PRNG seeds run 100% vanilla.
+   - `on` (`Takeover`): full deterministic takeover across gameplay call sites; with `ProtectSaveSeeds = true` (default), 31 save-persisted PRNG stepper RVAs (canteen/melder/appraisal/Safi awakening/save salt) stay untouched unless explicitly overridden.
    - `observe` (`ObserveOnly`): executes vanilla RNG for 100% unmodified outputs while maintaining call counters and firing `kMhwRngHookObserveOnly` / global observers.
    - `off` (`Off`): directly calls original vanilla functions without entering slot lookup.
 
@@ -96,7 +97,7 @@ Core built-in commands (prefix configurable via `ChatPrefix` in [mhw_rng.ini](mh
 | :--- | :--- |
 | `$rng` / `$rng status` | Show engine mode, active seed, epoch, loaded plugin count, and active rules |
 | `$rng help` | List core commands and all loaded plugin subcommands |
-| `$rng on` / `$rng observe` / `$rng off` | Switch between Takeover, ObserveOnly (vanilla RNG), and Off |
+| `$rng selective` / `$rng on` / `$rng observe` / `$rng off` | Switch between Selective (default), full Takeover, ObserveOnly (vanilla RNG), and Off |
 | `$rng seed <u64>` / `$rng reset` | Set 64-bit master seed or reset epoch counters/streams |
 | `$rng save [name]` / `$rng restore [name]` / `$rng saves` | Capture, restore, or list in-memory RNG state snapshots |
 | `$rng plugins` / `load <name>` / `unload <name>` / `reload [name]` | Inspect, load, unload, or hot-reload plugins (bare `reload` also reloads `mhw_rng.ini`) |
@@ -119,7 +120,7 @@ Key `MhwRngHostApi` capabilities:
 
 | Group | Key APIs | Purpose |
 | :--- | :--- | :--- |
-| Global Control | `SetEngineMode` / `GetEngineMode` / `SetMasterSeed` / `ResetEpoch` | Control 3-state engine mode, seed, and epoch |
+| Global Control | `SetEngineMode` / `GetEngineMode` / `SetMasterSeed` / `ResetEpoch` | Control 4-state engine mode, seed, and epoch |
 | Conditions & Slots | `SetActiveCondition` / `SetCondMasterDerived` / `SetCondCustomSeed` / `SetCondFixedValue` / `SetCondSequence` / `SetCondBypass` / `ReleaseCondSlot` | Push condition routing, per-`(rva, condId)` slot configuration, and tombstone slot reclamation |
 | Hooks & Observers | `RegisterSlotHook` / `RegisterSlotHookEx` / `RegisterGlobalObserver` / `RegisterLifecycleHook` | Prioritized Pre/Post/`FilterVanilla` hook chains, wildcard observers, and lifecycle notifications |
 | Context & Wrappers | `MhwRngDrawContext` (`callerRegs`, `origArg1/2`, `origMinVal/MaxVal`, `origReturnRva`) / `RegisterTransparentWrapper` / `SetInstancePolicy` | Read preserved entry GPRs and original arguments, unwrap custom wrappers, and configure private `MtRandom` policy |

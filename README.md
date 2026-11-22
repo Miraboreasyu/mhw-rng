@@ -54,8 +54,9 @@ flowchart LR
    - 每个调用点可按条件编号 `CondID` 拆分为互不干扰的独立随机流（支持 Tombstone 槽位回收），同一场战斗中的不同怪物或不同条件彼此独立。
    - 支持五种槽模式：`MasterDerived`（按总种子、RVA 与条件号派生）、`CustomSeed`（独立 64 位种子）、`FixedValue`（固定原始 `uint32_t`）、`Sequence`（按序输出数组，支持 `Loop` / `HoldLast` / `FallbackDerived`，`> 8` 项动态分配可回收堆缓冲）与 `Bypass`（原版直通）。
 
-3. **三态全局引擎切换**
-   - `on`（Takeover）：完整接管模式，按槽规则与插件回调控制随机数输出。
+3. **四态全局引擎切换与存档种子保护**
+   - `selective`（Selective，默认推荐）：按需接管模式，仅对配置了槽规则或挂载了插件钩子的点位生效；其余未触碰的游戏调用点及存档持久化种子 100% 走原版 RNG。
+   - `on`（Takeover）：全局确定性接管模式，所有玩法调用点按总种子派生；配合 `ProtectSaveSeeds = true`（默认开启）时自动保护猫饭/炼金/鉴定/赤龙觉醒等 31 处存档持久化种子推进器免被改写。
    - `observe`（ObserveOnly）：仅观测模式，全部抽取走原版实现并保持原版结果不变，同时继续维持计数器并触发带 `kMhwRngHookObserveOnly` 的只读观测回调。
    - `off`（Off）：关闭接管，直接跳转原版函数。
 
@@ -96,7 +97,7 @@ flowchart LR
 | :--- | :--- |
 | `$rng` / `$rng status` | 查看引擎状态、当前总种子、轮次、已载入插件数与激活规则 |
 | `$rng help` | 列出微内核指令及当前所有已加载插件注册的子指令 |
-| `$rng on` / `$rng observe` / `$rng off` | 切换完整接管 / 仅观测（保持原版结果） / 关闭直通 |
+| `$rng selective` / `$rng on` / `$rng observe` / `$rng off` | 切换按需接管（默认）/ 全局接管 / 仅观测（原版结果）/ 关闭直通 |
 | `$rng seed <u64>` / `$rng reset` | 切换 64 位总种子或按 `Epoch` 归零全部确定性随机流 |
 | `$rng save [name]` / `$rng restore [name]` / `$rng saves` | 保存、恢复或列出内存中的全表二进制 RNG 状态快照 |
 | `$rng plugins` / `load <name>` / `unload <name>` / `reload [name]` | 管理并免重启热重载子插件（无参数 `reload` 同时重读 `mhw_rng.ini`） |
@@ -119,7 +120,7 @@ MIRA 通过单头文件 [include/mhw_rng_api.h](include/mhw_rng_api.h) 向所有
 
 | 类别 | 主要接口 | 作用 |
 | :--- | :--- | :--- |
-| 全局状态 | `SetEngineMode` / `GetEngineMode` / `SetMasterSeed` / `ResetEpoch` | 切换三态引擎模式、读写总种子与全局轮次 |
+| 全局状态 | `SetEngineMode` / `GetEngineMode` / `SetMasterSeed` / `ResetEpoch` | 切换四态引擎模式、读写总种子与全局轮次 |
 | 条件与槽位规则 | `SetActiveCondition` / `SetCondMasterDerived` / `SetCondCustomSeed` / `SetCondFixedValue` / `SetCondSequence` / `SetCondBypass` / `ReleaseCondSlot` | Push 模式条件切换、按 `(rva, condId)` 写规则及回收 Tombstone 条件槽 |
 | Hook 链与观测 | `RegisterSlotHook` / `RegisterSlotHookEx` / `RegisterGlobalObserver` / `RegisterLifecycleHook` | 按优先级挂载 Pre/Post/`FilterVanilla` 回调、全游戏通配观测器与生命周期事件监听 |
 | 现场与封装展开 | `MhwRngDrawContext`（`callerRegs`、`origArg1/2`、`origMinVal/MaxVal`、`origReturnRva`）/ `RegisterTransparentWrapper` / `SetInstancePolicy` | 读取入口 8 个非易失寄存器与原入参、注册自定义栈帧展开与私有 `MtRandom` 策略 |

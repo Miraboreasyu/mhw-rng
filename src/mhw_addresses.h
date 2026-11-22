@@ -96,14 +96,38 @@ constexpr std::uint8_t kPrologueMt19937HeapDraw[6] = {
     0x48, 0x83, 0xEC, 0x20
 };
 
-// int CRT_rand(void) @ 0x142C58034 (4B-aligned; +4 is E8 rel32 call to __acrt_getptd 0x142C64908)
-//   [+0, 4B] 48 83 EC 28        sub rsp, 0x28
-//   [+4, 5B] E8 CB C8 00 00     call 0x142C64908
+// CRT_rand() @ 0x142C58034
 constexpr std::uintptr_t kRvaCrtRand = 0x2C58034;
 constexpr std::uint8_t kPrologueCrtRand[9] = {
     0x48, 0x83, 0xEC, 0x28,
     0xE8, 0xCB, 0xC8, 0x00, 0x00
 };
+
+// ---- Save-Persisted PRNG Steppers & Seeder RVAs (`ProtectSaveSeeds`) ----
+// Return RVAs for game routines that read a seed from cUserData/cPCSaveData/Safi,
+// advance it once, and write the new seed back to persistent save memory.
+constexpr std::uint32_t kSaveSeedProtectedRvas[] = {
+    // cPCSaveData save salt
+    0x031B682U, 0x031B69AU, 0x031B803U, 0x031B81AU, 0x031BA5BU, 0x031BA7AU,
+    // Safi'jiiva awakening seed stepper (FUN_140b1c480)
+    0x0B1C493U, 0x0B1C4A0U, 0x0B1C4AAU,
+    // cUserData persistent PRNG steppers (reward / facility / canteen / melder / appraisal / palico)
+    0x135D927U, 0x135D931U, // FUN_14135d900 -> cUserData+0x26A524
+    0x135D977U, 0x135D981U, // FUN_14135d950 -> cUserData+0x26CA78
+    0x135D9D2U, 0x135D9DCU, // FUN_14135d9a0 -> cUserData+0x102758[idx]
+    0x135DA34U, 0x135DA3EU, // FUN_14135da00 -> cUserData+0x26A50C[idx]
+    0x135DA97U, 0x135DAA1U, // FUN_14135da60 -> cUserData+0x1034A0[idx]
+    0x135DB20U, 0x135DB2CU, 0x135DB3AU, 0x135DB53U, // FUN_14135dad0 -> cUserData+0x26A3FC/+0x26A540
+    0x135DBA7U, 0x135DBB1U, // FUN_14135db80 -> cUserData+0x10C260
+    0x136B30FU, 0x136B31FU, 0x136B32FU, 0x136B33CU, 0x136B3A4U, 0x136B3AEU // cUserData+0x10275C
+};
+
+inline bool IsSaveSeedProtectedRva(std::uint32_t rva) noexcept {
+    for (std::uint32_t p : kSaveSeedProtectedRvas) {
+        if (p == rva) return true;
+    }
+    return false;
+}
 
 // ---- Engine Math & .rdata Constants Used by 0x142174E60 & 0x1427D3E60 ----
 // __libm_sse2_sincosf_(float angleInXmm0) -> XMM0 low32 = sin, second32 = cos @ 0x1427422A0

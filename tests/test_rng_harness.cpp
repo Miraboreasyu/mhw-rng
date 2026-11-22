@@ -199,6 +199,7 @@ int main(int argc, char** argv) {
     app::Config cfg{};
     cfg.masterSeed     = 0xCAFEBABE12345678ULL;
     cfg.takeoverOnBoot = true;
+    cfg.bootMode       = kMhwRngModeTakeover;
     rng::Init(base, end, cfg);
 
     void *origNrand = nullptr, *origCtor = nullptr, *origDef = nullptr, *origSrand = nullptr, *origSph = nullptr;
@@ -2100,6 +2101,201 @@ int main(int argc, char** argv) {
     }
     std::printf("[OK] sChat::move standalone W^X pool page verified (relay=%p)!\n",
                 reinterpret_cast<void*>(relayMove));
+
+    // 13. Verify `kMhwRngModeSelective` + `ProtectSaveSeeds` (using real MHW 15.23 `FUN_14135d9a0`)
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        constexpr MhwRngPluginId kTestPluginId = 999U;
+        host->ClearAllRules();
+        host->ResetEpoch();
+
+        // Populate IAT entries used by `FUN_14135d9a0` (`0x135D9B8` -> 0x2E13000, `0x135D9E6` -> 0x2E13008)
+        auto noopCritSec = +[](void*) {};
+        *reinterpret_cast<std::uintptr_t*>(base + 0x2E13000U) = reinterpret_cast<std::uintptr_t>(noopCritSec);
+        *reinterpret_cast<std::uintptr_t*>(base + 0x2E13008U) = reinterpret_cast<std::uintptr_t>(noopCritSec);
+
+        using SaveSeedStepFn = void(__fastcall*)(void* cUserData, std::uint32_t idx);
+        const auto fnSaveStepper = reinterpret_cast<SaveSeedStepFn>(base + 0x135D9A0U);
+        std::vector<std::uint8_t> fakeUserData(0x103000U, 0U);
+        auto* saveSeedPtr = reinterpret_cast<std::uint32_t*>(fakeUserData.data() + 0x102758U + 2U * 4U);
+        constexpr std::uint32_t kOrigSaveSeed = 0x3C4B2B0DU;
+
+        // Measure pure vanilla output from `kMhwRngModeOff`
+        host->SetEngineMode(kMhwRngModeOff);
+        *saveSeedPtr = kOrigSaveSeed;
+        fnSaveStepper(fakeUserData.data(), 2U);
+        const std::uint32_t expSaveVanilla1 = *saveSeedPtr;
+        fnSaveStepper(fakeUserData.data(), 2U);
+        const std::uint32_t expSaveVanilla2 = *saveSeedPtr;
+
+        // Also measure pure vanilla MtRandom::nrand(&sInst) sequence for SiteA / SiteB
+        std::uint32_t refInst[4]{0x11223344U, 0x55667788U, 0x99AABBCCU, 0xDDEEFF00U};
+        std::memcpy(sInst, refInst, sizeof(refInst));
+        const std::uint32_t expSiteAVan1 = CallNrandSiteA(fnNrand, sInst);
+        const std::uint32_t expSiteAVan2 = CallNrandSiteA(fnNrand, sInst);
+        std::uint32_t expSiteAVan3_fromStep = 0U;
+        {
+            const std::uint32_t expB_DummyVan = CallNrandSiteB(fnNrand, sInst);
+            (void)expB_DummyVan;
+            expSiteAVan3_fromStep = CallNrandSiteA(fnNrand, sInst);
+        }
+
+        // Test `SetTakeoverEnabled` / `IsTakeoverEnabled` state machine
+        if (host->IsTakeoverEnabled()) {
+            std::printf("FAIL [Selective-1]: IsTakeoverEnabled should be false in Off mode\n");
+            return 1;
+        }
+        host->SetTakeoverEnabled(true); // From Off -> Selective
+        if (host->GetEngineMode() != kMhwRngModeSelective || !host->IsTakeoverEnabled()) {
+            std::printf("FAIL [Selective-1]: SetTakeoverEnabled(true) from Off expected Selective, got %u\n", host->GetEngineMode());
+            return 1;
+        }
+        host->SetEngineMode(kMhwRngModeTakeover);
+        host->SetTakeoverEnabled(true); // Preserves Takeover if already active
+        if (host->GetEngineMode() != kMhwRngModeTakeover) {
+            std::printf("FAIL [Selective-1]: SetTakeoverEnabled(true) from Takeover should stay Takeover\n");
+            return 1;
+        }
+        host->SetEngineMode(kMhwRngModeSelective);
+
+        // Identify SiteA and SiteB RVAs and attach a GlobalObserver to verify telemetry
+        struct SelObsState { std::uint32_t count = 0U; std::uint32_t lastRva = 0U; std::uint32_t lastFlags = 0U; } obsSt{};
+        const MhwRngHookHandle hSelObs = host->RegisterGlobalObserver(
+            kTestPluginId, 0U, (1U << kMhwRngSrcMtNrandGlobal),
+            +[](const MhwRngDrawContext* c, void* ud) {
+                auto* s = static_cast<SelObsState*>(ud);
+                ++s->count;
+                s->lastRva   = c->callSiteRva;
+                s->lastFlags = c->callFlags;
+            },
+            &obsSt);
+
+        // Reset sInst and draw SiteA unoverridden + observe SiteB RVA
+        std::memcpy(sInst, refInst, sizeof(refInst));
+        const std::uint32_t gotSelA1 = CallNrandSiteA(fnNrand, sInst);
+        const std::uint32_t selARva  = obsSt.lastRva;
+        const std::uint32_t selAFlags= obsSt.lastFlags;
+        const std::uint32_t gotSelA2 = CallNrandSiteA(fnNrand, sInst);
+        (void)CallNrandSiteB(fnNrand, sInst);
+        const std::uint32_t selBRva  = obsSt.lastRva;
+
+        // Now override ONLY SiteB with FixedValue = 0x12345678 and verify SiteA stays pure vanilla
+        host->SetCondFixedValue(kTestPluginId, selBRva, 0U, 0x12345678U);
+        const std::uint32_t gotSelB_ovr = CallNrandSiteB(fnNrand, sInst);
+        const std::uint32_t gotSelA3    = CallNrandSiteA(fnNrand, sInst);
+        host->UnregisterGlobalObserver(kTestPluginId, hSelObs);
+
+        // Note: SiteB consumed a step on sInst before being overridden, so re-verify SiteA without touching SiteB on sInst
+        std::memcpy(sInst, refInst, sizeof(refInst));
+        (void)CallNrandSiteA(fnNrand, sInst);
+        (void)CallNrandSiteA(fnNrand, sInst);
+        const std::uint32_t gotSelB_ovr2 = CallNrandSiteB(fnNrand, sInst);
+        const std::uint32_t gotSelA_afterOvr = CallNrandSiteA(fnNrand, sInst);
+        (void)expSiteAVan3_fromStep;
+        if (gotSelA1 != expSiteAVan1 || gotSelA2 != expSiteAVan2 ||
+            (selAFlags & kMhwRngDrawFlagBypassed) == 0U ||
+            gotSelB_ovr != 0x12345678U || gotSelB_ovr2 != 0x12345678U ||
+            obsSt.count != 5U) {
+            std::printf("FAIL [Selective-2]: A1=%X(%X) A2=%X(%X) B_ovr=%X obs=%u flags=0x%X\n",
+                        gotSelA1, expSiteAVan1, gotSelA2, expSiteAVan2, gotSelB_ovr, obsSt.count, selAFlags);
+            return 1;
+        }
+        // Notice after B is overridden in Selective mode, sInst wasn't stepped by vanilla B, so A now matches step#3 of sInst!
+        std::memcpy(sInst, refInst, sizeof(refInst));
+        (void)CallNrandSiteA(fnNrand, sInst);
+        (void)CallNrandSiteA(fnNrand, sInst);
+        const std::uint32_t pureStep3 = CallNrandSiteA(fnNrand, sInst);
+        (void)gotSelA3; (void)selARva; (void)gotSelA_afterOvr;
+        if (gotSelA_afterOvr != pureStep3) {
+            std::printf("FAIL [Selective-2b]: Overridden SiteB unexpectedly stepped vanilla sInst (%X vs %X)!\n",
+                        gotSelA_afterOvr, pureStep3);
+            return 1;
+        }
+
+        // Test SlotHook in Selective mode (`ReturnValue` overrides; `UseCondition(0)` falls back to pure vanilla + still invokes postFn)
+        struct SelHookState { bool shouldOverride = false; std::uint32_t lastPostFlags = 0U; std::uint32_t lastPostVal = 0U; } hkSt{};
+        MhwRngHookDesc selHkDesc{};
+        selHkDesc.structSize = sizeof(MhwRngHookDesc);
+        selHkDesc.rva = selARva;
+        selHkDesc.flags = kMhwRngHookPre | kMhwRngHookPost;
+        selHkDesc.preFn = +[](const MhwRngDrawContext*, MhwRngHookDecision* d, void* ud) {
+            auto* st = static_cast<SelHookState*>(ud);
+            if (st->shouldOverride) {
+                d->action = kMhwRngActionReturnValue;
+                d->value0 = 0xCAFEBABEU;
+            } else {
+                d->action = kMhwRngActionUseCondition;
+                d->condId = 0U;
+            }
+        };
+        selHkDesc.postFn = +[](const MhwRngDrawContext* c, MhwRngHookDecision*, void* ud) {
+            auto* st = static_cast<SelHookState*>(ud);
+            st->lastPostFlags = c->callFlags;
+            st->lastPostVal   = c->finalValue0;
+        };
+        selHkDesc.userData = &hkSt;
+        const MhwRngHookHandle hSelHook = host->RegisterSlotHookEx(kTestPluginId, &selHkDesc);
+
+        std::memcpy(sInst, refInst, sizeof(refInst));
+        hkSt.shouldOverride = false;
+        const std::uint32_t hookPassA = CallNrandSiteA(fnNrand, sInst);
+        const bool passFlagsOk = (hkSt.lastPostFlags & (kMhwRngDrawFlagBypassed | kMhwRngDrawFlagHasVanilla)) ==
+                                     (kMhwRngDrawFlagBypassed | kMhwRngDrawFlagHasVanilla) &&
+                                 hkSt.lastPostVal == expSiteAVan1;
+        hkSt.shouldOverride = true;
+        const std::uint32_t hookOvrA = CallNrandSiteA(fnNrand, sInst);
+        const bool ovrFlagsOk = (hkSt.lastPostFlags & kMhwRngDrawFlagOverridden) != 0U && hkSt.lastPostVal == 0xCAFEBABEU;
+        host->UnregisterSlotHookHandle(kTestPluginId, hSelHook);
+
+        if (hookPassA != expSiteAVan1 || !passFlagsOk || hookOvrA != 0xCAFEBABEU || !ovrFlagsOk) {
+            std::printf("FAIL [Selective-3]: hookPass=%X(%X) passFlags=%d hookOvr=%X ovrFlags=%d\n",
+                        hookPassA, expSiteAVan1, passFlagsOk, hookOvrA, ovrFlagsOk);
+            return 1;
+        }
+
+        // Test `ProtectSaveSeeds` on real MHW 15.23 `FUN_14135d9a0`:
+        //   (a) In Selective mode -> pure vanilla
+        //   (b) In full Takeover mode with ProtectSaveSeeds=true -> STILL pure vanilla!
+        //   (c) In full Takeover mode with ProtectSaveSeeds=false -> MIRA deterministic stream (!= vanilla)
+        //   (d) In full Takeover mode with ProtectSaveSeeds=true + explicit FixedValue override on 0x135D9DC -> FixedValue!
+        host->ClearAllRules();
+        host->SetEngineMode(kMhwRngModeSelective);
+        rng::SetProtectSaveSeeds(true);
+        *saveSeedPtr = kOrigSaveSeed;
+        fnSaveStepper(fakeUserData.data(), 2U);
+        const std::uint32_t saveSel1 = *saveSeedPtr;
+        fnSaveStepper(fakeUserData.data(), 2U);
+        const std::uint32_t saveSel2 = *saveSeedPtr;
+
+        host->SetEngineMode(kMhwRngModeTakeover);
+        *saveSeedPtr = kOrigSaveSeed;
+        fnSaveStepper(fakeUserData.data(), 2U);
+        const std::uint32_t saveTakProt1 = *saveSeedPtr;
+        fnSaveStepper(fakeUserData.data(), 2U);
+        const std::uint32_t saveTakProt2 = *saveSeedPtr;
+
+        rng::SetProtectSaveSeeds(false);
+        *saveSeedPtr = kOrigSaveSeed;
+        fnSaveStepper(fakeUserData.data(), 2U);
+        const std::uint32_t saveTakUnprot = *saveSeedPtr;
+
+        rng::SetProtectSaveSeeds(true);
+        host->SetCondFixedValue(kTestPluginId, 0x135D9DCU, 0U, 0x11112222U);
+        *saveSeedPtr = kOrigSaveSeed;
+        fnSaveStepper(fakeUserData.data(), 2U);
+        const std::uint32_t saveTakExplicit = *saveSeedPtr;
+        host->ClearAllRules();
+
+        if (saveSel1 != expSaveVanilla1 || saveSel2 != expSaveVanilla2 ||
+            saveTakProt1 != expSaveVanilla1 || saveTakProt2 != expSaveVanilla2 ||
+            saveTakUnprot == expSaveVanilla1 || saveTakExplicit != 0x11112222U) {
+            std::printf("FAIL [ProtectSaveSeeds]: van=[%X,%X] sel=[%X,%X] takProt=[%X,%X] unprot=%X exp=%X\n",
+                        expSaveVanilla1, expSaveVanilla2, saveSel1, saveSel2,
+                        saveTakProt1, saveTakProt2, saveTakUnprot, saveTakExplicit);
+            return 1;
+        }
+        std::printf("[OK] Selective mode + ProtectSaveSeeds verified on real MHW 15.23 `FUN_14135d9a0`!\n");
+    }
 
     plugin_host::ShutdownAll();
     hook::RemoveAllHooks();

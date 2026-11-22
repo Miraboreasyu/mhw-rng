@@ -231,6 +231,8 @@ Config LoadConfig() {
     }
 
     std::string section;
+    bool hasBootMode       = false;
+    bool hasLegacyTakeover = false;
     char lineBuf[1024]{};
     while (std::fgets(lineBuf, sizeof(lineBuf), f)) {
         std::string line(lineBuf);
@@ -261,12 +263,35 @@ Config LoadConfig() {
         const std::string klow = ToLowerAscii(key);
 
         if (section == "general") {
-            if (klow == "enabled")               cfg.enabled          = ParseBool(val, cfg.enabled);
-            else if (klow == "takeoveronboot")   cfg.takeoverOnBoot   = ParseBool(val, cfg.takeoverOnBoot);
-            else if (klow == "autoloadplugins")  cfg.autoLoadPlugins  = ParseBool(val, cfg.autoLoadPlugins);
-            else if (klow == "showchatfeedback") cfg.showChatFeedback = ParseBool(val, cfg.showChatFeedback);
-            else if (klow == "chatprefix" && !val.empty()) cfg.chatPrefix = val;
-            else if (klow == "masterseed") {
+            if (klow == "enabled") {
+                cfg.enabled = ParseBool(val, cfg.enabled);
+            } else if (klow == "bootmode") {
+                const std::string mlow = ToLowerAscii(val);
+                if (mlow == "selective" || mlow == "sel" || mlow == "partial") {
+                    cfg.bootMode = kMhwRngModeSelective;
+                    hasBootMode  = true;
+                } else if (mlow == "takeover" || mlow == "full" || mlow == "all" || mlow == "on" || mlow == "true" || mlow == "1") {
+                    cfg.bootMode = kMhwRngModeTakeover;
+                    hasBootMode  = true;
+                } else if (mlow == "observe" || mlow == "obs" || mlow == "observeonly") {
+                    cfg.bootMode = kMhwRngModeObserveOnly;
+                    hasBootMode  = true;
+                } else if (mlow == "off" || mlow == "none" || mlow == "false" || mlow == "0") {
+                    cfg.bootMode = kMhwRngModeOff;
+                    hasBootMode  = true;
+                }
+            } else if (klow == "takeoveronboot") {
+                cfg.takeoverOnBoot = ParseBool(val, cfg.takeoverOnBoot);
+                hasLegacyTakeover  = true;
+            } else if (klow == "protectsaveseeds") {
+                cfg.protectSaveSeeds = ParseBool(val, cfg.protectSaveSeeds);
+            } else if (klow == "autoloadplugins") {
+                cfg.autoLoadPlugins = ParseBool(val, cfg.autoLoadPlugins);
+            } else if (klow == "showchatfeedback") {
+                cfg.showChatFeedback = ParseBool(val, cfg.showChatFeedback);
+            } else if (klow == "chatprefix" && !val.empty()) {
+                cfg.chatPrefix = val;
+            } else if (klow == "masterseed") {
                 std::uint64_t s = 0;
                 if (ParseU64Auto(val.c_str(), s)) cfg.masterSeed = s;
             }
@@ -300,10 +325,14 @@ Config LoadConfig() {
     }
 
     std::fclose(f);
-    Log("config: loaded %s (enabled=%d, takeover=%d, autoLoadPlugins=%d, masterSeed=0x%llX, rawRules=%zu)",
+    if (!hasBootMode && hasLegacyTakeover) {
+        cfg.bootMode = cfg.takeoverOnBoot ? kMhwRngModeSelective : kMhwRngModeOff;
+    }
+    Log("config: loaded %s (enabled=%d, bootMode=%u, protectSaveSeeds=%d, autoLoadPlugins=%d, masterSeed=0x%llX, rawRules=%zu)",
         path.c_str(),
         cfg.enabled ? 1 : 0,
-        cfg.takeoverOnBoot ? 1 : 0,
+        static_cast<unsigned>(cfg.bootMode),
+        cfg.protectSaveSeeds ? 1 : 0,
         cfg.autoLoadPlugins ? 1 : 0,
         static_cast<unsigned long long>(cfg.masterSeed),
         cfg.rawSlotRules.size());

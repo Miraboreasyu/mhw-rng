@@ -258,7 +258,8 @@ std::uintptr_t             g_exeBase       = 0;
 std::uintptr_t             g_exeEnd        = 0;
 std::uintptr_t             g_sInstanceAddr = 0;
 
-std::atomic<std::uint32_t> g_engineMode{kMhwRngModeTakeover};
+std::atomic<std::uint32_t> g_engineMode{kMhwRngModeSelective};
+std::atomic<bool>          g_protectSaveSeeds{true};
 std::atomic<std::uint64_t> g_masterSeed{12345ULL};
 std::atomic<std::uint64_t> g_seedEpoch{1ULL};
 
@@ -727,9 +728,10 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
     std::uint32_t obsCount = g_obsCount.load(std::memory_order_acquire);
     const bool enteredInFlight = (chainIdx < kMaxHookChains || obsCount != 0U);
     if (enteredInFlight) {
-        g_inFlightHookCalls.fetch_add(1U, std::memory_order_acq_rel);
-        chainIdx = DecodeChainIdx(baseSlot->hookChainIdxPlus1.load(std::memory_order_acquire));
-        obsCount = g_obsCount.load(std::memory_order_acquire);
+        // Full seq_cst Dekker barrier pairs with writer's seq_cst publish + g_inFlightHookCalls check.
+        g_inFlightHookCalls.fetch_add(1U, std::memory_order_seq_cst);
+        chainIdx = DecodeChainIdx(baseSlot->hookChainIdxPlus1.load(std::memory_order_seq_cst));
+        obsCount = g_obsCount.load(std::memory_order_seq_cst);
     }
 
     const RvaHookChain* chain = (chainIdx < kMaxHookChains && g_hookChains[chainIdx].inUse)
@@ -971,7 +973,11 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
                     targetSlot->sourceKind = static_cast<std::uint8_t>(srcKind);
                 }
                 slotMode = targetSlot->mode;
-                if (slotMode == kMhwRngSlotBypass) {
+                if (slotMode == kMhwRngSlotBypass ||
+                    (slotMode == kMhwRngSlotMasterDerived &&
+                     (engineMode == kMhwRngModeSelective ||
+                      (g_protectSaveSeeds.load(std::memory_order_relaxed) &&
+                       (mhw::IsSaveSeedProtectedRva(rva) || mhw::IsSaveSeedProtectedRva(origRetRva)))))) {
                     slotBypass = true;
                     if (targetSlot->seededEpoch != curEpoch) {
                         targetSlot->epochCalls  = 0ULL;
@@ -1064,8 +1070,8 @@ void FillSnapshotLocked(const RngSlot& src,
     auto countChain = [](const RngSlot& slot) -> std::uint8_t {
         std::uint16_t cIdx = DecodeChainIdx(slot.hookChainIdxPlus1.load(std::memory_order_acquire));
         if (cIdx >= kMaxHookChains) return 0U;
-        g_inFlightHookCalls.fetch_add(1U, std::memory_order_acq_rel);
-        cIdx = DecodeChainIdx(slot.hookChainIdxPlus1.load(std::memory_order_acquire));
+        g_inFlightHookCalls.fetch_add(1U, std::memory_order_seq_cst);
+        cIdx = DecodeChainIdx(slot.hookChainIdxPlus1.load(std::memory_order_seq_cst));
         std::uint8_t cnt = 0U;
         if (cIdx < kMaxHookChains && g_hookChains[cIdx].inUse) {
             cnt = static_cast<std::uint8_t>(g_hookChains[cIdx].count);
@@ -1125,8 +1131,8 @@ bool RebuildChainForRvaLocked(std::uint32_t normRva, RngSlot* baseSlot) {
 
     const std::uint16_t oldChainIdx = DecodeChainIdx(baseSlot->hookChainIdxPlus1.load(std::memory_order_acquire));
     if (mCount == 0U) {
-        baseSlot->hookChainIdxPlus1.store(0U, std::memory_order_release);
-        while (g_inFlightHookCalls.load(std::memory_order_acquire) != 0U) {
+        baseSlot->hookChainIdxPlus1.store(0U, std::memory_order_seq_cst);
+        while (g_inFlightHookCalls.load(std::memory_order_seq_cst) != 0U) {
             _mm_pause();
         }
         if (oldChainIdx < kMaxHookChains) {
@@ -1162,8 +1168,8 @@ bool RebuildChainForRvaLocked(std::uint32_t normRva, RngSlot* baseSlot) {
         if ((he.flags & kMhwRngHookFilterVanilla) != 0U)            nc.hasFilter = true;
     }
 
-    baseSlot->hookChainIdxPlus1.store(static_cast<std::uint16_t>(newChainIdx + 1U), std::memory_order_release);
-    while (g_inFlightHookCalls.load(std::memory_order_acquire) != 0U) {
+    baseSlot->hookChainIdxPlus1.store(static_cast<std::uint16_t>(newChainIdx + 1U), std::memory_order_seq_cst);
+    while (g_inFlightHookCalls.load(std::memory_order_seq_cst) != 0U) {
         _mm_pause();
     }
     if (oldChainIdx < kMaxHookChains) {
@@ -1188,9 +1194,9 @@ void PublishObserverSnapshotLocked() {
             dst.entries[dst.count++] = g_obsStorage[i];
         }
     }
-    g_obsActiveIdx.store(nextIdx, std::memory_order_release);
-    g_obsCount.store(dst.count, std::memory_order_release);
-    while (g_inFlightHookCalls.load(std::memory_order_acquire) != 0U) {
+    g_obsActiveIdx.store(nextIdx, std::memory_order_seq_cst);
+    g_obsCount.store(dst.count, std::memory_order_seq_cst);
+    while (g_inFlightHookCalls.load(std::memory_order_seq_cst) != 0U) {
         _mm_pause();
     }
 }
@@ -1263,7 +1269,9 @@ void Init(std::uintptr_t exeBase, std::uintptr_t exeEnd, const app::Config& cfg)
     RegisterBuiltinWrappers();
 
     g_masterSeed.store(cfg.masterSeed, std::memory_order_relaxed);
-    g_engineMode.store(cfg.takeoverOnBoot ? kMhwRngModeTakeover : kMhwRngModeOff, std::memory_order_release);
+    const std::uint32_t bootMode = (cfg.bootMode <= kMhwRngModeSelective) ? cfg.bootMode : kMhwRngModeSelective;
+    g_engineMode.store(bootMode, std::memory_order_release);
+    g_protectSaveSeeds.store(cfg.protectSaveSeeds, std::memory_order_release);
     g_seedEpoch.store(1ULL, std::memory_order_release);
 
     ApplyConfigRules(cfg, false);
@@ -1294,6 +1302,14 @@ void SetLifecycleEventSink(LifecycleEventSinkFn sink) noexcept {
 
 std::uintptr_t ExeBase() noexcept { return g_exeBase; }
 std::uintptr_t ExeEnd() noexcept  { return g_exeEnd; }
+
+void SetProtectSaveSeeds(bool enabled) noexcept {
+    g_protectSaveSeeds.store(enabled, std::memory_order_release);
+}
+
+bool IsProtectSaveSeedsEnabled() noexcept {
+    return g_protectSaveSeeds.load(std::memory_order_acquire);
+}
 
 std::uint32_t NormalizeUserSiteAddress(std::uint64_t rawAddr, bool* outWasCallInsn) noexcept {
     if (outWasCallInsn) *outWasCallInsn = false;
@@ -1715,7 +1731,8 @@ void UnregisterSlotHookHandle(MhwRngPluginId ownerId, MhwRngHookHandle handle) n
             if (RngSlot* baseSlot = FindExistingCompositeSlot(MakeCompositeKey(normRva, 0U))) {
                 RebuildChainForRvaLocked(normRva, baseSlot);
             } else {
-                while (g_inFlightHookCalls.load(std::memory_order_acquire) != 0U) _mm_pause();
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                while (g_inFlightHookCalls.load(std::memory_order_seq_cst) != 0U) _mm_pause();
             }
             g_hookEntries[i] = SlotHookEntry{};
             return;
@@ -1741,7 +1758,8 @@ void UnregisterSlotHook(MhwRngPluginId ownerId, std::uint32_t rva) noexcept {
     if (RngSlot* baseSlot = FindExistingCompositeSlot(MakeCompositeKey(norm, 0U))) {
         RebuildChainForRvaLocked(norm, baseSlot);
     } else {
-        while (g_inFlightHookCalls.load(std::memory_order_acquire) != 0U) _mm_pause();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        while (g_inFlightHookCalls.load(std::memory_order_seq_cst) != 0U) _mm_pause();
     }
     for (std::uint16_t idx : removed) {
         g_hookEntries[idx] = SlotHookEntry{};
@@ -1839,7 +1857,8 @@ void DetachAllHooksForPluginAndWait(MhwRngPluginId ownerId) noexcept {
         if (obsChanged) {
             PublishObserverSnapshotLocked();
         } else if (!removedEntries.empty()) {
-            while (g_inFlightHookCalls.load(std::memory_order_acquire) != 0U) {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            while (g_inFlightHookCalls.load(std::memory_order_seq_cst) != 0U) {
                 _mm_pause();
             }
         }
@@ -2363,7 +2382,7 @@ MHW_RNG_API std::uint32_t MhwRng_GetApiVersion() {
 }
 
 MHW_RNG_API void MhwRng_SetEngineMode(std::uint32_t mode) {
-    const std::uint32_t clamped = (mode <= kMhwRngModeTakeover) ? mode : kMhwRngModeTakeover;
+    const std::uint32_t clamped = (mode <= kMhwRngModeSelective) ? mode : kMhwRngModeSelective;
     const std::uint32_t prev    = rng::g_engineMode.exchange(clamped, std::memory_order_acq_rel);
     rng::EmitLifecycleEvent(kMhwRngEventEngineMode, prev);
 }
@@ -2373,11 +2392,20 @@ MHW_RNG_API std::uint32_t MhwRng_GetEngineMode() {
 }
 
 MHW_RNG_API void MhwRng_SetTakeoverEnabled(bool enabled) {
-    MhwRng_SetEngineMode(enabled ? kMhwRngModeTakeover : kMhwRngModeOff);
+    if (!enabled) {
+        MhwRng_SetEngineMode(kMhwRngModeOff);
+        return;
+    }
+    const std::uint32_t cur = MhwRng_GetEngineMode();
+    if (cur == kMhwRngModeTakeover || cur == kMhwRngModeSelective) {
+        return;
+    }
+    MhwRng_SetEngineMode(kMhwRngModeSelective);
 }
 
 MHW_RNG_API bool MhwRng_IsTakeoverEnabled() {
-    return rng::g_engineMode.load(std::memory_order_acquire) == kMhwRngModeTakeover;
+    const std::uint32_t m = rng::g_engineMode.load(std::memory_order_acquire);
+    return m == kMhwRngModeTakeover || m == kMhwRngModeSelective;
 }
 
 MHW_RNG_API void MhwRng_SetMasterSeed(std::uint64_t seed, bool resetEpoch) {

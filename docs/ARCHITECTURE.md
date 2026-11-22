@@ -47,7 +47,7 @@ flowchart TD
 | 组件 | 游戏目录部署路径 | 对应源码 | 说明 |
 | :--- | :--- | :--- | :--- |
 | 核心模块 | `nativePC\plugins\mhw_rng.dll` | [dllmain.cpp](../src/dllmain.cpp)、[rng_trampolines.asm](../src/rng_trampolines.asm)、[rng_engine.cpp](../src/rng_engine.cpp)、[plugin_host.cpp](../src/plugin_host.cpp)、[hook.cpp](../src/hook.cpp) | 底层 Hook、MASM 寄存器捕获、复合槽表与 Hook 链、插件宿主、基础 `$rng` 命令 |
-| 配置文件 | `nativePC\plugins\mhw_rng.ini` | [mhw_rng.ini](../mhw_rng.ini)、[log_config.cpp](../src/log_config.cpp) | 启动开关、初始 `MasterSeed`、自动加载插件开关、按地址配置的 `[SlotOverrides]` |
+| 配置文件 | `nativePC\plugins\mhw_rng.ini` | [mhw_rng.ini](../mhw_rng.ini)、[log_config.cpp](../src/log_config.cpp) | 启动模式 `BootMode`、存档种子保护 `ProtectSaveSeeds`、初始 `MasterSeed`、自动加载插件开关、按地址配置的 `[SlotOverrides]` |
 | 热加载缓存目录 | `nativePC\plugins\mhw_rng\.hotload\` | [plugin_host.cpp](../src/plugin_host.cpp#L278-L295) | 运行时自动创建的隐藏目录，存放影拷贝后的临时 DLL |
 | 插件 SDK 头文件 | *(仅编译期依赖，无需链接 `.lib`)* | [mhw_rng_api.h](../include/mhw_rng_api.h) | C ABI 数据结构、`MhwRngHostApi` 函数指针表与导出约定 |
 | 官方插件：`inspector` | `nativePC\plugins\mhw_rng\rng_inspector.dll` | [inspector_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-inspector/blob/main/inspector_plugin.cpp) | 详见《`rng_inspector` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-inspector/blob/main/README.md)) |
@@ -108,10 +108,11 @@ flowchart TD
 
 ### 2. 全局运行模式（`MhwRngEngineMode`）与槽位模式（`MhwRngSlotMode`）
 
-内核整体支持三种工作模式：
+内核整体支持四种工作模式：
 - `kMhwRngModeOff`（`0`）：关闭接管，入口处直接跳转原版函数，不进入槽位查找逻辑。
 - `kMhwRngModeObserveOnly`（`1`）：仅观测模式，全部抽签走原版实现并更新 `totalCalls`/`epochCalls`/`lastValue`，同时触发带有 `kMhwRngHookObserveOnly` 标记的 `postFn` 与全局观测器。
-- `kMhwRngModeTakeover`（`2`）：完整接管模式。
+- `kMhwRngModeTakeover`（`2`）：全局接管模式；当 `ProtectSaveSeeds = true`（默认开启）时，[mhw_addresses.h](../src/mhw_addresses.h) 中列出的 31 处存档持久化种子推进器 RVA 自动走原版直通，除非用户/插件显式覆盖该点位。
+- `kMhwRngModeSelective`（`3`，默认推荐）：按需接管模式，仅对配置了非默认槽规则或挂载了插件钩子的调用点生效，未触碰的调用点及存档持久化种子推进器 100% 执行原版函数。
 
 单槽位模式（`MhwRngSlotMode`）：
 
@@ -209,7 +210,7 @@ Windows 的 `LoadLibrary` 会锁定磁盘上的目标 DLL 文件，导致游戏�
 | :--- | :--- | :--- |
 | 路径与输出 | `GetRootPluginDir` / `GetSubPluginDir` | 获取 `nativePC\plugins` 与 `nativePC\plugins\mhw_rng` 路径 |
 | 路径与输出 | `ChatPrint` / `ChatPrintf` / `ChatPrintAsync` / `ChatPrintfAsync` / `Log` | 同步或跨线程异步队列投递至 `sChat::move` 主线程聊天框，或写入 `mhw_rng.log` |
-| 全局控制 | `SetEngineMode` / `GetEngineMode` / `SetTakeoverEnabled` / `SetMasterSeed` / `ResetEpoch` | 切换关闭/仅观测/接管三态、修改 64 位总种子、重置全局轮次 |
+| 全局控制 | `SetEngineMode` / `GetEngineMode` / `SetTakeoverEnabled` / `SetMasterSeed` / `ResetEpoch` | 切换关闭/仅观测/全局接管/按需接管四态、修改 64 位总种子、重置全局轮次 |
 | 地址与包装 | `NormalizeSiteAddress` / `RegisterTransparentWrapper` / `UnregisterTransparentWrapper` | 地址归一化与动态注册透明薄包装展开规则 |
 | 条件与槽规则 | `SetActiveCondition` / `GetActiveCondition` / `ReleaseCondSlot` | 读写活动条件号及释放不再使用的动态条件槽 |
 | 条件与槽规则 | `SetCondMasterDerived` / `SetCondCustomSeed` / `SetCondFixedValue` / `SetCondSequence` / `SetCondBypass` | 设置指定 `(rva, condId)` 复合槽的工作模式与参数 |
@@ -291,10 +292,10 @@ cl.exe /nologo /std:c++17 /O2 /EHsc /MT /utf-8 /I "include" rng_meal.cpp /LD /Fe
 - `$rng` / `$rng status`：查看接管状态、当前总种子、轮次、活跃槽数、已加载插件数与前几条激活规则。
 - `$rng help`：列出核心命令与当前已注册的所有插件子命令名。
 - `$rng plugins` / `load <name>` / `unload <name>` / `reload [name]`：查询、加载、卸载或热重载子插件（不带参数的 `reload` 会同时重读 `mhw_rng.ini` 并重载全部插件）。
-- `$rng on` / `off` / `observe` / `seed <u64>` / `reset` / `clearall`：切换接管/直通/仅观测模式、修改总种子、递增轮次、清空所有槽覆盖规则。
+- `$rng selective` / `on` / `off` / `observe` / `seed <u64>` / `reset` / `clearall`：切换按需接管/全局接管/直通/仅观测模式、修改总种子、递增轮次、清空所有槽覆盖规则。
 - `$rng save [name]` / `restore [name]` / `saves`：保存、恢复与列出内存中的 RNG 全表二进制状态快照。
 - `$rng rawfix` / `rawseed` / `rawbypass` / `rawclear`：在不加载任何插件的情况下直接按数值 RVA 操作指定槽位。
 
 ### 2. 构建与脱机回归测试
 - 运行 [build.bat](../build.bat)：依次执行 `sync_plugin_sdks.bat` 与 `ml64` 汇编 [rng_trampolines.asm](../src/rng_trampolines.asm)，再使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll`、`build\mhw_rng\rng_steam.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
-- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证全部既有回归场景（8 线程隔离、`rng_size`、`rng_endemic`、`rng_thk`、影拷贝热重载与 `sChat` 链自愈）及 SDK v3.0 全部新增能力（非易失寄存器与原入参捕获、多插件 Hook 优先级链、`ObserveOnly` 与通配观测器、`FilterVanilla` 保底过滤、二进制快照恢复、生命周期事件、并发异步聊天投递、堆序列与 Tombstone 槽回收、动态透明包装、私有实例策略、`rng_steam` 真实代码测试 `V3-9`，以及 64 KB 预留独立 W^X 跳板池对 `sChat::DispatchChatEntry` / `sChat::move` 的验证）。
+- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证全部既有回归场景（8 线程隔离、`rng_size`、`rng_endemic`、`rng_thk`、影拷贝热重载与 `sChat` 链自愈）及 SDK v3.0 全部新增能力（非易失寄存器与原入参捕获、多插件 Hook 优先级链、`ObserveOnly` 与通配观测器、`FilterVanilla` 保底过滤、二进制快照恢复、生命周期事件、并发异步聊天投递、堆序列与 Tombstone 槽回收、动态透明包装、私有实例策略、`rng_steam` 真实代码测试 `V3-9`，以及 64 KB 预留独立 W^X 跳板池对 `sChat::DispatchChatEntry` / `sChat::move` 的验证，以及 `Selective` 按需接管与 `ProtectSaveSeeds` 存档种子保护回归测试）。

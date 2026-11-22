@@ -20,6 +20,8 @@ struct RawSlotRuleConfig {
 struct Config {
     bool                           enabled          = true;
     bool                           takeoverOnBoot   = true;
+    std::uint32_t                  bootMode         = kMhwRngModeSelective;
+    bool                           protectSaveSeeds = true;
     bool                           autoLoadPlugins  = true;
     std::uint64_t                  masterSeed       = 12345ULL;
     bool                           showChatFeedback = true;

@@ -234,10 +234,21 @@ void DrainAsyncChatOnMainThread(std::uintptr_t sChat, std::uint32_t maxPerTick) 
 
 const char* EngineModeLabelCn(std::uint32_t mode) noexcept {
     switch (mode) {
-        case kMhwRngModeTakeover:    return u8"开启";
+        case kMhwRngModeTakeover:    return u8"全局接管";
+        case kMhwRngModeSelective:   return u8"按需接管";
         case kMhwRngModeObserveOnly: return u8"仅观测";
         case kMhwRngModeOff:
         default:                     return u8"关闭";
+    }
+}
+
+const char* EngineModeLabelAscii(std::uint32_t mode) noexcept {
+    switch (mode) {
+        case kMhwRngModeTakeover:    return "TAKEOVER";
+        case kMhwRngModeSelective:   return "SELECTIVE";
+        case kMhwRngModeObserveOnly: return "OBSERVE";
+        case kMhwRngModeOff:
+        default:                     return "OFF";
     }
 }
 
@@ -374,7 +385,7 @@ void HandleRngChatCommand(const std::string& rawMsg) {
 
     // 2. Kernel + Plugin Unified Help (`$rng help`)
     if (sub == "help" || sub == "?") {
-        NotifyChatFmt(u8"[RNG 核心] `$rng` 状态 | `on/off/observe` 模式 | `seed <n>` 总种子 | `reset` 重置 | `save/restore/saves` 快照 | `clearall` 全清");
+        NotifyChatFmt(u8"[RNG 核心] `$rng` 状态 | `selective/on/off/observe` 模式 | `seed <n>` | `reset` | `save/restore/saves` | `clearall`");
         NotifyChatFmt(u8"[RNG 插件管理] `plugins` 列表 | `reload [插件名]` 热重载DLL | `load/unload <插件名>`");
         const auto pcmds = plugin_host::ListPluginSubcommands();
         if (!pcmds.empty()) {
@@ -417,16 +428,22 @@ void HandleRngChatCommand(const std::string& rawMsg) {
             NotifyChatFmt(u8"[RNG] 热重载 `%s` %s: %s", toks[1].c_str(), ok ? u8"成功" : u8"失败", msg.c_str());
             return;
         }
-        app::Config fresh      = app::LoadConfig();
-        g_cfg.showChatFeedback = fresh.showChatFeedback;
-        g_cfg.chatPrefix       = fresh.chatPrefix;
-        MhwRng_SetTakeoverEnabled(fresh.takeoverOnBoot);
+        app::Config fresh        = app::LoadConfig();
+        g_cfg.showChatFeedback   = fresh.showChatFeedback;
+        g_cfg.chatPrefix         = fresh.chatPrefix;
+        g_cfg.bootMode           = fresh.bootMode;
+        g_cfg.protectSaveSeeds   = fresh.protectSaveSeeds;
+        MhwRng_SetEngineMode(fresh.bootMode);
+        rng::SetProtectSaveSeeds(fresh.protectSaveSeeds);
         MhwRng_SetMasterSeed(fresh.masterSeed, true);
         rng::ApplyConfigRules(fresh, true);
         std::string pmsg;
         plugin_host::ReloadAll(pmsg);
-        NotifyChatFmt(u8"[RNG] 已重载 mhw_rng.ini (总种子:%llu) & %s",
-                      static_cast<unsigned long long>(fresh.masterSeed), pmsg.c_str());
+        NotifyChatFmt(u8"[RNG] 已重载 mhw_rng.ini (模式:%s | 总种子:%llu | 存档保护:%s) & %s",
+                      EngineModeLabelCn(MhwRng_GetEngineMode()),
+                      static_cast<unsigned long long>(fresh.masterSeed),
+                      rng::IsProtectSaveSeedsEnabled() ? u8"开" : u8"关",
+                      pmsg.c_str());
         return;
     }
 
@@ -452,12 +469,19 @@ void HandleRngChatCommand(const std::string& rawMsg) {
         return;
     }
 
-    // 4. Global Takeover / Seed / Epoch / ClearAll
-    if (sub == "on" || sub == "enable") {
-        MhwRng_SetTakeoverEnabled(true);
-        NotifyChatFmt(u8"[RNG] 全局随机数接管已【开启】 (总种子:%llu, 第%llu轮)",
+    // 4. Global Mode / Seed / Epoch / ClearAll
+    if (sub == "selective" || sub == "sel" || sub == "partial") {
+        MhwRng_SetEngineMode(kMhwRngModeSelective);
+        NotifyChatFmt(u8"[RNG] 已切换为【按需接管模式】 (仅控制已设规则/插件挂钩点位，其余与存档种子保持原版随机)");
+        return;
+    }
+
+    if (sub == "on" || sub == "enable" || sub == "full" || sub == "takeover") {
+        MhwRng_SetEngineMode(kMhwRngModeTakeover);
+        NotifyChatFmt(u8"[RNG] 全局随机数接管已【开启】 (总种子:%llu, 第%llu轮 | 存档种子保护:%s)",
                       static_cast<unsigned long long>(MhwRng_GetMasterSeed()),
-                      static_cast<unsigned long long>(MhwRng_GetEpoch()));
+                      static_cast<unsigned long long>(MhwRng_GetEpoch()),
+                      rng::IsProtectSaveSeedsEnabled() ? u8"开" : u8"关");
         return;
     }
 
@@ -571,12 +595,16 @@ void HandleRngChatCommand(const std::string& rawMsg) {
             NotifyChatFmt(u8"[RNG] 种子格式无效: %s", toks[1].c_str());
             return;
         }
-        MhwRng_SetTakeoverEnabled(true);
+        const std::uint32_t curMode = MhwRng_GetEngineMode();
+        if (curMode == kMhwRngModeOff || curMode == kMhwRngModeObserveOnly) {
+            MhwRng_SetEngineMode(kMhwRngModeTakeover);
+        }
         MhwRng_SetMasterSeed(newSeed, true);
-        NotifyChatFmt(u8"[RNG] 已切换总种子 = %llu (0x%llX) | 第 %llu 轮",
+        NotifyChatFmt(u8"[RNG] 已切换总种子 = %llu (0x%llX) | 第 %llu 轮 | 模式:%s",
                       static_cast<unsigned long long>(newSeed),
                       static_cast<unsigned long long>(newSeed),
-                      static_cast<unsigned long long>(MhwRng_GetEpoch()));
+                      static_cast<unsigned long long>(MhwRng_GetEpoch()),
+                      EngineModeLabelCn(MhwRng_GetEngineMode()));
         return;
     }
 
@@ -719,9 +747,15 @@ LRESULT CALLBACK RngKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
             const int vk = static_cast<int>(wParam);
             if (vk != 0) {
                 if (vk == g_cfg.vkToggleTakeover) {
-                    const bool next = !MhwRng_IsTakeoverEnabled();
-                    MhwRng_SetTakeoverEnabled(next);
-                    NotifyChatFmt(u8"[RNG] 全局随机数接管 = %s", next ? u8"开启" : u8"关闭");
+                    if (MhwRng_IsTakeoverEnabled()) {
+                        MhwRng_SetEngineMode(kMhwRngModeOff);
+                    } else {
+                        const std::uint32_t target = (g_cfg.bootMode == kMhwRngModeTakeover)
+                                                         ? kMhwRngModeTakeover
+                                                         : kMhwRngModeSelective;
+                        MhwRng_SetEngineMode(target);
+                    }
+                    NotifyChatFmt(u8"[RNG] 模式 = %s", EngineModeLabelCn(MhwRng_GetEngineMode()));
                 } else if (vk == g_cfg.vkResetEpoch) {
                     const std::uint64_t ep = MhwRng_ResetEpoch();
                     NotifyChatFmt(u8"[RNG] 已重置到第 %llu 轮", static_cast<unsigned long long>(ep));
@@ -864,11 +898,12 @@ bool TryInstallCoreRngHooks(HMODULE exe, std::uintptr_t& outBase, std::uintptr_t
         loadedPlugins = plugin_host::LoadAllFromDirectory();
     }
 
-    app::Log("init: activated %zu/10 RNG hooks + %zu sub-plugins (arena=%p, takeover=%s, masterSeed=0x%llX)",
+    app::Log("init: activated %zu/10 RNG hooks + %zu sub-plugins (arena=%p, mode=%s, protectSaveSeeds=%s, masterSeed=0x%llX)",
              hookedCount,
              loadedPlugins,
              reinterpret_cast<void*>(hook::ArenaBase()),
-             MhwRng_IsTakeoverEnabled() ? "ON" : "OFF",
+             EngineModeLabelAscii(MhwRng_GetEngineMode()),
+             rng::IsProtectSaveSeedsEnabled() ? "ON" : "OFF",
              static_cast<unsigned long long>(MhwRng_GetMasterSeed()));
     outBase = base;
     outEnd  = end;

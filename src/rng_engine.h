@@ -30,6 +30,9 @@ void SetLifecycleEventSink(LifecycleEventSinkFn sink) noexcept;
 std::uintptr_t ExeBase() noexcept;
 std::uintptr_t ExeEnd() noexcept;
 
+void          SetProtectSaveSeeds(bool enabled) noexcept;
+bool          IsProtectSaveSeedsEnabled() noexcept;
+
 std::uint32_t NormalizeUserSiteAddress(std::uint64_t rawAddr, bool* outWasCallInsn = nullptr) noexcept;
 
 // Composite `(rva, condId)` & Push Condition Operations
