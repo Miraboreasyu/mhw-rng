@@ -6,17 +6,18 @@
 
 1. **核心模块 (`nativePC\plugins\mhw_rng.dll`)**
    - 拦截游戏内全部 10 处伪随机数入口（`MtRandom`、`mt19937`、`std::_Random_device`、`CRT_rand`），使用严格 W^X 跳板页与 MASM 寄存器快照入口保存调用方 8 个非易失通用寄存器与原始入参，并支持跨插件链式挂钩。
+   - 第一阶段预保留连续 64 KB（16 × 4 KB）W^X 跳板池：第 0 页用于 10 处核心 RNG 钩子，第 1..15 页供第二阶段 `sChat::DispatchChatEntry`、`sChat::move` 及可选 `D3DPresent` 等独立钩子按需提交。三阶段启动流程会在 `.text` 解壳与 `sChat` 实例就绪后安装聊天与同步队列钩子，并在 `+1.5s` / `+4.0s` 自动检测并修复未串联覆盖，同时发送就绪通知（`[RNG] mhw_rng v3.0 已就绪...`）。
    - 维护 16,384 项支持 Tombstone 回收的 64 位复合条件槽表 `Slot[(CondID << 32) | CallSiteRVA]`，按调用点与条件隔离随机流，支持 `MasterDerived`、`CustomSeed`、`FixedValue`、`Sequence`、`Bypass` 五种槽模式、`O(1)` 轮次重置（`Epoch`），以及状态快照保存/恢复（`$rng save / restore / saves`）。
    - 支持三态引擎模式（`on` / `off` / `observe`）、同 RVA 多插件优先级 Hook 链、`FilterVanilla` 原版过滤、全游戏通配观测器、`sChat::move` 主线程异步聊天投递，以及内核生命周期事件广播。
-   - 采用 `.hotload\` 影拷贝加载子插件，游戏运行期间源 DLL 文件不被系统锁定，可直接重新编译覆盖并通过 `$rng reload [插件名]` 热更新。
+   - 采用 `.hotload\` 影拷贝加载子插件，游戏运行期间源 DLL 文件不被系统锁定，重新编译覆盖后可通过 `$rng reload [插件名]` 热更新。
    - 所有核心与插件聊天指令统一收口于 `$rng <subcmd>`（兼容 `$rng_<subcmd>`）前缀下。
 
 2. **官方业务插件（以 Git Submodule 挂载于 `plugins/`）**
-   - **[`mhw-rng-size`](https://github.com/Miraboreasyu/mhw-rng-size)**（`plugins/size` $\rightarrow$ `rng_size.dll`）：挂载 `0x169BA15` 同步回调，通过读取栈帧 `Monster*` 支持冰原全 71 种大型怪物按 `MonsterID` 条件分流、开区间 `[0x00000001U, 0xFFFFFF00U]` 零权重非法行规避，以及读取实时 `cSizeTable` 反算目标体型百分比。
-   - **[`mhw-rng-endemic`](https://github.com/Miraboreasyu/mhw-rng-endemic)**（`plugins/endemic` $\rightarrow$ `rng_endemic.dll`）：挂载 `0x166CFE1`、`0x0672FBC`（按调用栈过滤）与 `0x1669CB6` 三处同步回调，覆盖环境生物地图刷新与捕获抽签，支持大小金档位固定、档内比例调节、按 `ecXXX_YY` 物种分流以及实时查 `rAnimalSize` 反算精确倍率/厘米尺寸。
-   - **[`mhw-rng-thk`](https://github.com/Miraboreasyu/mhw-rng-thk)**（`plugins/thk` $\rightarrow$ `rng_thk.dll` + `thk_presets\fatalis_p1_nasty.txt`）：仅挂载 `0x1339C8C`（`cThinkMgr::updateThk`）一处同步回调，提供与具体怪物解耦的通用 THK 随机节点探测、按怪物实例的决策与出招计数、计数门控规则、概率组合分枝、有序出招序列与外部纯文本预设加载，并通过声明式预设与 `$rng fatalis` 快捷入口实现黑龙（`MonsterID == 101`）一阶段二足+四足纯 RNG 控招。
-   - **[`mhw-rng-steam`](https://github.com/Miraboreasyu/mhw-rng-steam)**（`plugins/steam` $\rightarrow$ `rng_steam.dll`）：挂载 `0x066679A` / `0x06667BB` / `0x05CA0A2`，在 `ObserveOnly` 与 `Takeover` 下均可实时解码蒸汽机三键顺序、红槽倍率与隐藏任意键必中保底并通过异步聊天队列提示，亦支持可选固定按键顺序（SDK v3.0 示例插件）。
-   - **[`mhw-rng-inspector`](https://github.com/Miraboreasyu/mhw-rng-inspector)**（`plugins/inspector` $\rightarrow$ `rng_inspector.dll`）：提供 1,697 处静态调用点与 793 个外层函数区间的兜底词典，以及 `top`、`find`、`names`、`list`、`info`、`dump`、`fix`、`seq`、`slotseed`、`bypass`、`clear` 命令。
+   - **[`mhw-rng-size`](https://github.com/Miraboreasyu/mhw-rng-size)**（`plugins/size` → `rng_size.dll`）：挂载 `0x169BA15` 同步回调，通过读取栈帧 `Monster*` 支持冰原全 71 种大型怪物按 `MonsterID` 条件分流、开区间 `[0x00000001U, 0xFFFFFF00U]` 零权重非法行规避，以及读取实时 `cSizeTable` 反算目标体型百分比。
+   - **[`mhw-rng-endemic`](https://github.com/Miraboreasyu/mhw-rng-endemic)**（`plugins/endemic` → `rng_endemic.dll`）：挂载 `0x166CFE1`、`0x0672FBC`（按调用栈过滤）与 `0x1669CB6` 三处同步回调，覆盖环境生物地图刷新与捕获抽签，支持大小金档位固定、档内比例调节、按 `ecXXX_YY` 物种分流以及实时查 `rAnimalSize` 反算精确倍率/厘米尺寸。
+   - **[`mhw-rng-thk`](https://github.com/Miraboreasyu/mhw-rng-thk)**（`plugins/thk` → `rng_thk.dll` + `thk_presets\fatalis_p1_nasty.txt`）：仅挂载 `0x1339C8C`（`cThinkMgr::updateThk`）一处同步回调，提供与具体怪物解耦的通用 THK 随机节点探测、按怪物实例的决策与出招计数、计数门控规则、概率组合分枝、有序出招序列与外部纯文本预设加载，并通过声明式预设与 `$rng fatalis` 快捷入口实现黑龙（`MonsterID == 101`）一阶段二足+四足纯 RNG 控招。
+   - **[`mhw-rng-steam`](https://github.com/Miraboreasyu/mhw-rng-steam)**（`plugins/steam` → `rng_steam.dll`，`1.1.0`）：挂载 `0x066679A` / `0x06667BB` / `0x05CA0A2`，在 `ObserveOnly` 仅观测与 `Takeover` 接管模式下均可实时解码蒸汽机三键顺序、红槽倍率与隐藏必中保底；支持可选固定按键顺序（`$rng steam lock` 不带参数默认锁为 `awd`），默认 `verbose` 关闭（仅未锁序轮次提示按键，锁序轮次与隐藏保底静默，可通过 `$rng steam verbose on` 开启详细播报）。
+   - **[`mhw-rng-inspector`](https://github.com/Miraboreasyu/mhw-rng-inspector)**（`plugins/inspector` → `rng_inspector.dll`）：提供 1,697 处静态调用点与 793 个外层函数区间的兜底词典，以及 `top`、`find`、`names`、`list`、`info`、`dump`、`fix`、`seq`、`slotseed`、`bypass`、`clear` 命令。
 
 ## 克隆与构建
 

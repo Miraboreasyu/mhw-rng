@@ -1953,6 +1953,7 @@ int main(int argc, char** argv) {
             }
 
             // (b) `Takeover` mode sequence lock for all 6 permutations + `r2` alias
+            //     With default `verbose=false`, locked rounds stay silent while still setting `[8..10]`.
             host->SetEngineMode(kMhwRngModeTakeover);
             struct LockCase { const char* arg; std::uint8_t b0, b1, b2; };
             static constexpr LockCase kLockCases[] = {
@@ -1967,19 +1968,19 @@ int main(int argc, char** argv) {
                 g_capturedAsyncChatLines.clear();
                 callWithRbx(fakeSteamCtrl, img + 0x0666785U);
                 if (fakeSteamCtrl[8] != lc.b0 || fakeSteamCtrl[9] != lc.b1 || fakeSteamCtrl[10] != lc.b2 ||
-                    g_capturedAsyncChatLines.empty() ||
-                    g_capturedAsyncChatLines.back().find(u8"[锁序]") == std::string::npos) {
+                    !g_capturedAsyncChatLines.empty()) {
                     img[0x06667D6U] = origKeygenEnd;
                     img[0x05CA0B6U] = origPityCmp;
-                    std::printf("FAIL [V3-9b]: `$rng steam lock %s` produced [%u,%u,%u]!\n",
-                                lc.arg, fakeSteamCtrl[8], fakeSteamCtrl[9], fakeSteamCtrl[10]);
+                    std::printf("FAIL [V3-9b]: `$rng steam lock %s` produced [%u,%u,%u] async=%zu!\n",
+                                lc.arg, fakeSteamCtrl[8], fakeSteamCtrl[9], fakeSteamCtrl[10],
+                                g_capturedAsyncChatLines.size());
                     return 1;
                 }
             }
 
-            // Verify bare `$rng steam lock` (no args) defaults to `A - W - D` ({0, 1, 2})
-            plugin_host::DispatchPluginSubcommand("steam", {"lock", "off"}, "lock off");
-            plugin_host::DispatchPluginSubcommand("steam", {"lock"}, "lock");
+            // Enable `verbose on` to verify `[锁序]` async notifications emit when verbose is enabled
+            plugin_host::DispatchPluginSubcommand("steam", {"verbose", "on"}, "verbose on");
+            plugin_host::DispatchPluginSubcommand("steam", {"lock", "awd"}, "lock awd verbose");
             g_capturedAsyncChatLines.clear();
             callWithRbx(fakeSteamCtrl, img + 0x0666785U);
             if (fakeSteamCtrl[8] != 0 || fakeSteamCtrl[9] != 1 || fakeSteamCtrl[10] != 2 ||
@@ -1987,12 +1988,32 @@ int main(int argc, char** argv) {
                 g_capturedAsyncChatLines.back().find(u8"[锁序]") == std::string::npos) {
                 img[0x06667D6U] = origKeygenEnd;
                 img[0x05CA0B6U] = origPityCmp;
-                std::printf("FAIL [V3-9b]: bare `$rng steam lock` did not default to [0,1,2] (got [%u,%u,%u])!\n",
-                            fakeSteamCtrl[8], fakeSteamCtrl[9], fakeSteamCtrl[10]);
+                std::printf("FAIL [V3-9b]: `verbose on` + `$rng steam lock awd` did not emit [锁序]!\n");
+                return 1;
+            }
+            plugin_host::DispatchPluginSubcommand("steam", {"verbose", "off"}, "verbose off");
+
+            // Verify bare `$rng steam lock` (no args) defaults to `A - W - D` ({0, 1, 2}) and stays silent when verbose=false
+            plugin_host::DispatchPluginSubcommand("steam", {"lock", "off"}, "lock off");
+            plugin_host::DispatchPluginSubcommand("steam", {"lock"}, "lock");
+            g_capturedAsyncChatLines.clear();
+            callWithRbx(fakeSteamCtrl, img + 0x0666785U);
+            if (fakeSteamCtrl[8] != 0 || fakeSteamCtrl[9] != 1 || fakeSteamCtrl[10] != 2 ||
+                !g_capturedAsyncChatLines.empty()) {
+                img[0x06667D6U] = origKeygenEnd;
+                img[0x05CA0B6U] = origPityCmp;
+                std::printf("FAIL [V3-9b]: bare `$rng steam lock` did not default to [0,1,2] quietly (got [%u,%u,%u], async=%zu)!\n",
+                            fakeSteamCtrl[8], fakeSteamCtrl[9], fakeSteamCtrl[10], g_capturedAsyncChatLines.size());
                 return 1;
             }
 
-            // (c) Hidden guaranteed-win pity alert (`0x05CA0A2`)
+            // (c) Hidden guaranteed-win pity alert (`0x05CA0A2`): silent by default (`verbose=false`), alerts when `verbose=true`
+            g_capturedAsyncChatLines.clear();
+            *reinterpret_cast<std::uint32_t*>(fakeSteamCtrl + 0x4A4U) = 100U;
+            callWithRbx(fakeSteamCtrl + 0x4A4U, img + 0x05CA096U);
+            const bool quietPityDefault = g_capturedAsyncChatLines.empty();
+
+            plugin_host::DispatchPluginSubcommand("steam", {"verbose", "on"}, "verbose on pity");
             g_capturedAsyncChatLines.clear();
             *reinterpret_cast<std::uint32_t*>(fakeSteamCtrl + 0x4A4U) = 100U;
             callWithRbx(fakeSteamCtrl + 0x4A4U, img + 0x05CA096U);
@@ -2002,10 +2023,12 @@ int main(int argc, char** argv) {
             *reinterpret_cast<std::uint32_t*>(fakeSteamCtrl + 0x4A4U) = 0U;
             callWithRbx(fakeSteamCtrl + 0x4A4U, img + 0x05CA096U);
             const bool cleanPity0 = g_capturedAsyncChatLines.empty();
-            if (!sawPity100 || !cleanPity0) {
+            plugin_host::DispatchPluginSubcommand("steam", {"verbose", "off"}, "verbose off pity");
+            if (!quietPityDefault || !sawPity100 || !cleanPity0) {
                 img[0x06667D6U] = origKeygenEnd;
                 img[0x05CA0B6U] = origPityCmp;
-                std::printf("FAIL [V3-9c]: auto-win check failed (pity100=%d clean0=%d)\n", sawPity100, cleanPity0);
+                std::printf("FAIL [V3-9c]: auto-win check failed (quietDef=%d pity100=%d clean0=%d)\n",
+                            quietPityDefault, sawPity100, cleanPity0);
                 return 1;
             }
 

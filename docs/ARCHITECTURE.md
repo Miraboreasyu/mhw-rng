@@ -48,7 +48,7 @@ flowchart TD
 | :--- | :--- | :--- | :--- |
 | 核心模块 | `nativePC\plugins\mhw_rng.dll` | [dllmain.cpp](../src/dllmain.cpp)、[rng_trampolines.asm](../src/rng_trampolines.asm)、[rng_engine.cpp](../src/rng_engine.cpp)、[plugin_host.cpp](../src/plugin_host.cpp)、[hook.cpp](../src/hook.cpp) | 底层 Hook、MASM 寄存器捕获、复合槽表与 Hook 链、插件宿主、基础 `$rng` 命令 |
 | 配置文件 | `nativePC\plugins\mhw_rng.ini` | [mhw_rng.ini](../mhw_rng.ini)、[log_config.cpp](../src/log_config.cpp) | 启动开关、初始 `MasterSeed`、自动加载插件开关、按地址配置的 `[SlotOverrides]` |
-| 热加载缓存目录 | `nativePC\plugins\mhw_rng\.hotload\` | [plugin_host.cpp](../src/plugin_host.cpp#L230-L250) | 运行时自动创建的隐藏目录，存放影拷贝后的临时 DLL |
+| 热加载缓存目录 | `nativePC\plugins\mhw_rng\.hotload\` | [plugin_host.cpp](../src/plugin_host.cpp#L278-L295) | 运行时自动创建的隐藏目录，存放影拷贝后的临时 DLL |
 | 插件 SDK 头文件 | *(仅编译期依赖，无需链接 `.lib`)* | [mhw_rng_api.h](../include/mhw_rng_api.h) | C ABI 数据结构、`MhwRngHostApi` 函数指针表与导出约定 |
 | 官方插件：`inspector` | `nativePC\plugins\mhw_rng\rng_inspector.dll` | [inspector_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-inspector/blob/main/inspector_plugin.cpp) | 详见《`rng_inspector` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-inspector/blob/main/README.md)) |
 | 官方插件：`size` | `nativePC\plugins\mhw_rng\rng_size.dll` | [size_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-size/blob/main/size_plugin.cpp) | 详见《`rng_size` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-size/blob/main/README.md)) |
@@ -82,10 +82,14 @@ flowchart TD
 - **`CALL` 指令地址对齐**：`NormalizeUserSiteAddress` 支持直接传入虚拟地址或 RVA；若传入地址处是目标为上述 10 个入口之一的 5 字节 `E8 rel32` 指令，则自动 `+5` 转换为对应的返回地址 RVA。
 - **局部 `MtRandom` 实例策略**：内核维护 512 项实例策略表，并在 `SetInstancePolicy` 中提供 `Auto` / `FollowOwnState` / `ForceSlotControl` 三种接管策略；未显式指定时按本轮（`Epoch`）内是否由构造点指定过自定义种子自动判别。
 
-### 3. 跳板内存权限与链式 Hook
-[hook.cpp](../src/hook.cpp) 在主程序镜像 `±2 GB` 范围内申请一页 4 KB 跳板内存：
-1. `PrepareDetour` 在 `PAGE_READWRITE` 权限下生成原始头部指令跳板与 14 字节绝对跳转中继；若目标函数入口首字节已经是 `0xE9`（已被其它插件如 `mhw_hfi.dll` 先行挂钩），则解析既有跳转目标并串联为原函数入口，避免互相覆盖。
-2. `SealAndActivateAll` 先将跳板页权限改为 `PAGE_EXECUTE_READ`（不可写可执行）并调用 `FlushInstructionCache`，随后将 5 字节 `E9 rel32` 写入各目标入口（对 8 字节对齐地址使用 `_InterlockedCompareExchange64` 原子替换）。
+### 3. 跳板内存池、链式 Hook 与三阶段启动
+[hook.cpp](../src/hook.cpp) 的 `InitArena` 在第一阶段即在主程序镜像 `±2 GB` 范围内预保留一块 **64 KB（16 × 4 KB）** 连续虚拟地址空间，用于严格 W^X 跳板生成：
+1. **第 0 页（4 KB 核心跳板页）**：`PrepareDetour` 在 `PAGE_READWRITE` 权限下生成核心随机数入口的原始头部指令跳板与 14 字节绝对跳转中继；若目标入口首字节已经是 `0xE9`（已被其它插件先行挂钩），则解析既有跳转目标并串联为原函数入口，避免互相覆盖。随后 `SealAndActivateAll` 将该页权限修改为 `PAGE_EXECUTE_READ` 并调用 `FlushInstructionCache`，再通过期望字节 CAS 将 5 字节 `E9 rel32` 写入各目标入口（若检测到并发改写则回滚并重试）。
+2. **第 1..15 页（15 × 4 KB 预留独立跳板池）**：供第二阶段的 `InstallStandaloneDetour5`（挂钩 `sChat::DispatchChatEntry`、`sChat::move`、可选 `D3DPresent` 及后续重新串联）按页按需提交。单页先以 `PAGE_READWRITE` 提交并写入中继与原字节，密封为 `PAGE_EXECUTE_READ` 后再修改目标入口，避免后期加载 Mod 造成 `±2 GB` 地址空间碎片化后分配失败。
+3. **三阶段启动与自愈检查（[dllmain.cpp](../src/dllmain.cpp) `InitWorker`）**：
+   - **Phase 1**：轮询等待 5 处核心 `MtRandom` 入口与 `sChat::DispatchChatEntry` 完成解壳后，初始化 64 KB 跳板池、激活 10 处底层随机数钩子并自动加载子插件。
+   - **Phase 2**：等待并发启动插件完成初始化（不少于 `800 ms`，待 `sChat` 实例就绪或最多 `3000 ms`），安装 `sChat::DispatchChatEntry`、`sChat::move` 与可选 `D3DPresent` 钩子，并投递启动就绪通知（`[RNG] mhw_rng v3.0 已就绪...`），由 `sChat::move` 在主线程刷新（若 `sChat::move` 未挂钩则回退至场景轮询投递）。
+   - **Phase 3**：在安装后 `+1.5 s` 与 `+4.0 s` 调用 `WasUnchainedOverwrite5` 复检 `sChat::DispatchChatEntry` 与 `sChat::move`；若发现被后加载模组覆盖且未串联，自动重新挂载并串联原跳转链。
 
 ---
 
@@ -97,15 +101,15 @@ flowchart TD
 微内核在静态存储区维护一张容量为 **16,384 项**、支持 Tombstone 回收的开放寻址哈希表 `g_slots`（[rng_engine.cpp](../src/rng_engine.cpp)）：
 - **复合键格式**：
   $$\text{CompositeKey} = (\text{uint64\_t}(\text{condId}) \ll 32) \mid \text{uint64\_t}(\text{callSiteRva})$$
-  `condId == 0` 为基础槽；当插件定义条件编号 `condId > 0` 时，同一 `callSiteRva` 在不同条件下对应不同的 `RngSlot` 实例。不再使用的 `condId > 0` 条件槽可通过 `ReleaseCondSlot` 标记为 Tombstone 并真正回收槽位配额。
-- **可回收长序列**：长度 `<= 8` 的序列存于槽内 `inlineSeq`；`> 8` 的序列在槽自旋锁外按需分配堆缓冲并在替换/清理/释放槽位时归还内存，避免反复热重载或切序列造成静态池耗尽。
+  `condId == 0` 为基础槽；当插件定义条件编号 `condId > 0` 时，同一 `callSiteRva` 在不同条件下对应不同的 `RngSlot` 实例。不再使用的 `condId > 0` 条件槽可通过 `ReleaseCondSlot` 标记为 Tombstone 并回收槽位配额。
+- **可回收长序列**：长度 `<= 8` 的序列存于槽内 `inlineSeq`；`> 8` 的序列在槽自旋锁外按需分配堆缓冲并在替换、清理或释放槽位时归还内存，避免反复热重载或切换序列造成静态池耗尽。
 - **子流初始化与推进**：当槽位记录的 `seededEpoch` 与全局 `g_seedEpoch` 不一致时，使用 `SplitMix64` 将 `(Seed, RVA, CondID)` 混合生成非全零的 128 位初始状态 `state[0..3]`，之后每次抽取调用与原版一致的 `StepMhwXorshift128` 推进。不同调用点或不同 `CondID` 之间互不影响推进次数。
 - **快照与恢复**：提供单槽写回 `RestoreSlotState` 及全表二进制快照/恢复 `CaptureStateBlob` / `RestoreStateBlob`（带 `'MRSS'` 魔数与 CRC32 校验）。
 
 ### 2. 全局运行模式（`MhwRngEngineMode`）与槽位模式（`MhwRngSlotMode`）
 
 内核整体支持三种工作模式：
-- `kMhwRngModeOff`（`0`）：关闭接管，入口处立即跳转原版函数（零开销直通）。
+- `kMhwRngModeOff`（`0`）：关闭接管，入口处直接跳转原版函数，不进入槽位查找逻辑。
 - `kMhwRngModeObserveOnly`（`1`）：仅观测模式，全部抽签走原版实现并更新 `totalCalls`/`epochCalls`/`lastValue`，同时触发带有 `kMhwRngHookObserveOnly` 标记的 `postFn` 与全局观测器。
 - `kMhwRngModeTakeover`（`2`）：完整接管模式。
 
@@ -116,7 +120,7 @@ flowchart TD
 | `0` | `kMhwRngSlotMasterDerived` | 默认模式，由 `(MasterSeed, RVA, CondID)` 派生确定性子流 |
 | `1` | `kMhwRngSlotCustomSeed` | 独立种子模式，由 `(customSeed, RVA, CondID)` 派生子流，不受全局 `MasterSeed` 修改影响 |
 | `2` | `kMhwRngSlotFixedValue` | 固定值模式，每次恒定返回 `fixedValue`（原始 `uint32_t`） |
-| `3` | `kMhwRngSlotSequence` | 序列模式，按顺序输出预设数组（长度 `<= 8` 存于槽内 `inlineSeq`，`> 8` 存于 `g_seqPool`），支持 `Loop`（循环）、`HoldLast`（停在末项）、`FallbackDerived`（播完转确定性子流） |
+| `3` | `kMhwRngSlotSequence` | 序列模式，按顺序输出预设数组（长度 `<= 8` 存于槽内 `inlineSeq`，`> 8` 存于按需分配并可回收的堆缓冲区 `seqHeap`），支持 `Loop`（循环）、`HoldLast`（停在末项）、`FallbackDerived`（播完转确定性子流） |
 | `4` | `kMhwRngSlotBypass` | 原版直通模式，跳过接管，调用原版跳板函数 |
 
 ---
@@ -128,29 +132,32 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant Game as 游戏调用方
-    participant Kernel as DrawSlotValues (rng_engine.cpp)
-    participant Plugin as 插件回调 SlotHookFn
-    participant Slot as 目标槽 Slot[(CondID << 32) | RVA]
+    participant Kernel as DrawSlotValues
+    participant Chain as RvaHookChain
+    participant Slot as 目标槽
 
     Game->>Kernel: 调用随机数函数
-    Kernel->>Kernel: 查找基础槽 BaseSlot[(0 << 32) | RVA]<br/>读取 activeCond
-    alt hookIdx == 0xFFFF (未挂载回调)
+    Kernel->>Kernel: 查找基础槽 BaseSlot[(0 << 32) | RVA]，读取 hookChainIdxPlus1 与 activeCond
+    alt hookChainIdxPlus1 == 0
         Kernel->>Slot: 访问 Slot[(activeCond << 32) | RVA]
-        Slot-->>Game: 返回 u32
-    else hookIdx < 128 (已挂载回调)
-        Kernel->>Kernel: g_inFlightHookCalls++ (原子递增)
-        Kernel->>Plugin: SEH 保护下调用 SlotHookFn(ctx, decision)
-        Plugin-->>Kernel: 写入 action (UseCondition / ReturnValue / Bypass)
-        Kernel->>Kernel: g_inFlightHookCalls-- (原子递减)
-        alt action == UseCondition
-            Kernel->>Slot: 访问 Slot[(decision.condId << 32) | RVA]
-            Slot-->>Game: 返回 u32
-        else action == ReturnValue
-            Kernel->>Slot: 更新计数与 lastValue = decision.value0
-            Kernel-->>Game: 返回 decision.value0
-        else action == Bypass
+        Slot-->>Game: 返回数值
+    else hookChainIdxPlus1 > 0
+        Kernel->>Kernel: g_inFlightHookCalls++
+        Kernel->>Chain: 按 priority 执行 Pre 链 (最多 8 个 Hook)
+        alt Pre 返回 ReturnValue / ReturnFloatBits
+            Kernel->>Slot: 更新计数与 lastValue
+            Kernel-->>Game: 返回覆盖值
+        else Pre 返回 Bypass
             Kernel-->>Game: 调用原版函数
+        else Pre 返回 FilterVanilla 或含 FilterVanilla 标志
+            Kernel->>Game: 先执行原版抽签生成 vanillaValue
+            Kernel->>Chain: 调用 postFn (含 CanModify) 并允许改写
+        else Continue / UseCondition / ClaimCondition
+            Kernel->>Slot: 按目标 condId 抽取或生成结果
         end
+        Kernel->>Chain: 触发只读 postFn 与 GlobalObserver
+        Kernel->>Kernel: g_inFlightHookCalls--
+        Kernel-->>Game: 返回最终结果
     end
 ```
 
@@ -179,8 +186,8 @@ Windows 的 `LoadLibrary` 会锁定磁盘上的目标 DLL 文件，导致游戏�
 - **`g_registryMx`（注册表叶子锁）**：仅保护内存中的插件列表、子命令表、RVA 元数据表与兜底解析器列表，不在调用插件函数、`LoadLibrary`/`FreeLibrary` 或等待回调排空期间持有。插件短名称另存于静态定长数组 `g_shortNameCache`，使 `GetPluginShortName` 可无锁返回稳定指针。
 
 卸载或重载单个插件（`UnloadByIdLifecycleLocked`）按以下四步执行：
-1. **摘除回调并等待在途调用结束**：调用 `rng::DetachAllHooksForPluginAndWait(id)`，将插件关联的 `baseSlot->hookIdx` 置为无效、槽钩子项 `active` 置为 `false`，随后轮询等待原子计数 `g_inFlightHookCalls == 0`，确保没有工作线程仍在该插件代码段中执行。
-2. **清理注册项与槽位规则**：移除 `ownerId == id` 的所有聊天子命令、站点元数据与兜底解析器，并将该插件名下的复合槽重置为 `MasterDerived`。
+1. **摘除回调并等待在途调用结束**：调用 `rng::DetachAllHooksForPluginAndWait(id)`，摘除该插件拥有的槽位钩子项（并重建受影响的 `RvaHookChain`、`hookChainIdxPlus1`）、全局观测器与动态透明包装，随后轮询等待原子计数 `g_inFlightHookCalls == 0`，确保没有工作线程仍在该插件代码段中执行。
+2. **清理注册项与槽位规则**：移除 `ownerId == id` 的所有聊天子命令、站点元数据、兜底解析器与生命周期钩子（`g_lifecycleHooks`），并调用 `rng::ClearRulesByOwner(id)` 将该插件名下的复合槽重置为 `MasterDerived`。
 3. **停机通知**：在 SEH 保护下调用插件导出的 `MhwRngPlugin_Shutdown()`。
 4. **释放模块**：调用 `FreeLibrary` 卸载影子 DLL，并尝试删除对应的 `.hotload\*.dll` 临时文件。
 
@@ -290,4 +297,4 @@ cl.exe /nologo /std:c++17 /O2 /EHsc /MT /utf-8 /I "include" rng_meal.cpp /LD /Fe
 
 ### 2. 构建与脱机回归测试
 - 运行 [build.bat](../build.bat)：依次执行 `sync_plugin_sdks.bat` 与 `ml64` 汇编 [rng_trampolines.asm](../src/rng_trampolines.asm)，再使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll`、`build\mhw_rng\rng_steam.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
-- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证全部既有回归场景（8 线程隔离、`rng_size`、`rng_endemic`、`rng_thk`、影拷贝热重载与 `sChat` 链自愈）及 SDK v3.0 全部新增能力（非易失寄存器与原入参捕获、多插件 Hook 优先级链、`ObserveOnly` 与通配观测器、`FilterVanilla` 保底过滤、二进制快照恢复、生命周期事件、并发异步聊天投递、堆序列与 Tombstone 槽回收、动态透明包装与私有实例策略）。
+- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证全部既有回归场景（8 线程隔离、`rng_size`、`rng_endemic`、`rng_thk`、影拷贝热重载与 `sChat` 链自愈）及 SDK v3.0 全部新增能力（非易失寄存器与原入参捕获、多插件 Hook 优先级链、`ObserveOnly` 与通配观测器、`FilterVanilla` 保底过滤、二进制快照恢复、生命周期事件、并发异步聊天投递、堆序列与 Tombstone 槽回收、动态透明包装、私有实例策略、`rng_steam` 真实代码测试 `V3-9`，以及 64 KB 预留独立 W^X 跳板池对 `sChat::DispatchChatEntry` / `sChat::move` 的验证）。
