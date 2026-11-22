@@ -1,13 +1,13 @@
-# `mhw_rng` 微内核与热重载插件框架（v2）
+# `mhw_rng` 微内核与热重载插件框架（v3.0）
 
 面向《怪物猎人：世界 冰原》Steam 15.23（Build 15539686）的全局随机数接管与条件分流框架。采用微内核（`mhw_rng.dll`）与热插拔业务插件（`nativePC\plugins\mhw_rng\*.dll`）分离的结构。
 
 ## 架构概览
 
 1. **核心模块 (`nativePC\plugins\mhw_rng.dll`)**
-   - 拦截游戏内全部 10 处伪随机数入口（`MtRandom`、`mt19937`、`std::_Random_device`、`CRT_rand`），使用 W^X 跳板页并支持多插件链式挂钩。
-   - 维护 8,192 项 64 位复合条件槽表 `Slot[(CondID << 32) | CallSiteRVA]`，按调用点与条件隔离随机流，支持 `MasterDerived`、`CustomSeed`、`FixedValue`、`Sequence`、`Bypass` 五种模式及 `O(1)` 轮次重置（`Epoch`）。
-   - 同时支持异步状态切换（Push 模式：`SetActiveCondition`）与抽签时同步回调（Pull 模式：`RegisterSlotHook`）。
+   - 拦截游戏内全部 10 处伪随机数入口（`MtRandom`、`mt19937`、`std::_Random_device`、`CRT_rand`），使用严格 W^X 跳板页与 MASM 寄存器快照入口保存调用方 8 个非易失通用寄存器与原始入参，并支持跨插件链式挂钩。
+   - 维护 16,384 项支持 Tombstone 回收的 64 位复合条件槽表 `Slot[(CondID << 32) | CallSiteRVA]`，按调用点与条件隔离随机流，支持 `MasterDerived`、`CustomSeed`、`FixedValue`、`Sequence`、`Bypass` 五种槽模式、`O(1)` 轮次重置（`Epoch`），以及状态快照保存/恢复（`$rng save / restore / saves`）。
+   - 支持三态引擎模式（`on` / `off` / `observe`）、同 RVA 多插件优先级 Hook 链、`FilterVanilla` 原版过滤、全游戏通配观测器、`sChat::move` 主线程异步聊天投递，以及内核生命周期事件广播。
    - 采用 `.hotload\` 影拷贝加载子插件，游戏运行期间源 DLL 文件不被系统锁定，可直接重新编译覆盖并通过 `$rng reload [插件名]` 热更新。
    - 所有核心与插件聊天指令统一收口于 `$rng <subcmd>`（兼容 `$rng_<subcmd>`）前缀下。
 

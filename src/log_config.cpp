@@ -163,7 +163,7 @@ void InitLog() {
         SYSTEMTIME st{};
         ::GetLocalTime(&st);
         std::fprintf(g_logFile,
-                     "=== MHW RNG Microkernel v2 (mhw_rng.dll) started %04d-%02d-%02d %02d:%02d:%02d ===\n",
+                     "=== MHW RNG Microkernel v3.0 (mhw_rng.dll) started %04d-%02d-%02d %02d:%02d:%02d ===\n",
                      st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
         std::fflush(g_logFile);
     }

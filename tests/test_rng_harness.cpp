@@ -32,8 +32,10 @@
 
 namespace {
 
-using TestNrandFn  = std::uint32_t(__fastcall*)(std::uint32_t*);
-using TestSphereFn = float*(__fastcall*)(std::uint32_t*, float*);
+using TestNrandFn       = std::uint32_t(__fastcall*)(std::uint32_t*);
+using TestCtorSeedFn    = std::uint32_t*(__fastcall*)(std::uint32_t*, std::uint32_t);
+using TestSphereFn      = float*(__fastcall*)(std::uint32_t*, float*);
+using TestMtRangeFn     = float(__fastcall*)(void*, float, float);
 // Executes `fn_r9(holder_rcx, tblIdx_rdx)` with non-volatile `RBX = monster_r8`, reproducing `FUN_141ccfb70`!
 using CallWithMonsterRbxFn = std::uint32_t(__fastcall*)(void* holder, std::uint32_t* tblIdxPtr, void* monster, void* targetFn);
 using EndemicCaptureRollFn = std::uint32_t(__fastcall*)(std::int32_t animalId, std::int32_t animalType, float* outScale);
@@ -41,11 +43,18 @@ using SharedFloatRangeFn   = float(__fastcall*)(float minVal, float maxVal);
 
 volatile std::uint32_t g_antiTailCallSink = 0;
 std::vector<std::string> g_capturedChatLines;
+std::vector<std::string> g_capturedAsyncChatLines;
 
 void CaptureChatSink(const char* utf8Text) noexcept {
     if (utf8Text) {
         g_capturedChatLines.emplace_back(utf8Text);
         std::printf("  [chat] %s\n", utf8Text);
+    }
+}
+
+void CaptureAsyncChatSink(const char* utf8Text) noexcept {
+    if (utf8Text) {
+        g_capturedAsyncChatLines.emplace_back(utf8Text);
     }
 }
 
@@ -57,6 +66,36 @@ __declspec(noinline) std::uint32_t CallNrandSiteA(TestNrandFn fn, std::uint32_t*
 __declspec(noinline) std::uint32_t CallNrandSiteB(TestNrandFn fn, std::uint32_t* sInst) {
     const std::uint32_t r = fn(sInst);
     g_antiTailCallSink = r ^ 2U;
+    return r;
+}
+__declspec(noinline) std::uint32_t CallNrandV3Chain(TestNrandFn fn, std::uint32_t* sInst) {
+    const std::uint32_t r = fn(sInst);
+    g_antiTailCallSink = r ^ 3U;
+    return r;
+}
+__declspec(noinline) std::uint32_t CallNrandV3Filter(TestNrandFn fn, std::uint32_t* sInst) {
+    const std::uint32_t r = fn(sInst);
+    g_antiTailCallSink = r ^ 4U;
+    return r;
+}
+__declspec(noinline) std::uint32_t CallNrandV3Observe(TestNrandFn fn, std::uint32_t* sInst) {
+    const std::uint32_t r = fn(sInst);
+    g_antiTailCallSink = r ^ 5U;
+    return r;
+}
+__declspec(noinline) std::uint32_t CallNrandV3Priv(TestNrandFn fn, std::uint32_t* privInst) {
+    const std::uint32_t r = fn(privInst);
+    g_antiTailCallSink = r ^ 6U;
+    return r;
+}
+__declspec(noinline) std::uint32_t* CallCtorSeedV3Priv(TestCtorSeedFn fn, std::uint32_t* privInst, std::uint32_t seed) {
+    std::uint32_t* p = fn(privInst, seed);
+    g_antiTailCallSink = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(p));
+    return p;
+}
+__declspec(noinline) float CallMtRangeV3(TestMtRangeFn fn, void* ctx, float lo, float hi) {
+    const float r = fn(ctx, lo, hi);
+    _ReadWriteBarrier();
     return r;
 }
 __declspec(noinline) std::uint32_t CallNoiseWorker(TestNrandFn fn, std::uint32_t* sInst) {
@@ -72,7 +111,7 @@ __declspec(noinline) void CallSphereSite(TestSphereFn fn, std::uint32_t* sInst, 
 } // namespace
 
 int main(int argc, char** argv) {
-    std::printf("=== MHW RNG Microkernel v2.1 + Official Plugin Audit Suite ===\n");
+    std::printf("=== MHW RNG Microkernel v3.0 + Official Plugin Audit Suite ===\n");
 
     constexpr std::size_t kImageSize = 0x06000000ULL;
     auto* img = static_cast<std::uint8_t*>(
@@ -165,17 +204,21 @@ int main(int argc, char** argv) {
     void *origRdev  = nullptr, *origMtRng = nullptr, *origMtIni = nullptr, *origMtDrw = nullptr, *origCrt = nullptr;
 
     const bool okHooks =
-        hook::PrepareDetour(base + mhw::kRvaMtRandomNrand,       sizeof(mhw::kPrologueMtRandomNrand),       reinterpret_cast<void*>(&rng::Hook_MtRandomNrand),       &origNrand, mhw::kPrologueMtRandomNrand) &&
-        hook::PrepareDetour(base + mhw::kRvaMtRandomCtorSeed,    sizeof(mhw::kPrologueMtRandomCtorSeed),    reinterpret_cast<void*>(&rng::Hook_MtRandomCtorSeed),    &origCtor,  mhw::kPrologueMtRandomCtorSeed) &&
-        hook::PrepareDetour(base + mhw::kRvaMtRandomCtorDefault, sizeof(mhw::kPrologueMtRandomCtorDefault), reinterpret_cast<void*>(&rng::Hook_MtRandomCtorDefault), &origDef,   mhw::kPrologueMtRandomCtorDefault) &&
-        hook::PrepareDetour(base + mhw::kRvaMtRandomSrand,       sizeof(mhw::kPrologueMtRandomSrand),       reinterpret_cast<void*>(&rng::Hook_MtRandomSrand),       &origSrand, mhw::kPrologueMtRandomSrand) &&
-        hook::PrepareDetour(base + mhw::kRvaMtRandomSphere,      sizeof(mhw::kPrologueMtRandomSphere),      reinterpret_cast<void*>(&rng::Hook_MtRandomSphere),      &origSph,   mhw::kPrologueMtRandomSphere) &&
-        hook::PrepareDetour(base + mhw::kRvaStdRandomDevice,     sizeof(mhw::kPrologueStdRandomDevice),     reinterpret_cast<void*>(&rng::Hook_StdRandomDevice),     &origRdev,  mhw::kPrologueStdRandomDevice) &&
-        hook::PrepareDetour(base + mhw::kRvaMt19937Range,        sizeof(mhw::kPrologueMt19937Range),        reinterpret_cast<void*>(&rng::Hook_Mt19937Range),        &origMtRng, mhw::kPrologueMt19937Range) &&
-        hook::PrepareDetour(base + mhw::kRvaMt19937HeapInit,     sizeof(mhw::kPrologueMt19937HeapInit),     reinterpret_cast<void*>(&rng::Hook_Mt19937HeapInit),     &origMtIni, mhw::kPrologueMt19937HeapInit) &&
-        hook::PrepareDetour(base + mhw::kRvaMt19937HeapDraw,     sizeof(mhw::kPrologueMt19937HeapDraw),     reinterpret_cast<void*>(&rng::Hook_Mt19937HeapDraw),     &origMtDrw, mhw::kPrologueMt19937HeapDraw) &&
-        hook::PrepareDetour(base + mhw::kRvaCrtRand,             sizeof(mhw::kPrologueCrtRand),             reinterpret_cast<void*>(&rng::Hook_CrtRand),             &origCrt,   mhw::kPrologueCrtRand);
+        hook::PrepareDetour(base + mhw::kRvaMtRandomNrand,       sizeof(mhw::kPrologueMtRandomNrand),       reinterpret_cast<void*>(&MhwRngAsm_MtRandomNrand),       &origNrand, mhw::kPrologueMtRandomNrand) &&
+        hook::PrepareDetour(base + mhw::kRvaMtRandomCtorSeed,    sizeof(mhw::kPrologueMtRandomCtorSeed),    reinterpret_cast<void*>(&MhwRngAsm_MtRandomCtorSeed),    &origCtor,  mhw::kPrologueMtRandomCtorSeed) &&
+        hook::PrepareDetour(base + mhw::kRvaMtRandomCtorDefault, sizeof(mhw::kPrologueMtRandomCtorDefault), reinterpret_cast<void*>(&MhwRngAsm_MtRandomCtorDefault), &origDef,   mhw::kPrologueMtRandomCtorDefault) &&
+        hook::PrepareDetour(base + mhw::kRvaMtRandomSrand,       sizeof(mhw::kPrologueMtRandomSrand),       reinterpret_cast<void*>(&MhwRngAsm_MtRandomSrand),       &origSrand, mhw::kPrologueMtRandomSrand) &&
+        hook::PrepareDetour(base + mhw::kRvaMtRandomSphere,      sizeof(mhw::kPrologueMtRandomSphere),      reinterpret_cast<void*>(&MhwRngAsm_MtRandomSphere),      &origSph,   mhw::kPrologueMtRandomSphere) &&
+        hook::PrepareDetour(base + mhw::kRvaStdRandomDevice,     sizeof(mhw::kPrologueStdRandomDevice),     reinterpret_cast<void*>(&MhwRngAsm_StdRandomDevice),     &origRdev,  mhw::kPrologueStdRandomDevice) &&
+        hook::PrepareDetour(base + mhw::kRvaMt19937Range,        sizeof(mhw::kPrologueMt19937Range),        reinterpret_cast<void*>(&MhwRngAsm_Mt19937Range),        &origMtRng, mhw::kPrologueMt19937Range) &&
+        hook::PrepareDetour(base + mhw::kRvaMt19937HeapInit,     sizeof(mhw::kPrologueMt19937HeapInit),     reinterpret_cast<void*>(&MhwRngAsm_Mt19937HeapInit),     &origMtIni, mhw::kPrologueMt19937HeapInit) &&
+        hook::PrepareDetour(base + mhw::kRvaMt19937HeapDraw,     sizeof(mhw::kPrologueMt19937HeapDraw),     reinterpret_cast<void*>(&MhwRngAsm_Mt19937HeapDraw),     &origMtDrw, mhw::kPrologueMt19937HeapDraw) &&
+        hook::PrepareDetour(base + mhw::kRvaCrtRand,             sizeof(mhw::kPrologueCrtRand),             reinterpret_cast<void*>(&MhwRngAsm_CrtRand),             &origCrt,   mhw::kPrologueCrtRand);
     if (!okHooks) return 1;
+    if (std::memcmp(img + mhw::kRvaSChatMove, mhw::kPrologueSChatMove, sizeof(mhw::kPrologueSChatMove)) != 0) {
+        std::printf("FAIL: sChat::move prologue mismatch at 0x%llX\n", static_cast<unsigned long long>(mhw::kRvaSChatMove));
+        return 1;
+    }
 
     rng::SetOrigMtRandomNrand(origNrand);
     rng::SetOrigMtRandomCtorSeed(origCtor);
@@ -230,7 +273,7 @@ int main(int argc, char** argv) {
     // 2. Load Official Plugins (`rng_inspector.dll` + `rng_size.dll` + `rng_endemic.dll` + `rng_fatalis.dll`) via Shadow-Copy Host
     const std::string plugDir = buildDir + "\\mhw_rng";
 
-    plugin_host::Init(base, end, plugDir, &CaptureChatSink);
+    plugin_host::Init(base, end, plugDir, &CaptureChatSink, &CaptureAsyncChatSink);
     const std::size_t loadedCnt = plugin_host::LoadAllFromDirectory();
     if (loadedCnt < 4U) {
         std::printf("FAIL: Expected >= 4 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
@@ -1194,7 +1237,603 @@ int main(int argc, char** argv) {
         std::printf("[OK] sChat::DispatchChatEntry chaining + unchained-overwrite detection & self-heal verified!\n");
     }
 
-    // 11. Verify `randUnitSphere` & clean shutdown
+    // 11. Verify SDK v3.0 Microkernel Capabilities (Real `text_1523.bin` + MHW x64 Thunks)
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        if (!host || host->apiVersion != 3U || host->structSize != sizeof(MhwRngHostApi)) {
+            std::printf("FAIL [v3 host]: invalid HostApi version/size\n");
+            return 1;
+        }
+        constexpr MhwRngPluginId kTestPluginId = 777U;
+
+        // V3-1: Caller Non-Volatile Register Snapshot + Original Argument Forwarding
+        {
+            // Thunk placed inside [base, end) at `base + 0x05000000`:
+            //   fn(void* rcx, std::uint64_t rdx_or_xmm1, std::uint64_t r8_or_xmm2, void* target_r9)
+            std::uint8_t* regThunk = img + 0x05000000ULL;
+            std::size_t off = 0;
+            auto emitBytes = [&](std::initializer_list<std::uint8_t> bs) {
+                for (std::uint8_t b : bs) regThunk[off++] = b;
+            };
+            auto emitU64 = [&](std::uint64_t v) {
+                std::memcpy(regThunk + off, &v, 8);
+                off += 8;
+            };
+            emitBytes({0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57}); // push rbx..r15
+            emitBytes({0x48, 0x83, 0xEC, 0x28});                                                 // sub rsp, 28h
+            emitBytes({0x49, 0x8B, 0xC1});                                                       // mov rax, r9
+            emitBytes({0x48, 0xBB}); emitU64(0x1111222233334441ULL);
+            emitBytes({0x48, 0xBD}); emitU64(0x1111222233334442ULL);
+            emitBytes({0x48, 0xBE}); emitU64(0x1111222233334443ULL);
+            emitBytes({0x48, 0xBF}); emitU64(0x1111222233334444ULL);
+            emitBytes({0x49, 0xBC}); emitU64(0x1111222233334445ULL);
+            emitBytes({0x49, 0xBD}); emitU64(0x1111222233334446ULL);
+            emitBytes({0x49, 0xBE}); emitU64(0x1111222233334447ULL);
+            emitBytes({0x49, 0xBF}); emitU64(0x1111222233334448ULL);
+            emitBytes({0xFF, 0xD0});                                                             // call rax
+            const std::uint32_t thunkRetRva = static_cast<std::uint32_t>(0x05000000ULL + off);
+            emitBytes({0x48, 0x83, 0xC4, 0x28});                                                 // add rsp, 28h
+            emitBytes({0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5F, 0x5E, 0x5D, 0x5B, 0xC3});
+            ::FlushInstructionCache(::GetCurrentProcess(), regThunk, off);
+
+            struct RegCheckState {
+                bool seenNrand = false, seenCtor = false, seenRange = false;
+                bool regsExact = false;
+                std::uint64_t gotSeed = 0;
+                float gotMin = 0.0f, gotMax = 0.0f;
+            } regSt{};
+
+            MhwRngHookDesc hd{};
+            hd.structSize = sizeof(hd);
+            hd.rva        = thunkRetRva;
+            hd.priority   = 0;
+            hd.flags      = kMhwRngHookPre;
+            hd.userData   = &regSt;
+            hd.preFn      = +[](const MhwRngDrawContext* ctx, MhwRngHookDecision* dec, void* ud) {
+                auto* st = static_cast<RegCheckState*>(ud);
+                if (!ctx->callerRegs || (ctx->callFlags & kMhwRngDrawFlagHasRegs) == 0U) return;
+                const bool match =
+                    ctx->callerRegs->rbx == 0x1111222233334441ULL &&
+                    ctx->callerRegs->rbp == 0x1111222233334442ULL &&
+                    ctx->callerRegs->rsi == 0x1111222233334443ULL &&
+                    ctx->callerRegs->rdi == 0x1111222233334444ULL &&
+                    ctx->callerRegs->r12 == 0x1111222233334445ULL &&
+                    ctx->callerRegs->r13 == 0x1111222233334446ULL &&
+                    ctx->callerRegs->r14 == 0x1111222233334447ULL &&
+                    ctx->callerRegs->r15 == 0x1111222233334448ULL &&
+                    ctx->callerRegs->callerRsp == reinterpret_cast<std::uintptr_t>(ctx->returnAddrSlot);
+
+                if (ctx->sourceKind == kMhwRngSrcMtNrandGlobal) {
+                    st->seenNrand = true;
+                    st->regsExact = match;
+                } else if (ctx->sourceKind == kMhwRngSrcMtCtorSeed) {
+                    st->seenCtor = match && ((ctx->callFlags & kMhwRngDrawFlagHasOrigSeed) != 0U);
+                    st->gotSeed  = ctx->origArg1;
+                } else if (ctx->sourceKind == kMhwRngSrcMt19937Range) {
+                    st->seenRange = match && ((ctx->callFlags & kMhwRngDrawFlagHasRange) != 0U);
+                    st->gotMin    = ctx->origMinVal;
+                    st->gotMax    = ctx->origMaxVal;
+                    float retF = 42.5f;
+                    std::uint32_t bits = 0U;
+                    std::memcpy(&bits, &retF, sizeof(bits));
+                    dec->action = kMhwRngActionReturnFloatBits;
+                    dec->value0 = bits;
+                }
+            };
+            const MhwRngHookHandle hReg = host->RegisterSlotHookEx(kTestPluginId, &hd);
+            if (!hReg) {
+                std::printf("FAIL [V3-1]: RegisterSlotHookEx failed\n");
+                return 1;
+            }
+
+            using ThunkNrandFn = std::uint32_t(__fastcall*)(void*, std::uint64_t, std::uint64_t, void*);
+            using ThunkCtorFn  = std::uint32_t*(__fastcall*)(void*, std::uint32_t, std::uint64_t, void*);
+            using ThunkRangeFn = float(__fastcall*)(void*, float, float, void*);
+            alignas(16) std::uint32_t tmpMt[4]{};
+
+            reinterpret_cast<ThunkNrandFn>(regThunk)(sInst, 0ULL, 0ULL, reinterpret_cast<void*>(fnNrand));
+            reinterpret_cast<ThunkCtorFn>(regThunk)(tmpMt, 0x13579BDFU, 0ULL, reinterpret_cast<void*>(base + mhw::kRvaMtRandomCtorSeed));
+            const float fGot = reinterpret_cast<ThunkRangeFn>(regThunk)(nullptr, -12.5f, 37.25f, reinterpret_cast<void*>(base + mhw::kRvaMt19937Range));
+
+            host->UnregisterSlotHookHandle(kTestPluginId, hReg);
+
+            if (!regSt.seenNrand || !regSt.regsExact || !regSt.seenCtor || regSt.gotSeed != 0x13579BDFULL ||
+                !regSt.seenRange || std::fabs(regSt.gotMin - (-12.5f)) > 1e-6f ||
+                std::fabs(regSt.gotMax - 37.25f) > 1e-6f || std::fabs(fGot - 42.5f) > 1e-6f) {
+                std::printf("FAIL [V3-1]: reg/arg capture failed (nrand=%d regs=%d ctor=%d seed=0x%llX range=%d f=%.2f)\n",
+                            regSt.seenNrand, regSt.regsExact, regSt.seenCtor,
+                            static_cast<unsigned long long>(regSt.gotSeed), regSt.seenRange, fGot);
+                return 1;
+            }
+            std::printf("[OK] V3-1: MASM non-volatile GPR snapshot (all 8 regs) + origSeed/minVal/maxVal verified!\n");
+        }
+
+        // V3-2: Multi-Plugin Chained Priority Hooks + Unregister Independence
+        {
+            (void)CallNrandV3Chain(fnNrand, sInst);
+            MhwRngSlotSnapshot snap{};
+            // Discover the exact RVA of `CallNrandV3Chain`'s inner call by inspecting active slots or via GlobalObserver
+            std::uint32_t chainRva = 0U;
+            const MhwRngHookHandle hObs = host->RegisterGlobalObserver(
+                kTestPluginId, 0U, (1U << kMhwRngSrcMtNrandGlobal),
+                +[](const MhwRngDrawContext* ctx, void* ud) {
+                    *static_cast<std::uint32_t*>(ud) = ctx->callSiteRva;
+                },
+                &chainRva);
+            (void)CallNrandV3Chain(fnNrand, sInst);
+            host->UnregisterGlobalObserver(kTestPluginId, hObs);
+            if (chainRva == 0U || !host->GetCondSlotInfo(chainRva, 0U, &snap)) {
+                std::printf("FAIL [V3-2]: failed to capture chainRva via GlobalObserver\n");
+                return 1;
+            }
+
+            struct ChainTrace {
+                int  orderIdx = 0;
+                int  bPos = -1, aPos = -1;
+                int  bMode = 0; // 0 = Continue, 1 = ReturnValue, 2 = UseCondition(7)
+                std::uint32_t aSawCond = 0U;
+            } tr{};
+
+            MhwRngHookDesc hdA{};
+            hdA.structSize = sizeof(hdA);
+            hdA.rva        = chainRva;
+            hdA.priority   = 10;
+            hdA.flags      = kMhwRngHookPre;
+            hdA.userData   = &tr;
+            hdA.preFn      = +[](const MhwRngDrawContext* ctx, MhwRngHookDecision* dec, void* ud) {
+                auto* t = static_cast<ChainTrace*>(ud);
+                t->aPos = t->orderIdx++;
+                t->aSawCond = ctx->activeCondId;
+                if (t->bMode == 2) {
+                    dec->action = kMhwRngActionClaimCondition;
+                    dec->condId = ctx->activeCondId;
+                } else {
+                    dec->action = kMhwRngActionReturnValue;
+                    dec->value0 = 0xAAAAAAAAU;
+                }
+            };
+
+            MhwRngHookDesc hdB{};
+            hdB.structSize = sizeof(hdB);
+            hdB.rva        = chainRva;
+            hdB.priority   = -10;
+            hdB.flags      = kMhwRngHookPre;
+            hdB.userData   = &tr;
+            hdB.preFn      = +[](const MhwRngDrawContext*, MhwRngHookDecision* dec, void* ud) {
+                auto* t = static_cast<ChainTrace*>(ud);
+                t->bPos = t->orderIdx++;
+                if (t->bMode == 1) {
+                    dec->action = kMhwRngActionReturnValue;
+                    dec->value0 = 0xBBBBBBBBU;
+                } else if (t->bMode == 2) {
+                    dec->action = kMhwRngActionUseCondition;
+                    dec->condId = 7U;
+                } else {
+                    dec->action = kMhwRngActionContinue;
+                }
+            };
+
+            const MhwRngHookHandle hA = host->RegisterSlotHookEx(kTestPluginId, &hdA);
+            const MhwRngHookHandle hB = host->RegisterSlotHookEx(kTestPluginId, &hdB);
+            if (!hA || !hB) {
+                std::printf("FAIL [V3-2]: RegisterSlotHookEx failed\n");
+                return 1;
+            }
+
+            tr.bMode = 0;
+            const std::uint32_t vCont = CallNrandV3Chain(fnNrand, sInst);
+            if (vCont != 0xAAAAAAAAU || tr.bPos != 0 || tr.aPos != 1) {
+                std::printf("FAIL [V3-2]: priority/Continue mismatch (v=0x%X bPos=%d aPos=%d)\n", vCont, tr.bPos, tr.aPos);
+                return 1;
+            }
+
+            tr.orderIdx = 0; tr.bPos = tr.aPos = -1; tr.bMode = 1;
+            const std::uint32_t vShort = CallNrandV3Chain(fnNrand, sInst);
+            if (vShort != 0xBBBBBBBBU || tr.bPos != 0 || tr.aPos != -1) {
+                std::printf("FAIL [V3-2]: ReturnValue short-circuit failed\n");
+                return 1;
+            }
+
+            host->SetCondFixedValue(kTestPluginId, chainRva, 7U, 0x77777777U);
+            tr.orderIdx = 0; tr.bPos = tr.aPos = -1; tr.bMode = 2;
+            const std::uint32_t vCond = CallNrandV3Chain(fnNrand, sInst);
+            if (vCond != 0x77777777U || tr.aSawCond != 7U) {
+                std::printf("FAIL [V3-2]: UseCondition propagation failed (v=0x%X aSaw=%u)\n", vCond, tr.aSawCond);
+                return 1;
+            }
+
+            // Unregister B and ensure A remains completely intact
+            host->UnregisterSlotHookHandle(kTestPluginId, hB);
+            tr.bMode = 0;
+            if (CallNrandV3Chain(fnNrand, sInst) != 0xAAAAAAAAU) {
+                std::printf("FAIL [V3-2]: hook A lost after unregistering hook B\n");
+                return 1;
+            }
+            host->UnregisterSlotHookHandle(kTestPluginId, hA);
+            host->ClearSlotAllConditions(chainRva);
+            std::printf("[OK] V3-2: Multi-plugin priority hook chain & independent handle unregistration verified!\n");
+        }
+
+        // V3-3: Observe-Only Mode + Global Wildcard Observer
+        {
+            alignas(16) std::uint32_t vanInst[4]{0x12345678U, 0x23456789U, 0x3456789AU, 0x456789ABU};
+            auto stepLocalVanilla = [](std::uint32_t s[4]) -> std::uint32_t {
+                std::uint32_t t = (s[0] << 15) ^ s[0];
+                s[0] = s[1]; s[1] = s[2];
+                const std::uint32_t w = s[3];
+                s[2] = w;
+                t = ((w >> 17) ^ t) >> 4 ^ w ^ t;
+                s[3] = t;
+                return t;
+            };
+            std::uint32_t refInst[4]{0x12345678U, 0x23456789U, 0x3456789AU, 0x456789ABU};
+            std::uint32_t expectedVan[8]{};
+            for (int i = 0; i < 8; ++i) expectedVan[i] = stepLocalVanilla(refInst);
+
+            struct ObsStats {
+                int count = 0;
+                int postCount = 0;
+                std::uint32_t rva = 0U;
+                std::uint32_t seenVals[8]{};
+                bool flagsOk = true;
+            } obs{};
+
+            const MhwRngHookHandle hObs = host->RegisterGlobalObserver(
+                kTestPluginId, 0U, (1U << kMhwRngSrcMtNrandPrivate),
+                +[](const MhwRngDrawContext* ctx, void* ud) {
+                    auto* st = static_cast<ObsStats*>(ud);
+                    if ((ctx->callFlags & (kMhwRngDrawFlagObserveOnly | kMhwRngDrawFlagPostDraw | kMhwRngDrawFlagHasVanilla)) !=
+                        (kMhwRngDrawFlagObserveOnly | kMhwRngDrawFlagPostDraw | kMhwRngDrawFlagHasVanilla)) {
+                        st->flagsOk = false;
+                    }
+                    if (ctx->vanillaValue0 != ctx->finalValue0) st->flagsOk = false;
+                    if (st->count < 8) st->seenVals[st->count] = ctx->finalValue0;
+                    st->rva = ctx->callSiteRva;
+                    ++st->count;
+                },
+                &obs);
+
+            host->SetEngineMode(kMhwRngModeObserveOnly);
+            std::uint32_t gotVan[8]{};
+            for (int i = 0; i < 8; ++i) gotVan[i] = CallNrandV3Observe(fnNrand, vanInst);
+
+            MhwRngHookDesc postOnly{};
+            postOnly.structSize = sizeof(postOnly);
+            postOnly.rva        = obs.rva;
+            postOnly.flags      = kMhwRngHookPost | kMhwRngHookObserveOnly;
+            postOnly.postFn     = +[](const MhwRngDrawContext* ctx, MhwRngHookDecision* dec, void* ud) {
+                auto* st = static_cast<ObsStats*>(ud);
+                ++st->postCount;
+                // Attempted return override MUST be ignored in ObserveOnly mode!
+                dec->action = kMhwRngActionReturnValue;
+                dec->value0 = 0xDEADBEEFU;
+                (void)ctx;
+            };
+            postOnly.userData   = &obs;
+            const MhwRngHookHandle hPostObs = host->RegisterSlotHookEx(kTestPluginId, &postOnly);
+
+            const std::uint32_t extraExpected = stepLocalVanilla(refInst);
+            const std::uint32_t extraGot      = CallNrandV3Observe(fnNrand, vanInst);
+
+            host->SetEngineMode(kMhwRngModeTakeover);
+            host->UnregisterSlotHookHandle(kTestPluginId, hPostObs);
+            host->UnregisterGlobalObserver(kTestPluginId, hObs);
+
+            MhwRngSlotSnapshot obsSnap{};
+            if (std::memcmp(gotVan, expectedVan, sizeof(expectedVan)) != 0 ||
+                std::memcmp(obs.seenVals, expectedVan, sizeof(expectedVan)) != 0 ||
+                extraGot != extraExpected || obs.postCount != 1 || obs.count != 9 || !obs.flagsOk ||
+                !host->GetCondSlotInfo(obs.rva, 0U, &obsSnap) || obsSnap.lastValue != extraExpected || obsSnap.totalCalls < 9ULL) {
+                std::printf("FAIL [V3-3]: ObserveOnly/GlobalObserver mismatch (cnt=%d post=%d flagsOk=%d)\n",
+                            obs.count, obs.postCount, obs.flagsOk);
+                return 1;
+            }
+            std::printf("[OK] V3-3: ObserveOnly mode + Global Wildcard Observer verified against raw MHW Xorshift128!\n");
+        }
+
+        // V3-4: `FilterVanilla` Post-Draw Conditional Floor/Clamp
+        {
+            std::uint32_t filterRva = 0U;
+            const MhwRngHookHandle hFind = host->RegisterGlobalObserver(
+                kTestPluginId, 0U, (1U << kMhwRngSrcMtNrandPrivate),
+                +[](const MhwRngDrawContext* ctx, void* ud) { *static_cast<std::uint32_t*>(ud) = ctx->callSiteRva; },
+                &filterRva);
+            alignas(16) std::uint32_t privF[4]{0x87654321U, 0x13572468U, 0x99887766U, 0x55443322U};
+            (void)CallNrandV3Filter(fnNrand, privF);
+            host->UnregisterGlobalObserver(kTestPluginId, hFind);
+
+            struct FilterStats {
+                int kept = 0, clamped = 0;
+                bool canModifyOk = true;
+            } fst{};
+
+            MhwRngHookDesc fd{};
+            fd.structSize = sizeof(fd);
+            fd.rva        = filterRva;
+            fd.flags      = kMhwRngHookFilterVanilla;
+            fd.userData   = &fst;
+            fd.postFn     = +[](const MhwRngDrawContext* ctx, MhwRngHookDecision* dec, void* ud) {
+                auto* st = static_cast<FilterStats*>(ud);
+                if ((ctx->callFlags & (kMhwRngDrawFlagCanModify | kMhwRngDrawFlagPostDraw | kMhwRngDrawFlagHasVanilla)) !=
+                    (kMhwRngDrawFlagCanModify | kMhwRngDrawFlagPostDraw | kMhwRngDrawFlagHasVanilla)) {
+                    st->canModifyOk = false;
+                }
+                if (ctx->vanillaValue0 < 0x80000000U) {
+                    dec->action = kMhwRngActionReturnValue;
+                    dec->value0 = 0xF00F0001U;
+                    ++st->clamped;
+                } else {
+                    dec->action = kMhwRngActionContinue;
+                    ++st->kept;
+                }
+            };
+            const MhwRngHookHandle hF = host->RegisterSlotHookEx(kTestPluginId, &fd);
+            int gotKept = 0, gotClamped = 0;
+            for (int i = 0; i < 32; ++i) {
+                const std::uint32_t r = CallNrandV3Filter(fnNrand, privF);
+                if (r == 0xF00F0001U) ++gotClamped;
+                else if (r >= 0x80000000U) ++gotKept;
+            }
+            host->UnregisterSlotHookHandle(kTestPluginId, hF);
+            if (!fst.canModifyOk || fst.kept == 0 || fst.clamped == 0 || gotKept != fst.kept || gotClamped != fst.clamped) {
+                std::printf("FAIL [V3-4]: FilterVanilla failed (kept=%d clamped=%d ok=%d)\n",
+                            fst.kept, fst.clamped, fst.canModifyOk);
+                return 1;
+            }
+            std::printf("[OK] V3-4: FilterVanilla post-draw pity clamp (%d kept vanilla, %d clamped) verified!\n",
+                        gotKept, gotClamped);
+        }
+
+        // V3-5 & V3-6: Binary State Snapshot/Restore + Single-Slot Restore + Lifecycle Events
+        {
+            struct LifeStats {
+                int evEpoch = 0, evSeed = 0, evMode = 0, evClear = 0, evRestore = 0;
+            } lst{};
+            const MhwRngHookHandle hLife = host->RegisterLifecycleHook(
+                kTestPluginId,
+                +[](const MhwRngEventInfo* info, void* ud) {
+                    auto* s = static_cast<LifeStats*>(ud);
+                    switch (info->eventKind) {
+                        case kMhwRngEventEpochReset:    ++s->evEpoch; break;
+                        case kMhwRngEventMasterSeed:    ++s->evSeed; break;
+                        case kMhwRngEventEngineMode:    ++s->evMode; break;
+                        case kMhwRngEventClearAllRules: ++s->evClear; break;
+                        case kMhwRngEventStateRestored: ++s->evRestore; break;
+                        default: break;
+                    }
+                },
+                &lst);
+
+            for (int i = 0; i < 20; ++i) (void)CallNrandSiteA(fnNrand, sInst);
+
+            // Also test unseeded slot + activeCond restoration behavior:
+            constexpr std::uint32_t kUnseededRva = 0x05000400U;
+            host->SetCondMasterDerived(kTestPluginId, kUnseededRva, 0U);
+            host->SetActiveCondition(kTestPluginId, kUnseededRva, 0U);
+
+            const std::uint32_t blobNeed = host->CaptureStateBlob(nullptr, 0U);
+            std::vector<std::uint8_t> blob(blobNeed);
+            const std::uint32_t blobGot = host->CaptureStateBlob(blob.data(), blobNeed);
+            if (blobNeed == 0U || blobGot != blobNeed) {
+                std::printf("FAIL [V3-5]: CaptureStateBlob size mismatch (%u vs %u)\n", blobGot, blobNeed);
+                return 1;
+            }
+            const std::uint64_t savedSeed  = host->GetMasterSeed();
+            const std::uint64_t savedEpoch = host->GetEpoch();
+
+            std::uint32_t expAfterSave[16]{};
+            for (int i = 0; i < 16; ++i) expAfterSave[i] = CallNrandSiteA(fnNrand, sInst);
+
+            // Mutate heavily (including modifying activeCond on kUnseededRva!)
+            host->SetActiveCondition(kTestPluginId, kUnseededRva, 99U);
+            for (int i = 0; i < 50; ++i) (void)CallNrandSiteA(fnNrand, sInst);
+            host->SetMasterSeed(0x9999888877776666ULL, true);
+            host->ResetEpoch();
+            host->SetEngineMode(kMhwRngModeObserveOnly);
+            host->SetEngineMode(kMhwRngModeTakeover);
+            host->ClearAllRules();
+
+            if (!host->RestoreStateBlob(blob.data(), static_cast<std::uint32_t>(blob.size())) ||
+                host->GetMasterSeed() != savedSeed || host->GetEpoch() != savedEpoch ||
+                host->GetActiveCondition(kUnseededRva) != 0U) {
+                std::printf("FAIL [V3-5]: RestoreStateBlob failed to restore seed/epoch/activeCond\n");
+                return 1;
+            }
+            // Verify unseeded slot captured with seededEpoch==0 was NOT corrupted to fallback state:
+            MhwRngSlotSnapshot unseededSnap{};
+            if (!host->GetCondSlotInfo(kUnseededRva, 0U, &unseededSnap) ||
+                (unseededSnap.state[0] == 0x075BCD15U && unseededSnap.state[1] == 0x159A55E5U)) {
+                std::printf("FAIL [V3-5]: unseeded slot state corrupted on Capture/RestoreStateBlob!\n");
+                return 1;
+            }
+            std::uint32_t gotAfterRestore[16]{};
+            for (int i = 0; i < 16; ++i) gotAfterRestore[i] = CallNrandSiteA(fnNrand, sInst);
+
+            if (std::memcmp(gotAfterRestore, expAfterSave, sizeof(expAfterSave)) != 0) {
+                std::printf("FAIL [V3-5]: Restored RNG stream diverged from captured snapshot!\n");
+                return 1;
+            }
+
+            // Single-slot cursor/state restore check
+            for (int i = 0; i < 10; ++i) (void)CallNrandSiteB(fnNrand, sInst);
+            std::uint32_t siteBRva = 0U;
+            const MhwRngHookHandle hBobs = host->RegisterGlobalObserver(
+                kTestPluginId, 0U, (1U << kMhwRngSrcMtNrandGlobal),
+                +[](const MhwRngDrawContext* ctx, void* ud) { *static_cast<std::uint32_t*>(ud) = ctx->callSiteRva; },
+                &siteBRva);
+            (void)CallNrandSiteB(fnNrand, sInst);
+            host->UnregisterGlobalObserver(kTestPluginId, hBobs);
+
+            MhwRngSlotSnapshot snapB{};
+            host->GetCondSlotInfo(siteBRva, 0U, &snapB);
+            MhwRngSlotState midSt{};
+            midSt.callSiteRva  = siteBRva;
+            midSt.condId       = 0U;
+            std::memcpy(midSt.state, snapB.state, sizeof(midSt.state));
+            midSt.seqCursor    = snapB.seqCursor;
+            midSt.activeCondId = snapB.activeCondId;
+            midSt.epochCalls   = snapB.epochCalls;
+            midSt.lastValue    = snapB.lastValue;
+            midSt.flags        = kMhwRngRestoreAll;
+
+            std::uint32_t expB[8]{};
+            for (int i = 0; i < 8; ++i) expB[i] = CallNrandSiteB(fnNrand, sInst);
+            for (int i = 0; i < 20; ++i) (void)CallNrandSiteB(fnNrand, sInst);
+            if (!host->RestoreSlotState(&midSt)) {
+                std::printf("FAIL [V3-5]: RestoreSlotState failed\n");
+                return 1;
+            }
+            for (int i = 0; i < 8; ++i) {
+                if (CallNrandSiteB(fnNrand, sInst) != expB[i]) {
+                    std::printf("FAIL [V3-5]: Single-slot RestoreSlotState diverged at step %d\n", i);
+                    return 1;
+                }
+            }
+
+            host->UnregisterLifecycleHook(kTestPluginId, hLife);
+            if (lst.evEpoch < 1 || lst.evSeed < 1 || lst.evMode < 2 || lst.evClear < 1 || lst.evRestore < 1) {
+                std::printf("FAIL [V3-6]: Lifecycle events missing (%d/%d/%d/%d/%d)\n",
+                            lst.evEpoch, lst.evSeed, lst.evMode, lst.evClear, lst.evRestore);
+                return 1;
+            }
+            std::printf("[OK] V3-5 & V3-6: Full binary SaveState/Restore + single-slot Restore + 5 lifecycle events verified!\n");
+        }
+
+        // V3-7: Concurrent Async Chat Queue
+        {
+            g_capturedAsyncChatLines.clear();
+            std::vector<std::thread> chatThreads;
+            for (int t = 0; t < 4; ++t) {
+                chatThreads.emplace_back([&, t]() {
+                    for (int k = 0; k < 10; ++k) {
+                        host->ChatPrintfAsync("[async-t%d] msg #%d", t, k);
+                    }
+                });
+            }
+            for (auto& th : chatThreads) th.join();
+            if (g_capturedAsyncChatLines.size() != 40U) {
+                std::printf("FAIL [V3-7]: expected 40 async chat messages, got %zu\n", g_capturedAsyncChatLines.size());
+                return 1;
+            }
+            std::printf("[OK] V3-7: Concurrent ChatPrintfAsync (4 threads x 10 msgs) verified!\n");
+        }
+
+        // V3-8: Resource Ceiling Removal (Reclaimable Heap Seq, Tombstone CondSlots, Dynamic Wrapper, Instance Policy)
+        {
+            // (a) 2,000 updates of a 128-element sequence (= 256,000 elements > old 65,536 fixed pool)
+            std::vector<std::uint32_t> longSeq(128U, 0xABCD0001U);
+            for (std::uint32_t iter = 0; iter < 2000U; ++iter) {
+                longSeq[0] = iter;
+                if (!host->SetCondSequence(kTestPluginId, 0x05000100U, 1U, longSeq.data(), 128U, kMhwRngSeqLoop)) {
+                    std::printf("FAIL [V3-8a]: SetCondSequence exhausted memory at iter %u\n", iter);
+                    return 1;
+                }
+            }
+            host->ReleaseCondSlot(kTestPluginId, 0x05000100U, 1U);
+
+            // (b) Dynamic condId allocation + tombstone reclamation
+            const std::uint32_t baselineSlots = host->GetActiveSlotCount();
+            for (std::uint32_t cid = 100U; cid < 600U; ++cid) {
+                if (!host->SetCondFixedValue(kTestPluginId, 0x05000120U, cid, cid)) {
+                    std::printf("FAIL [V3-8b]: SetCondFixedValue failed at cid %u\n", cid);
+                    return 1;
+                }
+            }
+            for (std::uint32_t cid = 100U; cid < 600U; ++cid) {
+                if (!host->ReleaseCondSlot(kTestPluginId, 0x05000120U, cid)) {
+                    std::printf("FAIL [V3-8b]: ReleaseCondSlot failed at cid %u\n", cid);
+                    return 1;
+                }
+            }
+            if (host->GetActiveSlotCount() != baselineSlots) {
+                std::printf("FAIL [V3-8b]: active slot count not reclaimed (%u vs %u)\n",
+                            host->GetActiveSlotCount(), baselineSlots);
+                return 1;
+            }
+
+            // (c) Custom transparent wrapper registration (frameQwords = 8 -> push rbx/rsi/rdi + sub rsp,20h + call rdx)
+            std::uint8_t* customWrap  = img + 0x05000200ULL;
+            std::uint8_t* outerCaller = img + 0x05000300ULL;
+            // Wrapper: 53 56 57 48 83 EC 20 FF D2 48 83 C4 20 5F 5E 5B C3
+            const std::uint8_t kWrapCode[] = {
+                0x53, 0x56, 0x57, 0x48, 0x83, 0xEC, 0x20,
+                0xFF, 0xD2,
+                0x48, 0x83, 0xC4, 0x20, 0x5F, 0x5E, 0x5B, 0xC3
+            };
+            std::memcpy(customWrap, kWrapCode, sizeof(kWrapCode));
+            const std::uint32_t wrapRetRva = 0x05000209U; // right after `call rdx`
+            // Outer: 48 83 EC 28 41 FF D0 48 83 C4 28 C3  (calls r8=wrapper, passes rcx=sInst, rdx=fnNrand)
+            const std::uint8_t kOuterCode[] = {
+                0x48, 0x83, 0xEC, 0x28,
+                0x41, 0xFF, 0xD0,
+                0x48, 0x83, 0xC4, 0x28, 0xC3
+            };
+            std::memcpy(outerCaller, kOuterCode, sizeof(kOuterCode));
+            const std::uint32_t outerRetRva = 0x05000307U; // right after `call r8`
+            ::FlushInstructionCache(::GetCurrentProcess(), customWrap, 0x200U);
+
+            if (!host->RegisterTransparentWrapper(kTestPluginId, wrapRetRva, 8U)) {
+                std::printf("FAIL [V3-8c]: RegisterTransparentWrapper failed\n");
+                return 1;
+            }
+            struct WrapObs {
+                std::uint32_t resolvedRva = 0U, origRetRva = 0U;
+            } wobs{};
+            const MhwRngHookHandle hWobs = host->RegisterGlobalObserver(
+                kTestPluginId, outerRetRva, (1U << kMhwRngSrcMtNrandGlobal),
+                +[](const MhwRngDrawContext* ctx, void* ud) {
+                    auto* w = static_cast<WrapObs*>(ud);
+                    w->resolvedRva = ctx->callSiteRva;
+                    w->origRetRva  = ctx->origReturnRva;
+                },
+                &wobs);
+            using OuterFn = std::uint32_t(__fastcall*)(void* sInst, void* fnNrand, void* wrapPtr);
+            (void)reinterpret_cast<OuterFn>(outerCaller)(sInst, reinterpret_cast<void*>(fnNrand), customWrap);
+            host->UnregisterGlobalObserver(kTestPluginId, hWobs);
+            host->UnregisterTransparentWrapper(kTestPluginId, wrapRetRva);
+            if (wobs.resolvedRva != outerRetRva || wobs.origRetRva != wrapRetRva) {
+                std::printf("FAIL [V3-8c]: wrapper unwrap failed (resolved=0x%X orig=0x%X)\n",
+                            wobs.resolvedRva, wobs.origRetRva);
+                return 1;
+            }
+
+            // (d) Private MtRandom instance policy (FollowOwnState vs ForceSlotControl)
+            alignas(16) std::uint32_t privPol[4]{};
+            const auto fnCtorSeed = reinterpret_cast<TestCtorSeedFn>(base + mhw::kRvaMtRandomCtorSeed);
+            CallCtorSeedV3Priv(fnCtorSeed, privPol, 0x55667788U);
+            // Initially MasterDerived on ctor -> not explicitly seeded in Auto mode, returns slot derived value.
+            // Explicitly set FollowOwnState -> steps privPol directly:
+            if (!host->SetInstancePolicy(reinterpret_cast<std::uintptr_t>(privPol), kMhwRngInstFollowOwnState) ||
+                host->GetInstancePolicy(reinterpret_cast<std::uintptr_t>(privPol)) != kMhwRngInstFollowOwnState) {
+                std::printf("FAIL [V3-8d]: SetInstancePolicy failed\n");
+                return 1;
+            }
+            std::uint32_t copyWords[4]{privPol[0], privPol[1], privPol[2], privPol[3]};
+            auto stepWordRef = [](std::uint32_t s[4]) -> std::uint32_t {
+                std::uint32_t t = (s[0] << 15) ^ s[0];
+                s[0] = s[1]; s[1] = s[2];
+                const std::uint32_t w = s[3]; s[2] = w;
+                t = ((w >> 17) ^ t) >> 4 ^ w ^ t; s[3] = t;
+                return t;
+            };
+            const std::uint32_t ownGot = CallNrandV3Priv(fnNrand, privPol);
+            const std::uint32_t ownExp = stepWordRef(copyWords);
+            if (ownGot != ownExp) {
+                std::printf("FAIL [V3-8d]: FollowOwnState did not step instance state (0x%X vs 0x%X)\n", ownGot, ownExp);
+                return 1;
+            }
+            host->SetInstancePolicy(reinterpret_cast<std::uintptr_t>(privPol), kMhwRngInstForceSlotControl);
+            const std::uint32_t forceGot = CallNrandV3Priv(fnNrand, privPol);
+            const std::uint32_t ownRef2  = stepWordRef(copyWords);
+            if (forceGot == ownRef2) {
+                std::printf("FAIL [V3-8d]: ForceSlotControl still stepped own state instead of slot!\n");
+                return 1;
+            }
+            std::printf("[OK] V3-8: Reclaimable seq heap, tombstone slots, custom wrapper unwrap & instance policy verified!\n");
+        }
+    }
+
+    // 12. Verify `randUnitSphere` & clean shutdown
     float v3[3]{};
     CallSphereSite(fnSphere, sInst, v3);
     const float norm = std::sqrt(v3[0] * v3[0] + v3[1] * v3[1] + v3[2] * v3[2]);
@@ -1202,12 +1841,13 @@ int main(int argc, char** argv) {
 
     plugin_host::ShutdownAll();
     hook::RemoveAllHooks();
+    rng::Shutdown();
     if (std::memcmp(img + mhw::kRvaMtRandomNrand, mhw::kPrologueMtRandomNrand, sizeof(mhw::kPrologueMtRandomNrand)) != 0) {
         std::printf("FAIL: RemoveAllHooks failed\n");
         return 1;
     }
     ::VirtualFree(thunkMem, 0, MEM_RELEASE);
     ::VirtualFree(img, 0, MEM_RELEASE);
-    std::printf("=== ALL MICROKERNEL v2.1 & OFFICIAL PLUGIN AUDIT TESTS PASSED ===\n");
+    std::printf("=== ALL MICROKERNEL v3.0 & OFFICIAL PLUGIN AUDIT TESTS PASSED ===\n");
     return 0;
 }

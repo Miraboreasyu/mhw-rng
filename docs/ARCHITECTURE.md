@@ -1,6 +1,6 @@
-# `mhw_rng` 核心框架与插件 SDK（v2）技术文档
+# `mhw_rng` 核心框架与插件 SDK（v3.0）技术文档
 
-本文档说明 `mhw_rng` 随机数接管框架的职责划分、底层 Hook 点位、复合条件槽数据结构、条件分流机制、插件热重载流程以及插件 SDK 接口规范。目标客户端版本为《怪物猎人：世界 冰原》Steam 15.23（Build 15539686，默认镜像基址 `0x140000000`）。
+本文档说明 `mhw_rng` 随机数接管框架的职责划分、底层 Hook 点位、MASM 寄存器现场捕获层、复合条件槽数据结构、多插件 Hook 链与后置过滤机制、插件热重载流程以及插件 SDK v3 接口规范。目标客户端版本为《怪物猎人：世界 冰原》Steam 15.23（Build 15539686，默认镜像基址 `0x140000000`）。
 
 > [!NOTE]
 > **职责边界**
@@ -14,14 +14,15 @@
 flowchart TD
     subgraph Game["MonsterHunterWorld.exe (15.23)"]
         PRNG["10 处底层随机数函数 (MtRandom / mt19937 / random_device / CRT_rand)"]
-        Chat["sChat::DispatchChatEntry & sChat::ShowMessage"]
+        Chat["sChat::DispatchChatEntry / sChat::move / sChat::ShowMessage"]
         GameMem["游戏运行时内存 (Monster / cSizeTable / 任务与AI结构)"]
     end
 
     subgraph Kernel["核心模块 nativePC/plugins/mhw_rng.dll"]
+        Asm["MASM 寄存器快照入口层 (rng_trampolines.asm)"]
         Hooks["跳板页与内联补丁 (hook.cpp)"]
-        Table["64位复合槽哈希表 Slot[(CondID << 32) | RVA] (rng_engine.cpp)"]
-        Host["影拷贝插件宿主与 $rng 命令路由 (plugin_host.cpp)"]
+        Table["64位复合槽哈希表 Slot[(CondID << 32) | RVA] + Hook链 (rng_engine.cpp)"]
+        Host["影拷贝插件宿主与生命周期广播 (plugin_host.cpp)"]
     end
 
     subgraph Plugins["业务子插件 nativePC/plugins/mhw_rng/*.dll"]
@@ -32,20 +33,19 @@ flowchart TD
         Custom["第三方扩展插件"]
     end
 
-    PRNG -->|"5字节 E9 相对跳转"| Hooks
-    Hooks --> Table
-    Chat -->|"解析 $rng 前缀指令"| Host
+    PRNG -->|"5字节 E9 相对跳转"| Hooks --> Asm --> Table
+    Chat -->|"解析 $rng / 每帧排空异步队列"| Host
     Host -->|"输出聊天框系统消息"| Chat
-    Table <-->|"Push: SetActiveCondition / Pull: SlotHookFn"| Plugins
-    Host <-->|"影拷贝加载 .hotload/*.dll & 分发子命令"| Plugins
-    Plugins -.->|"只读访问栈帧与结构体"| GameMem
+    Table <-->|"Pre链 / Post / FilterVanilla / Observer / SaveState"| Plugins
+    Host <-->|"影拷贝加载 .hotload/*.dll & 分发子命令/事件"| Plugins
+    Plugins -.->|"只读访问寄存器与栈帧/结构体"| GameMem
 ```
 
 ### 运行时文件与源码对照
 
 | 组件 | 游戏目录部署路径 | 对应源码 | 说明 |
 | :--- | :--- | :--- | :--- |
-| 核心模块 | `nativePC\plugins\mhw_rng.dll` | [dllmain.cpp](../src/dllmain.cpp)、[rng_engine.cpp](../src/rng_engine.cpp)、[plugin_host.cpp](../src/plugin_host.cpp)、[hook.cpp](../src/hook.cpp) | 底层 Hook、复合槽表、插件宿主、基础 `$rng` 命令 |
+| 核心模块 | `nativePC\plugins\mhw_rng.dll` | [dllmain.cpp](../src/dllmain.cpp)、[rng_trampolines.asm](../src/rng_trampolines.asm)、[rng_engine.cpp](../src/rng_engine.cpp)、[plugin_host.cpp](../src/plugin_host.cpp)、[hook.cpp](../src/hook.cpp) | 底层 Hook、MASM 寄存器捕获、复合槽表与 Hook 链、插件宿主、基础 `$rng` 命令 |
 | 配置文件 | `nativePC\plugins\mhw_rng.ini` | [mhw_rng.ini](../mhw_rng.ini)、[log_config.cpp](../src/log_config.cpp) | 启动开关、初始 `MasterSeed`、自动加载插件开关、按地址配置的 `[SlotOverrides]` |
 | 热加载缓存目录 | `nativePC\plugins\mhw_rng\.hotload\` | [plugin_host.cpp](../src/plugin_host.cpp#L230-L250) | 运行时自动创建的隐藏目录，存放影拷贝后的临时 DLL |
 | 插件 SDK 头文件 | *(仅编译期依赖，无需链接 `.lib`)* | [mhw_rng_api.h](../include/mhw_rng_api.h) | C ABI 数据结构、`MhwRngHostApi` 函数指针表与导出约定 |
@@ -74,10 +74,11 @@ flowchart TD
 | 9 | `0x2A744B0` | `mt19937_heap_draw` | 6 B | 接管堆上 `mt19937` 实例的整数抽取 |
 | 10 | `0x2C58034` | `CRT_rand()` | 9 B | 接管 MSVC CRT `rand()`（备份头部 `+4` 处的 `E8 rel32` 由跳板重算相对偏移） |
 
-### 2. 调用点 RVA 归一化规则
-- **薄包装函数展开**：在 `ComputeCallSiteRva`（[rng_engine.cpp](../src/rng_engine.cpp#L215-L235)）中，若直接返回地址落在引擎的 4 个固定栈帧（`0x28` 字节栈空间 + `8` 字节返回地址 = `6` 个 QWORD）薄包装函数内（`0x04F71BF` `MtRandom::between`、`0x2396F02` / `0x2396F2D`、`0x197D6A2` / `0x197D6B5`），则自动向上读取 `slotPtr[6]` 作为调用点 RVA，使不同调用方拥有各自独立的槽位。
-- **`CALL` 指令地址对齐**：`NormalizeUserSiteAddress`（[rng_engine.cpp](../src/rng_engine.cpp#L540-L578)）支持直接传入虚拟地址或 RVA；若传入地址处是目标为上述 10 个入口之一的 5 字节 `E8 rel32` 指令，则自动 `+5` 转换为对应的返回地址 RVA。
-- **局部 `MtRandom` 实例跟踪**：对于先构造局部 `MtRandom` 再多次调用 `nrand(&local)` 的代码路径，内核使用 64 项环形数组 `g_overriddenInstances` 记录本轮（`Epoch`）内显式指定过构造种子的实例地址。若构造点被设了固定值/自定义种子而后续 `nrand` 点保持默认模式，则 `nrand(&local)` 按该局部实例自身的 `state[4]` 自然递推；否则由 `nrand` 调用点槽位直接给出返回值并更新 `self[0..3]`。
+### 2. 调用点 RVA 归一化规则与寄存器捕获
+- **MASM x64 入口现场捕获**：10 个底层钩子统一经 [rng_trampolines.asm](../src/rng_trampolines.asm) 进入 C++，在动用非易失寄存器前保存调用方 `RBX/RBP/RSI/RDI/R12..R15`、入口 `callerRsp`（与 `returnAddrSlot` 一致）和 `callerRip` 到 `MhwRngCallerRegs`，并向 `MhwRngDrawContext` 透传原函数入参（`ctor(seed)` / `srand(seed)` / `mt19937_heap_init(seed)` 的 `origArg1` 以及 `mt19937_envelope_range` 的 `origMinVal`/`origMaxVal`）。
+- **动态透明包装展开**：在 `ComputeCallSiteRva`（[rng_engine.cpp](../src/rng_engine.cpp)）中内置 5 处固定 `+0x28` 栈帧的引擎薄包装（`0x04F71BF`、`0x2396F02`、`0x2396F2D`、`0x197D6A2`、`0x197D6B5`，`frameQwords = 6`），支持插件通过 `RegisterTransparentWrapper` 扩展自定义帧深并做最多 2 层展开，展开前的原始返回地址保存在 `ctx->origReturnRva`。
+- **`CALL` 指令地址对齐**：`NormalizeUserSiteAddress` 支持直接传入虚拟地址或 RVA；若传入地址处是目标为上述 10 个入口之一的 5 字节 `E8 rel32` 指令，则自动 `+5` 转换为对应的返回地址 RVA。
+- **局部 `MtRandom` 实例策略**：内核维护 512 项实例策略表，并在 `SetInstancePolicy` 中提供 `Auto` / `FollowOwnState` / `ForceSlotControl` 三种接管策略；未显式指定时按本轮（`Epoch`）内是否由构造点指定过自定义种子自动判别。
 
 ### 3. 跳板内存权限与链式 Hook
 [hook.cpp](../src/hook.cpp) 在主程序镜像 `±2 GB` 范围内申请一页 4 KB 跳板内存：
@@ -91,15 +92,22 @@ flowchart TD
 ### 1. 按调用点与条件拆分子流的原因
 原版游戏中，粒子特效、环境生物、UI 抖动、怪物 AI 与体型抽取共用同一个全局 `MtRandom::sInstance`，并由多个工作线程并发调用。帧率变化或额外特效都会改变 `sInstance` 的推进次数，导致固定全局种子无法稳定复现行为。
 
-微内核在静态存储区维护一张容量为 **8,192 项**的开放寻址哈希表 `g_slots`（[rng_engine.cpp](../src/rng_engine.cpp#L97-L154)）：
+微内核在静态存储区维护一张容量为 **16,384 项**、支持 Tombstone 回收的开放寻址哈希表 `g_slots`（[rng_engine.cpp](../src/rng_engine.cpp)）：
 - **复合键格式**：
   $$\text{CompositeKey} = (\text{uint64\_t}(\text{condId}) \ll 32) \mid \text{uint64\_t}(\text{callSiteRva})$$
-  `condId == 0` 为基础槽；当插件定义条件编号 `condId > 0` 时，同一 `callSiteRva` 在不同条件下对应不同的 `RngSlot` 实例。
-- **内存开销**：单个 `RngSlot` 按 64 字节缓存行对齐（实际大小 128 字节），8,192 项固定占用 1 MB 静态未初始化段（BSS），外加 256 KB 静态长序列池 `g_seqPool`，运行时无动态堆分配。
+  `condId == 0` 为基础槽；当插件定义条件编号 `condId > 0` 时，同一 `callSiteRva` 在不同条件下对应不同的 `RngSlot` 实例。不再使用的 `condId > 0` 条件槽可通过 `ReleaseCondSlot` 标记为 Tombstone 并真正回收槽位配额。
+- **可回收长序列**：长度 `<= 8` 的序列存于槽内 `inlineSeq`；`> 8` 的序列在槽自旋锁外按需分配堆缓冲并在替换/清理/释放槽位时归还内存，避免反复热重载或切序列造成静态池耗尽。
 - **子流初始化与推进**：当槽位记录的 `seededEpoch` 与全局 `g_seedEpoch` 不一致时，使用 `SplitMix64` 将 `(Seed, RVA, CondID)` 混合生成非全零的 128 位初始状态 `state[0..3]`，之后每次抽取调用与原版一致的 `StepMhwXorshift128` 推进。不同调用点或不同 `CondID` 之间互不影响推进次数。
-- **并发与轮次重置**：槽位认领通过原子 `compare_exchange_strong` 完成且运行期不删除键；单个槽位的状态读写由 `std::atomic_flag` 自旋锁保护。调用 `ResetEpoch()` 只需原子递增 `g_seedEpoch`，各槽位在下次被访问时自动按新轮次重新派生初始状态并归零序列游标。
+- **快照与恢复**：提供单槽写回 `RestoreSlotState` 及全表二进制快照/恢复 `CaptureStateBlob` / `RestoreStateBlob`（带 `'MRSS'` 魔数与 CRC32 校验）。
 
-### 2. 槽位工作模式（`MhwRngSlotMode`）
+### 2. 全局运行模式（`MhwRngEngineMode`）与槽位模式（`MhwRngSlotMode`）
+
+内核整体支持三种工作模式：
+- `kMhwRngModeOff`（`0`）：关闭接管，入口处立即跳转原版函数（零开销直通）。
+- `kMhwRngModeObserveOnly`（`1`）：仅观测模式，全部抽签走原版实现并更新 `totalCalls`/`epochCalls`/`lastValue`，同时触发带有 `kMhwRngHookObserveOnly` 标记的 `postFn` 与全局观测器。
+- `kMhwRngModeTakeover`（`2`）：完整接管模式。
+
+单槽位模式（`MhwRngSlotMode`）：
 
 | 枚举值 | 名称 | 行为说明 |
 | :-: | :--- | :--- |
@@ -146,13 +154,13 @@ sequenceDiagram
 
 1. **Push 模式（`SetActiveCondition`）**：
    插件在外部时机修改基础槽的原子字段 `activeCond`。抽签路径无需进入函数回调，适合随任务状态或配置切换的全局条件。
-2. **Pull 模式（`RegisterSlotHook`）**：
-   插件在特定 `RVA` 的基础槽上挂载同步回调函数 `MhwRngSlotHookFn`。当同一帧内多个实体在不同线程调用同一 `RVA`（如多只怪物同时生成或决策 AI）时，回调可通过 `MhwRngDrawContext` 中的 `returnAddrSlot`（栈上返回地址位置）和 `rngInstance` 识别当前调用方实体，并选择：
-   - `kMhwRngActionUseCondition`：将本次抽取路由到指定的 `decision.condId` 复合槽；
-   - `kMhwRngActionReturnValue`：直接返回现场计算的 `decision.value0`；若需要确定性随机数参与自定义分布计算，可调用上下文提供的 `ctx->DrawDeterministic(rva, condId)`；
-   - `kMhwRngActionBypass`：仅本次调用走原版随机数函数。
+2. **Pull 模式优先级链与后置过滤（`RegisterSlotHook` / `RegisterSlotHookEx`）**：
+   同一 `RVA` 允许最多 8 个插件回调按 `priority`（升序）组成不可变 Hook 链，热路径无锁读取并在原子切换后通过 `g_inFlightHookCalls` 静默等待回收旧链：
+   - **Pre 阶段**：返回 `kMhwRngActionContinue`（或仅附带状态查询不篡改时保持默认）继续流向下一插件；返回 `ClaimCondition` / `ReturnValue` / `ReturnFloatBits` / `Bypass` 时结束 Pre 链并立即生效；
+   - **FilterVanilla 保底过滤**：Pre 返回 `kMhwRngActionFilterVanilla`（或注册时携带 `kMhwRngHookFilterVanilla` 标志）时，内核先执行原版随机生成函数，将原值写入 `ctx->vanillaValue0/1`/`vanillaFloat` 并调用该钩子的 `postFn`（附带 `kMhwRngDrawFlagCanModify`），插件可选择放行原版值或仅在极端区间下改写返回值；
+   - **Post 与全局观测器**：抽签完成后统一写入 `ctx->finalValue0/1`/`finalFloat` 并触发只读 `postFn` 及 `RegisterGlobalObserver` 注册的通配观测器（支持按 `RVA` 与 `sourceKindMask` 过滤）。
 
-未挂载回调的槽位 `hookIdx` 为 `0xFFFF`，抽签时仅做一次无符号比较，不进入回调逻辑。回调函数在槽位自旋锁外部执行，并由 `__try / __except` 捕获硬件异常（异常发生时回退至 `UseCondition(activeCondId)`）。
+未挂载回调且无全局观测器的槽位仅执行两次无锁原子比较，不进入回调与计数屏障逻辑。回调函数在槽位自旋锁外部执行，并由 `__try / __except` 捕获硬件异常。
 
 ---
 
@@ -176,31 +184,32 @@ Windows 的 `LoadLibrary` 会锁定磁盘上的目标 DLL 文件，导致游戏�
 
 ---
 
-## 六、插件开发接口规范（Plugin SDK v2）
+## 六、插件开发接口规范（Plugin SDK v3.0）
 
 子插件只需包含单一头文件 [mhw_rng_api.h](../include/mhw_rng_api.h)，无需链接任何导入库。
 
 ### 1. 必选与可选导出函数
 每个子插件 DLL 需以 C 链接约定导出以下函数：
-- `const MhwRngPluginDescriptor* MhwRngPlugin_GetInfo()`：返回插件元数据，其中 `targetApiVersion` 必须等于 `kMhwRngApiVersion`（当前为 `2`），`shortName` 为全小写唯一标识（用于 `$rng reload <shortName>`）。
-- `bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPluginId selfId)`：插件初始化入口，保存 `host` 与 `selfId` 并注册子命令、元数据或槽位回调；返回 `false` 表示初始化失败，宿主会自动回滚并卸载。
-- `void MhwRngPlugin_Shutdown()`（可选）：卸载前通知入口。宿主调用此函数前已完成回调摘除、并发等待与规则清理。
+- `const MhwRngPluginDescriptor* MhwRngPlugin_GetInfo()`：返回插件元数据，其中 `targetApiVersion` 必须严格等于 `kMhwRngApiVersion`（当前为 `3`），`shortName` 为全小写唯一标识（用于 `$rng reload <shortName>`）。
+- `bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPluginId selfId)`：插件初始化入口，保存 `host` 与 `selfId` 并注册子命令、元数据、槽位回调、观测器或生命周期钩子；返回 `false` 表示初始化失败，宿主会自动回滚并卸载。
+- `void MhwRngPlugin_Shutdown()`（可选）：卸载前通知入口。宿主调用此函数前已完成 Hook 链摘除、并发等待、包裹规则与生命周期监听器清理。
 
 ### 2. `MhwRngHostApi` 主要接口分类
 
 | 类别 | 接口函数 | 用途说明 |
 | :--- | :--- | :--- |
 | 路径与输出 | `GetRootPluginDir` / `GetSubPluginDir` | 获取 `nativePC\plugins` 与 `nativePC\plugins\mhw_rng` 路径 |
-| 路径与输出 | `ChatPrint` / `ChatPrintf` / `Log` | 向游戏聊天框输出 UTF-8 消息，或写入 `mhw_rng.log` |
-| 全局控制 | `SetTakeoverEnabled` / `SetMasterSeed` / `ResetEpoch` | 开关接管、修改 64 位总种子、重置全局轮次 |
-| 地址辅助 | `NormalizeSiteAddress` | 将虚拟地址或 `CALL` 指令地址归一化为返回地址 RVA |
-| 条件与槽规则 | `SetActiveCondition` / `GetActiveCondition` | 读写指定 RVA 基础槽的 Push 模式活动条件号 |
+| 路径与输出 | `ChatPrint` / `ChatPrintf` / `ChatPrintAsync` / `ChatPrintfAsync` / `Log` | 同步或跨线程异步队列投递至 `sChat::move` 主线程聊天框，或写入 `mhw_rng.log` |
+| 全局控制 | `SetEngineMode` / `GetEngineMode` / `SetTakeoverEnabled` / `SetMasterSeed` / `ResetEpoch` | 切换关闭/仅观测/接管三态、修改 64 位总种子、重置全局轮次 |
+| 地址与包装 | `NormalizeSiteAddress` / `RegisterTransparentWrapper` / `UnregisterTransparentWrapper` | 地址归一化与动态注册透明薄包装展开规则 |
+| 条件与槽规则 | `SetActiveCondition` / `GetActiveCondition` / `ReleaseCondSlot` | 读写活动条件号及释放不再使用的动态条件槽 |
 | 条件与槽规则 | `SetCondMasterDerived` / `SetCondCustomSeed` / `SetCondFixedValue` / `SetCondSequence` / `SetCondBypass` | 设置指定 `(rva, condId)` 复合槽的工作模式与参数 |
 | 条件与槽规则 | `ClearSlotAllConditions` / `ClearPluginRules` / `ClearAllRules` | 清理单个 RVA 全部条件槽、当前插件名下规则或全局规则 |
-| 同步回调 | `RegisterSlotHook` / `UnregisterSlotHook` | 在指定 RVA 上注册或移除 Pull 模式同步决策回调 |
-| 命令与元数据 | `RegisterSubcommand` | 注册 `$rng <subcmd>`（同时兼容 `$rng_<subcmd>`）子命令处理器 |
-| 命令与元数据 | `RegisterSiteMeta` / `SetFallbackMetaResolver` / `QuerySiteMeta` / `FormatSlotCustom` | 注册站点别名、中文描述、状态格式化回调或全局词典解析器 |
-| 状态快照 | `GetCondSlotInfo` / `GetActiveSlotCount` / `SnapshotActiveSlots` | 读取单个或全部已激活复合槽的计数与当前状态 |
+| 回调与观测 | `RegisterSlotHook` / `RegisterSlotHookEx` / `UnregisterSlotHook` / `UnregisterSlotHookHandle` | 注册或移除带优先级、`PostDraw` 与 `FilterVanilla` 的同步 Hook 链 |
+| 回调与观测 | `RegisterGlobalObserver` / `RegisterLifecycleHook` 及对应 `Unregister*` | 注册通配 RNG 抽取观测器与全局生命周期事件广播 |
+| 快照与实例 | `GetCondSlotInfo` / `GetActiveSlotCount` / `SnapshotActiveSlots` / `RestoreSlotState` / `CaptureStateBlob` / `RestoreStateBlob` | 读写单槽游标状态、导出/恢复带 CRC32 的全表二进制快照 |
+| 实例策略 | `SetInstancePolicy` / `GetInstancePolicy` | 控制私有 `MtRandom` 实例沿用自身状态或强制由调用点槽接管 |
+| 命令与元数据 | `RegisterSubcommand` / `RegisterSiteMeta` / `SetFallbackMetaResolver` / `QuerySiteMeta` / `FormatSlotCustom` | 注册 `$rng <subcmd>` 子命令、站点别名、中文描述及词典解析器 |
 
 ### 3. 插件线程安全与编写约束
 1. **锁顺序要求**：插件内部若使用互斥锁保护自有状态，应将其视为纯叶子锁，**不要在持有插件内部互斥锁的同时调用 `host->...` 接口**。原因在于宿主执行 `FormatSlotCustom` 等查询时可能从外部调用插件回调，若插件持锁反向调用宿主或槽位接口，容易引入锁顺序反转。
@@ -273,9 +282,10 @@ cl.exe /nologo /std:c++17 /O2 /EHsc /MT /utf-8 /I "include" rng_meal.cpp /LD /Fe
 - `$rng` / `$rng status`：查看接管状态、当前总种子、轮次、活跃槽数、已加载插件数与前几条激活规则。
 - `$rng help`：列出核心命令与当前已注册的所有插件子命令名。
 - `$rng plugins` / `load <name>` / `unload <name>` / `reload [name]`：查询、加载、卸载或热重载子插件（不带参数的 `reload` 会同时重读 `mhw_rng.ini` 并重载全部插件）。
-- `$rng on` / `off` / `seed <u64>` / `reset` / `clearall`：全局接管开关、修改总种子、递增轮次、清空所有槽覆盖规则。
+- `$rng on` / `off` / `observe` / `seed <u64>` / `reset` / `clearall`：切换接管/直通/仅观测模式、修改总种子、递增轮次、清空所有槽覆盖规则。
+- `$rng save [name]` / `restore [name]` / `saves`：保存、恢复与列出内存中的 RNG 全表二进制状态快照。
 - `$rng rawfix` / `rawseed` / `rawbypass` / `rawclear`：在不加载任何插件的情况下直接按数值 RVA 操作指定槽位。
 
 ### 2. 构建与脱机回归测试
-- 运行 [build.bat](../build.bat)：使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
-- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 Hook，验证 8 线程并发流隔离、`Epoch` 重置、复合条件槽分流、真实 `cSizeTable::getSizeMultiplier` 机器码下的按怪体型分流与零权重行跳过、真实环境生物尺寸函数（`0x141669AC0` / `0x14166CCC0` / `0x140672F90`）下的大小金与共享调用方隔离、真实 THK 虚拟机（`0x14132B838` / `0x14133A850` -> `0x141339640`）下的通用节点探测/计数/有序序列/外部预设加载与黑龙一阶段二足纯 RNG 控招、以及影拷贝热重载时源 DLL 的可写状态。
+- 运行 [build.bat](../build.bat)：依次执行 `sync_plugin_sdks.bat` 与 `ml64` 汇编 [rng_trampolines.asm](../src/rng_trampolines.asm)，再使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
+- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证全部既有回归场景（8 线程隔离、`rng_size`、`rng_endemic`、`rng_thk`、影拷贝热重载与 `sChat` 链自愈）及 SDK v3.0 全部新增能力（非易失寄存器与原入参捕获、多插件 Hook 优先级链、`ObserveOnly` 与通配观测器、`FilterVanilla` 保底过滤、二进制快照恢复、生命周期事件、并发异步聊天投递、堆序列与 Tombstone 槽回收、动态透明包装与私有实例策略）。

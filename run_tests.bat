@@ -25,6 +25,9 @@ set "INCDIR=%ROOT%include"
 set "OUTDIR=%ROOT%build"
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 
+ml64.exe /nologo /c /Fo"%OUTDIR%\rng_trampolines.obj" "%SRCDIR%\rng_trampolines.asm"
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
 cl.exe /nologo /std:c++17 /O2 /W4 /EHsc /MT /utf-8 /D "MHW_RNG_EXPORTS" ^
     /I "%SRCDIR%" /I "%INCDIR%" ^
     "%ROOT%tests\test_rng_harness.cpp" ^
@@ -32,6 +35,7 @@ cl.exe /nologo /std:c++17 /O2 /W4 /EHsc /MT /utf-8 /D "MHW_RNG_EXPORTS" ^
     "%SRCDIR%\log_config.cpp" ^
     "%SRCDIR%\plugin_host.cpp" ^
     "%SRCDIR%\rng_engine.cpp" ^
+    "%OUTDIR%\rng_trampolines.obj" ^
     /Fe:"%OUTDIR%\test_rng_harness.exe" ^
     /Fo:"%OUTDIR%\\" ^
     /link kernel32.lib user32.lib

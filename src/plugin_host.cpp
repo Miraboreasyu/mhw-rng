@@ -41,6 +41,13 @@ struct FallbackResolver {
     void*                userData = nullptr;
 };
 
+struct RegisteredLifecycleHook {
+    MhwRngPluginId    ownerId  = 0;
+    MhwRngHookHandle  handle   = 0;
+    MhwRngLifecycleFn fn       = nullptr;
+    void*             userData = nullptr;
+};
+
 struct LoadedPlugin {
     MhwRngPluginId         id = 0;
     std::string            shortName;
@@ -65,19 +72,22 @@ std::mutex                       g_registryMx;
 
 std::string                      g_subPluginDir;
 std::string                      g_hotloadDir;
-ChatPrintSinkFn                  g_chatSink = nullptr;
+ChatPrintSinkFn                  g_chatSink      = nullptr;
+AsyncChatSinkFn                  g_asyncChatSink = nullptr;
 MhwRngHostApi                    g_hostApi{};
-MhwRngPluginId                   g_nextPluginId = 1U;
-std::uint32_t                    g_shadowGen    = 1U;
+MhwRngPluginId                   g_nextPluginId     = 1U;
+std::uint32_t                    g_nextLifecycleHdl = 1U;
+std::uint32_t                    g_shadowGen        = 1U;
 
 // Static lock-free ring of plugin shortNames so `GetPluginShortName()` never returns dangling heap pointers:
 constexpr std::size_t            kShortNameSlotCount = 512U;
 char                             g_shortNameCache[kShortNameSlotCount][32]{};
 
-std::vector<LoadedPlugin>        g_plugins;
-std::vector<RegisteredSubcmd>    g_subcmds;
-std::vector<RegisteredSiteMeta>  g_siteMetas;
-std::vector<FallbackResolver>    g_fallbackResolvers;
+std::vector<LoadedPlugin>            g_plugins;
+std::vector<RegisteredSubcmd>        g_subcmds;
+std::vector<RegisteredSiteMeta>      g_siteMetas;
+std::vector<FallbackResolver>        g_fallbackResolvers;
+std::vector<RegisteredLifecycleHook> g_lifecycleHooks;
 
 std::string LowerAscii(std::string s) {
     for (char& c : s) {
@@ -188,6 +198,30 @@ bool InvokeResolverSEH(MhwRngMetaResolverFn fn,
     }
 }
 
+void InvokeLifecycleSEH(MhwRngLifecycleFn fn,
+                        const MhwRngEventInfo* info,
+                        void* userData) noexcept {
+    __try {
+        fn(info, userData);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+void BroadcastLifecycleEvent(const MhwRngEventInfo* info) noexcept {
+    if (!info) return;
+    std::vector<RegisteredLifecycleHook> snapshot;
+    {
+        std::lock_guard<std::mutex> rlk(g_registryMx);
+        if (g_lifecycleHooks.empty()) return;
+        snapshot = g_lifecycleHooks;
+    }
+    for (const auto& h : snapshot) {
+        if (h.fn) {
+            InvokeLifecycleSEH(h.fn, info, h.userData);
+        }
+    }
+}
+
 // Requires `g_lifecycleMx` held; NEVER holds `g_registryMx` across `DetachAllHooksForPluginAndWait`!
 void UnloadByIdLifecycleLocked(MhwRngPluginId targetId) {
     LoadedPlugin p{};
@@ -208,7 +242,7 @@ void UnloadByIdLifecycleLocked(MhwRngPluginId targetId) {
     // 1. Detach all synchronous RNG slot callbacks and wait for in-flight calls to drain (WITHOUT `g_registryMx`!)
     rng::DetachAllHooksForPluginAndWait(p.id);
 
-    // 2. Remove registered subcommands, metadata, fallback resolvers, and slot overrides
+    // 2. Remove registered subcommands, metadata, fallback resolvers, lifecycle hooks, and slot overrides
     {
         std::lock_guard<std::mutex> rlk(g_registryMx);
         g_subcmds.erase(
@@ -223,6 +257,10 @@ void UnloadByIdLifecycleLocked(MhwRngPluginId targetId) {
             std::remove_if(g_fallbackResolvers.begin(), g_fallbackResolvers.end(),
                            [&](const FallbackResolver& r) { return r.ownerId == p.id; }),
             g_fallbackResolvers.end());
+        g_lifecycleHooks.erase(
+            std::remove_if(g_lifecycleHooks.begin(), g_lifecycleHooks.end(),
+                           [&](const RegisteredLifecycleHook& l) { return l.ownerId == p.id; }),
+            g_lifecycleHooks.end());
     }
     rng::ClearRulesByOwner(p.id);
 
@@ -380,6 +418,48 @@ void __cdecl Host_ChatPrintf(const char* fmt, ...) {
     Host_ChatPrint(buf);
 }
 
+void __fastcall Host_ChatPrintAsync(const char* utf8Text) {
+    if (!utf8Text || utf8Text[0] == '\0') return;
+    app::Log("ui-async: %s", utf8Text);
+    if (g_asyncChatSink) {
+        g_asyncChatSink(utf8Text);
+    } else if (g_chatSink) {
+        g_chatSink(utf8Text);
+    }
+}
+
+void __cdecl Host_ChatPrintfAsync(const char* fmt, ...) {
+    if (!fmt) return;
+    char buf[256]{};
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    Host_ChatPrintAsync(buf);
+}
+
+MhwRngHookHandle __fastcall Host_RegisterLifecycleHook(MhwRngPluginId selfId,
+                                                       MhwRngLifecycleFn fn,
+                                                       void* userData) {
+    if (!fn) return kMhwRngInvalidHandle;
+    std::lock_guard<std::mutex> rlk(g_registryMx);
+    const MhwRngHookHandle h = g_nextLifecycleHdl++;
+    if (g_nextLifecycleHdl == 0U) g_nextLifecycleHdl = 1U;
+    g_lifecycleHooks.push_back(RegisteredLifecycleHook{selfId, h, fn, userData});
+    return h;
+}
+
+void __fastcall Host_UnregisterLifecycleHook(MhwRngPluginId selfId, MhwRngHookHandle handle) {
+    if (handle == kMhwRngInvalidHandle) return;
+    std::lock_guard<std::mutex> rlk(g_registryMx);
+    g_lifecycleHooks.erase(
+        std::remove_if(g_lifecycleHooks.begin(), g_lifecycleHooks.end(),
+                       [&](const RegisteredLifecycleHook& l) {
+                           return l.handle == handle && (selfId == 0U || l.ownerId == selfId);
+                       }),
+        g_lifecycleHooks.end());
+}
+
 bool __fastcall Host_RegisterSubcommand(MhwRngPluginId selfId,
                                         const char* subcmd,
                                         const char* usageExample,
@@ -465,11 +545,15 @@ bool __fastcall Host_SetFallbackMetaResolver(MhwRngPluginId selfId,
 void Init(std::uintptr_t exeBase,
           std::uintptr_t exeEnd,
           const std::string& subPluginDir,
-          ChatPrintSinkFn chatSink) {
+          ChatPrintSinkFn chatSink,
+          AsyncChatSinkFn asyncChatSink) {
     std::lock_guard<std::recursive_mutex> lk(g_lifecycleMx);
-    g_subPluginDir = subPluginDir;
-    g_hotloadDir   = subPluginDir + "\\.hotload";
-    g_chatSink     = chatSink;
+    g_subPluginDir  = subPluginDir;
+    g_hotloadDir    = subPluginDir + "\\.hotload";
+    g_chatSink      = chatSink;
+    g_asyncChatSink = asyncChatSink;
+
+    rng::SetLifecycleEventSink(&BroadcastLifecycleEvent);
 
     g_hostApi.apiVersion               = kMhwRngApiVersion;
     g_hostApi.structSize               = sizeof(MhwRngHostApi);
@@ -514,6 +598,26 @@ void Init(std::uintptr_t exeBase,
     g_hostApi.GetCondSlotInfo          = &rng::GetCondSlotInfo;
     g_hostApi.GetActiveSlotCount       = &MhwRng_GetActiveSlotCount;
     g_hostApi.SnapshotActiveSlots      = &MhwRng_SnapshotActiveSlots;
+
+    // v3.0 capabilities
+    g_hostApi.ChatPrintAsync               = &Host_ChatPrintAsync;
+    g_hostApi.ChatPrintfAsync              = &Host_ChatPrintfAsync;
+    g_hostApi.SetEngineMode                = &MhwRng_SetEngineMode;
+    g_hostApi.GetEngineMode                = &MhwRng_GetEngineMode;
+    g_hostApi.RegisterSlotHookEx           = &rng::RegisterSlotHookEx;
+    g_hostApi.UnregisterSlotHookHandle     = &rng::UnregisterSlotHookHandle;
+    g_hostApi.RegisterGlobalObserver       = &rng::RegisterGlobalObserver;
+    g_hostApi.UnregisterGlobalObserver     = &rng::UnregisterGlobalObserver;
+    g_hostApi.RegisterLifecycleHook        = &Host_RegisterLifecycleHook;
+    g_hostApi.UnregisterLifecycleHook      = &Host_UnregisterLifecycleHook;
+    g_hostApi.RestoreSlotState             = &rng::RestoreSlotState;
+    g_hostApi.CaptureStateBlob             = &rng::CaptureStateBlob;
+    g_hostApi.RestoreStateBlob             = &rng::RestoreStateBlob;
+    g_hostApi.ReleaseCondSlot              = &rng::ReleaseCondSlot;
+    g_hostApi.SetInstancePolicy            = &rng::SetInstancePolicy;
+    g_hostApi.GetInstancePolicy            = &rng::GetInstancePolicy;
+    g_hostApi.RegisterTransparentWrapper   = &rng::RegisterTransparentWrapper;
+    g_hostApi.UnregisterTransparentWrapper = &rng::UnregisterTransparentWrapper;
 }
 
 void ShutdownAll() {

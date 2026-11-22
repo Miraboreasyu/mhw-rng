@@ -114,6 +114,12 @@ constexpr std::uintptr_t kRvaFloatTwoPiOver2P32= 0x2F13EC4; // 2*pi / 4294967296
 constexpr std::uintptr_t kRvaFloatHalfStep2P32 = 0x30D2BC8; // 0.5f / 4294967296.0f
 
 // ---- Chat Command & Notification Engine Hooks / Helpers ----
+// sChat::move(sChat* this) @ 0x141A511F0 (per-frame main-thread chat update; 5B mov [rsp+10h], rbx)
+constexpr std::uintptr_t kRvaSChatMove = 0x1A511F0;
+constexpr std::uint8_t kPrologueSChatMove[5] = {
+    0x48, 0x89, 0x5C, 0x24, 0x10
+};
+
 // sChat::DispatchChatEntry(sChat* this, const cChatNetMsg* msg, uint32_t channel, uint8_t isLocal)
 // @ 0x141A51A40 (5B mov [rsp+18h], rbx; chains cleanly with mhw_hfi.dll!)
 constexpr std::uintptr_t kRvaSChatDispatchEntry = 0x1A51A40;

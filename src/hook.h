@@ -33,7 +33,9 @@ bool InstallStandaloneDetour5(std::uintptr_t site,
                               const std::uint8_t expected5[5],
                               bool* outWasChained = nullptr,
                               std::uintptr_t* outChainedTarget = nullptr,
-                              std::uintptr_t* outRelay = nullptr);
+                              std::uintptr_t* outRelay = nullptr,
+                              char* outErrBuf = nullptr,
+                              std::size_t errBufCap = 0);
 
 // Detects whether `site` was overwritten by vanilla bytes or an unchained E9 hook (whose trampoline at target+16
 // holds `expected5` instead of chaining back to `ourRelay`). Returns false if `ourRelay` is still active or chained.

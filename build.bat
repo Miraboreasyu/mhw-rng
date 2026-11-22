@@ -41,6 +41,9 @@ if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 if not exist "%PLUGOUT%" mkdir "%PLUGOUT%"
 
 echo ===== [1/5] Building RNG Microkernel (mhw_rng.dll) =====
+ml64.exe /nologo /c /Fo"%OUTDIR%\rng_trampolines.obj" "%SRCDIR%\rng_trampolines.asm"
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
 cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
     /W4 /WX- /EHsc /MT ^
     /D "WIN32" /D "NDEBUG" /D "_WINDOWS" /D "_USRDLL" /D "NOMINMAX" /D "MHW_RNG_EXPORTS" ^
@@ -51,6 +54,7 @@ cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
     "%SRCDIR%\log_config.cpp" ^
     "%SRCDIR%\plugin_host.cpp" ^
     "%SRCDIR%\rng_engine.cpp" ^
+    "%OUTDIR%\rng_trampolines.obj" ^
     /Fe:"%OUTDIR%\mhw_rng.dll" ^
     /Fo:"%OUTDIR%\\" ^
     /LD ^

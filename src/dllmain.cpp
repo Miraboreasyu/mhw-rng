@@ -16,12 +16,14 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
 namespace {
 
 using ChatDispatchFn     = void(__fastcall*)(std::uintptr_t, std::uintptr_t, std::uint32_t, std::uint8_t);
+using SChatMoveFn        = void(__fastcall*)(std::uintptr_t);
 using SChatShowMessageFn = void(__fastcall*)(std::uintptr_t, const char*, float, std::uint32_t, std::uint8_t);
 using D3DPresentFn       = std::uint64_t(__fastcall*)(std::uintptr_t, std::uint64_t, std::uint64_t, std::uint64_t);
 
@@ -31,13 +33,33 @@ std::uintptr_t             g_exeEnd           = 0;
 app::Config                g_cfg{};
 
 void*                       g_origChatDispatchRaw = nullptr;
+void*                       g_origSChatMoveRaw    = nullptr;
 void*                       g_origPresentRaw      = nullptr;
 std::uintptr_t              g_chatRelay           = 0;
+std::uintptr_t              g_chatMoveRelay       = 0;
 HHOOK                       g_kbHook           = nullptr;
 std::atomic<bool>           g_kbHookInstalled{false};
 std::atomic<bool>           g_detaching{false};
 thread_local std::uintptr_t tls_activeSChat    = 0;
 thread_local bool           tls_inChatCmd      = false;
+
+constexpr std::size_t       kAsyncChatCap      = 64U;
+char                        g_asyncChatRing[kAsyncChatCap][256]{};
+std::size_t                 g_asyncChatHead    = 0U;
+std::size_t                 g_asyncChatTail    = 0U;
+std::size_t                 g_asyncChatCount   = 0U;
+std::mutex                  g_asyncChatMx;
+std::atomic<std::uint32_t>  g_asyncChatPending{0U};
+
+struct SavedRngSnapshot {
+    std::string               name;
+    std::vector<std::uint8_t> blob;
+    std::uint64_t             seed  = 0ULL;
+    std::uint64_t             epoch = 0ULL;
+};
+constexpr std::size_t       kMaxSavedSnaps = 16U;
+std::mutex                  g_savedSnapsMx;
+std::vector<SavedRngSnapshot> g_savedSnaps;
 
 std::string TrimStr(const std::string& s) {
     std::size_t b = 0;
@@ -101,6 +123,56 @@ void NotifyChatFmt(const char* fmt, ...) {
     va_end(ap);
     app::Log("ui: %s", buf);
     PostChatSystemNoticeSEH(buf);
+}
+
+void EnqueueAsyncChat(const char* utf8Text) noexcept {
+    if (!g_cfg.showChatFeedback || !utf8Text || utf8Text[0] == '\0') return;
+    std::lock_guard<std::mutex> lk(g_asyncChatMx);
+    if (g_asyncChatCount >= kAsyncChatCap) {
+        g_asyncChatHead = (g_asyncChatHead + 1U) % kAsyncChatCap;
+        --g_asyncChatCount;
+    }
+    std::size_t n = 0U;
+    while (n < 255U && utf8Text[n] != '\0') {
+        g_asyncChatRing[g_asyncChatTail][n] = utf8Text[n];
+        ++n;
+    }
+    g_asyncChatRing[g_asyncChatTail][n] = '\0';
+    g_asyncChatTail = (g_asyncChatTail + 1U) % kAsyncChatCap;
+    ++g_asyncChatCount;
+    g_asyncChatPending.store(static_cast<std::uint32_t>(g_asyncChatCount), std::memory_order_release);
+}
+
+void DrainAsyncChatOnMainThread(std::uintptr_t sChat, std::uint32_t maxPerTick) noexcept {
+    char msgs[8][256]{};
+    std::uint32_t popped = 0U;
+    const std::uint32_t limit = (maxPerTick > 8U) ? 8U : maxPerTick;
+    {
+        std::lock_guard<std::mutex> lk(g_asyncChatMx);
+        while (g_asyncChatCount > 0U && popped < limit) {
+            std::memcpy(msgs[popped], g_asyncChatRing[g_asyncChatHead], 256U);
+            g_asyncChatHead = (g_asyncChatHead + 1U) % kAsyncChatCap;
+            --g_asyncChatCount;
+            ++popped;
+        }
+        g_asyncChatPending.store(static_cast<std::uint32_t>(g_asyncChatCount), std::memory_order_release);
+    }
+    if (popped == 0U) return;
+    const std::uintptr_t prevSChat = tls_activeSChat;
+    tls_activeSChat = sChat;
+    for (std::uint32_t i = 0U; i < popped; ++i) {
+        PostChatSystemNoticeSEH(msgs[i]);
+    }
+    tls_activeSChat = prevSChat;
+}
+
+const char* EngineModeLabelCn(std::uint32_t mode) noexcept {
+    switch (mode) {
+        case kMhwRngModeTakeover:    return u8"开启";
+        case kMhwRngModeObserveOnly: return u8"仅观测";
+        case kMhwRngModeOff:
+        default:                     return u8"关闭";
+    }
 }
 
 bool IsGameTextInputActive(std::uintptr_t exeBase) noexcept {
@@ -187,7 +259,7 @@ void HandleRngChatCommand(const std::string& rawMsg) {
 
     // 1. Kernel Status (`$rng` / `$rng status`)
     if (sub == "status" || sub == "stat") {
-        const std::uint32_t estCap = std::min<std::uint32_t>(8192U, std::max<std::uint32_t>(MhwRng_GetActiveSlotCount() + 64U, 256U));
+        const std::uint32_t estCap = std::min<std::uint32_t>(16384U, std::max<std::uint32_t>(MhwRng_GetActiveSlotCount() + 64U, 256U));
         std::vector<MhwRngSlotSnapshot> snaps(estCap);
         const std::uint32_t totalSlots = MhwRng_SnapshotActiveSlots(snaps.data(), estCap);
         snaps.resize(totalSlots);
@@ -200,8 +272,8 @@ void HandleRngChatCommand(const std::string& rawMsg) {
         }
         const auto plugins = plugin_host::ListLoadedPlugins();
 
-        NotifyChatFmt(u8"[RNG] 接管:%s | 总种子:%llu | 第%llu轮 | 活跃槽:%u | 插件:%zu个 | 激活规则:%zu处",
-                      MhwRng_IsTakeoverEnabled() ? u8"开启" : u8"关闭",
+        NotifyChatFmt(u8"[RNG] 模式:%s | 总种子:%llu | 第%llu轮 | 活跃槽:%u | 插件:%zu个 | 激活规则:%zu处",
+                      EngineModeLabelCn(MhwRng_GetEngineMode()),
                       static_cast<unsigned long long>(MhwRng_GetMasterSeed()),
                       static_cast<unsigned long long>(MhwRng_GetEpoch()),
                       totalSlots,
@@ -236,7 +308,7 @@ void HandleRngChatCommand(const std::string& rawMsg) {
 
     // 2. Kernel + Plugin Unified Help (`$rng help`)
     if (sub == "help" || sub == "?") {
-        NotifyChatFmt(u8"[RNG 核心] `$rng` 状态 | `on/off` 开关 | `seed <n>` 总种子 | `reset` 重置轮次 | `clearall` 全清");
+        NotifyChatFmt(u8"[RNG 核心] `$rng` 状态 | `on/off/observe` 模式 | `seed <n>` 总种子 | `reset` 重置 | `save/restore/saves` 快照 | `clearall` 全清");
         NotifyChatFmt(u8"[RNG 插件管理] `plugins` 列表 | `reload [插件名]` 热重载DLL | `load/unload <插件名>`");
         const auto pcmds = plugin_host::ListPluginSubcommands();
         if (!pcmds.empty()) {
@@ -324,8 +396,95 @@ void HandleRngChatCommand(const std::string& rawMsg) {
     }
 
     if (sub == "off" || sub == "disable") {
-        MhwRng_SetTakeoverEnabled(false);
+        MhwRng_SetEngineMode(kMhwRngModeOff);
         NotifyChatFmt(u8"[RNG] 全局随机数接管已【关闭】 (完全原版随机)");
+        return;
+    }
+
+    if (sub == "observe" || sub == "obs") {
+        MhwRng_SetEngineMode(kMhwRngModeObserveOnly);
+        NotifyChatFmt(u8"[RNG] 已切换为【仅观测模式】 (100%%原版结果 + 计数/全局观测继续采集)");
+        return;
+    }
+
+    if (sub == "save" || sub == "snap") {
+        const std::string snapName = (toks.size() >= 2) ? LowerAscii(toks[1]) : "default";
+        std::vector<std::uint8_t> blob;
+        std::uint32_t written = 0U;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const std::uint32_t need = MhwRng_CaptureStateBlob(nullptr, 0U);
+            if (need == 0U) break;
+            const std::uint32_t cap = need + 64U * static_cast<std::uint32_t>(sizeof(MhwRngSlotState));
+            blob.resize(cap);
+            written = MhwRng_CaptureStateBlob(blob.data(), cap);
+            if (written > 0U) break;
+        }
+        if (written == 0U) {
+            NotifyChatFmt(u8"[RNG] 快照捕获失败");
+            return;
+        }
+        blob.resize(written);
+        const std::uint64_t sSeed  = MhwRng_GetMasterSeed();
+        const std::uint64_t sEpoch = MhwRng_GetEpoch();
+        {
+            std::lock_guard<std::mutex> lk(g_savedSnapsMx);
+            auto it = std::find_if(g_savedSnaps.begin(), g_savedSnaps.end(),
+                                   [&](const SavedRngSnapshot& e) { return e.name == snapName; });
+            if (it != g_savedSnaps.end()) {
+                it->blob  = std::move(blob);
+                it->seed  = sSeed;
+                it->epoch = sEpoch;
+            } else {
+                if (g_savedSnaps.size() >= kMaxSavedSnaps) {
+                    g_savedSnaps.erase(g_savedSnaps.begin());
+                }
+                g_savedSnaps.push_back(SavedRngSnapshot{snapName, std::move(blob), sSeed, sEpoch});
+            }
+        }
+        NotifyChatFmt(u8"[RNG] 已保存状态快照 `%s` (%u 字节 | 第%llu轮)",
+                      snapName.c_str(), written, static_cast<unsigned long long>(sEpoch));
+        return;
+    }
+
+    if (sub == "restore" || sub == "loadstate") {
+        const std::string snapName = (toks.size() >= 2) ? LowerAscii(toks[1]) : "default";
+        std::vector<std::uint8_t> blobCopy;
+        {
+            std::lock_guard<std::mutex> lk(g_savedSnapsMx);
+            auto it = std::find_if(g_savedSnaps.begin(), g_savedSnaps.end(),
+                                   [&](const SavedRngSnapshot& e) { return e.name == snapName; });
+            if (it != g_savedSnaps.end()) {
+                blobCopy = it->blob;
+            }
+        }
+        if (blobCopy.empty()) {
+            NotifyChatFmt(u8"[RNG] 找不到名为 `%s` 的快照 (`$rng saves` 查看列表)", snapName.c_str());
+            return;
+        }
+        if (!MhwRng_RestoreStateBlob(blobCopy.data(), static_cast<std::uint32_t>(blobCopy.size()))) {
+            NotifyChatFmt(u8"[RNG] 恢复快照 `%s` 失败 (校验无效)", snapName.c_str());
+            return;
+        }
+        NotifyChatFmt(u8"[RNG] 已恢复状态快照 `%s` (总种子:%llu, 第%llu轮)",
+                      snapName.c_str(),
+                      static_cast<unsigned long long>(MhwRng_GetMasterSeed()),
+                      static_cast<unsigned long long>(MhwRng_GetEpoch()));
+        return;
+    }
+
+    if (sub == "saves" || sub == "snaps") {
+        std::lock_guard<std::mutex> lk(g_savedSnapsMx);
+        if (g_savedSnaps.empty()) {
+            NotifyChatFmt(u8"[RNG] 当前无已保存快照 (用 `$rng save [名称]` 保存)");
+            return;
+        }
+        NotifyChatFmt(u8"[RNG] 已存快照 (%zu/%zu)：", g_savedSnaps.size(), kMaxSavedSnaps);
+        for (const auto& e : g_savedSnaps) {
+            NotifyChatFmt(u8" - %s (%zuB | 种子:%llu | 第%llu轮)",
+                          e.name.c_str(), e.blob.size(),
+                          static_cast<unsigned long long>(e.seed),
+                          static_cast<unsigned long long>(e.epoch));
+        }
         return;
     }
 
@@ -467,6 +626,19 @@ void __fastcall Hook_ChatDispatch(std::uintptr_t sChat,
         if (!ok) {
             app::Log("ui: caught SEH exception while executing chat command '%s'", msgBuf);
         }
+        if (g_asyncChatPending.load(std::memory_order_acquire) != 0U) {
+            DrainAsyncChatOnMainThread(sChat, 8U);
+        }
+    }
+}
+
+void __fastcall Hook_SChatMove(std::uintptr_t sChat) {
+    if (g_asyncChatPending.load(std::memory_order_acquire) != 0U) {
+        DrainAsyncChatOnMainThread(sChat, 4U);
+    }
+    if (const auto orig = reinterpret_cast<SChatMoveFn>(
+            _InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(&g_origSChatMoveRaw), nullptr, nullptr))) {
+        orig(sChat);
     }
 }
 
@@ -574,16 +746,16 @@ bool TryInstallCoreRngHooks(HMODULE exe, std::uintptr_t& outBase, std::uintptr_t
     };
 
     const HookSpec specs[] = {
-        {"MtRandom::nrand",        mhw::kRvaMtRandomNrand,       mhw::kPrologueMtRandomNrand,       sizeof(mhw::kPrologueMtRandomNrand),       reinterpret_cast<void*>(&rng::Hook_MtRandomNrand),       &rng::SetOrigMtRandomNrand,       true},
-        {"MtRandom::ctor(seed)",   mhw::kRvaMtRandomCtorSeed,    mhw::kPrologueMtRandomCtorSeed,    sizeof(mhw::kPrologueMtRandomCtorSeed),    reinterpret_cast<void*>(&rng::Hook_MtRandomCtorSeed),    &rng::SetOrigMtRandomCtorSeed,    true},
-        {"MtRandom::ctor_default", mhw::kRvaMtRandomCtorDefault, mhw::kPrologueMtRandomCtorDefault, sizeof(mhw::kPrologueMtRandomCtorDefault), reinterpret_cast<void*>(&rng::Hook_MtRandomCtorDefault), &rng::SetOrigMtRandomCtorDefault, true},
-        {"MtRandom::srand",        mhw::kRvaMtRandomSrand,       mhw::kPrologueMtRandomSrand,       sizeof(mhw::kPrologueMtRandomSrand),       reinterpret_cast<void*>(&rng::Hook_MtRandomSrand),       &rng::SetOrigMtRandomSrand,       true},
-        {"MtRandom::randSphere",   mhw::kRvaMtRandomSphere,      mhw::kPrologueMtRandomSphere,      sizeof(mhw::kPrologueMtRandomSphere),      reinterpret_cast<void*>(&rng::Hook_MtRandomSphere),      &rng::SetOrigMtRandomSphere,      true},
-        {"std::_Random_device",    mhw::kRvaStdRandomDevice,     mhw::kPrologueStdRandomDevice,     sizeof(mhw::kPrologueStdRandomDevice),     reinterpret_cast<void*>(&rng::Hook_StdRandomDevice),     &rng::SetOrigStdRandomDevice,     false},
-        {"mt19937_envelope_range", mhw::kRvaMt19937Range,        mhw::kPrologueMt19937Range,        sizeof(mhw::kPrologueMt19937Range),        reinterpret_cast<void*>(&rng::Hook_Mt19937Range),        &rng::SetOrigMt19937Range,        false},
-        {"mt19937_heap_init",      mhw::kRvaMt19937HeapInit,     mhw::kPrologueMt19937HeapInit,     sizeof(mhw::kPrologueMt19937HeapInit),     reinterpret_cast<void*>(&rng::Hook_Mt19937HeapInit),     &rng::SetOrigMt19937HeapInit,     false},
-        {"mt19937_heap_draw",      mhw::kRvaMt19937HeapDraw,     mhw::kPrologueMt19937HeapDraw,     sizeof(mhw::kPrologueMt19937HeapDraw),     reinterpret_cast<void*>(&rng::Hook_Mt19937HeapDraw),     &rng::SetOrigMt19937HeapDraw,     false},
-        {"CRT_rand",               mhw::kRvaCrtRand,             mhw::kPrologueCrtRand,             sizeof(mhw::kPrologueCrtRand),             reinterpret_cast<void*>(&rng::Hook_CrtRand),             &rng::SetOrigCrtRand,             false},
+        {"MtRandom::nrand",        mhw::kRvaMtRandomNrand,       mhw::kPrologueMtRandomNrand,       sizeof(mhw::kPrologueMtRandomNrand),       reinterpret_cast<void*>(&MhwRngAsm_MtRandomNrand),       &rng::SetOrigMtRandomNrand,       true},
+        {"MtRandom::ctor(seed)",   mhw::kRvaMtRandomCtorSeed,    mhw::kPrologueMtRandomCtorSeed,    sizeof(mhw::kPrologueMtRandomCtorSeed),    reinterpret_cast<void*>(&MhwRngAsm_MtRandomCtorSeed),    &rng::SetOrigMtRandomCtorSeed,    true},
+        {"MtRandom::ctor_default", mhw::kRvaMtRandomCtorDefault, mhw::kPrologueMtRandomCtorDefault, sizeof(mhw::kPrologueMtRandomCtorDefault), reinterpret_cast<void*>(&MhwRngAsm_MtRandomCtorDefault), &rng::SetOrigMtRandomCtorDefault, true},
+        {"MtRandom::srand",        mhw::kRvaMtRandomSrand,       mhw::kPrologueMtRandomSrand,       sizeof(mhw::kPrologueMtRandomSrand),       reinterpret_cast<void*>(&MhwRngAsm_MtRandomSrand),       &rng::SetOrigMtRandomSrand,       true},
+        {"MtRandom::randSphere",   mhw::kRvaMtRandomSphere,      mhw::kPrologueMtRandomSphere,      sizeof(mhw::kPrologueMtRandomSphere),      reinterpret_cast<void*>(&MhwRngAsm_MtRandomSphere),      &rng::SetOrigMtRandomSphere,      true},
+        {"std::_Random_device",    mhw::kRvaStdRandomDevice,     mhw::kPrologueStdRandomDevice,     sizeof(mhw::kPrologueStdRandomDevice),     reinterpret_cast<void*>(&MhwRngAsm_StdRandomDevice),     &rng::SetOrigStdRandomDevice,     false},
+        {"mt19937_envelope_range", mhw::kRvaMt19937Range,        mhw::kPrologueMt19937Range,        sizeof(mhw::kPrologueMt19937Range),        reinterpret_cast<void*>(&MhwRngAsm_Mt19937Range),        &rng::SetOrigMt19937Range,        false},
+        {"mt19937_heap_init",      mhw::kRvaMt19937HeapInit,     mhw::kPrologueMt19937HeapInit,     sizeof(mhw::kPrologueMt19937HeapInit),     reinterpret_cast<void*>(&MhwRngAsm_Mt19937HeapInit),     &rng::SetOrigMt19937HeapInit,     false},
+        {"mt19937_heap_draw",      mhw::kRvaMt19937HeapDraw,     mhw::kPrologueMt19937HeapDraw,     sizeof(mhw::kPrologueMt19937HeapDraw),     reinterpret_cast<void*>(&MhwRngAsm_Mt19937HeapDraw),     &rng::SetOrigMt19937HeapDraw,     false},
+        {"CRT_rand",               mhw::kRvaCrtRand,             mhw::kPrologueCrtRand,             sizeof(mhw::kPrologueCrtRand),             reinterpret_cast<void*>(&MhwRngAsm_CrtRand),             &rng::SetOrigCrtRand,             false},
     };
 
     std::size_t hookedCount = 0;
@@ -617,7 +789,7 @@ bool TryInstallCoreRngHooks(HMODULE exe, std::uintptr_t& outBase, std::uintptr_t
     }
 
     // Initialize Plugin Host & auto-load sub-plugins BEFORE activating sChat::DispatchChatEntry
-    plugin_host::Init(base, end, app::SubPluginDirectory(), &PostChatSystemNoticeSEH);
+    plugin_host::Init(base, end, app::SubPluginDirectory(), &PostChatSystemNoticeSEH, &EnqueueAsyncChat);
     std::size_t loadedPlugins = 0U;
     if (g_cfg.autoLoadPlugins) {
         loadedPlugins = plugin_host::LoadAllFromDirectory();
@@ -636,6 +808,7 @@ bool TryInstallCoreRngHooks(HMODULE exe, std::uintptr_t& outBase, std::uintptr_t
 
 bool InstallChatHookWithRetry(std::uintptr_t base, const char* tag) {
     const std::uintptr_t chatSite = base + mhw::kRvaSChatDispatchEntry;
+    char errBuf[192]{};
     for (int retry = 0; retry < 20 && !g_detaching.load(std::memory_order_acquire); ++retry) {
         bool wasChained = false;
         std::uintptr_t chainedTarget = 0;
@@ -646,7 +819,9 @@ bool InstallChatHookWithRetry(std::uintptr_t base, const char* tag) {
                                            mhw::kPrologueSChatDispatch,
                                            &wasChained,
                                            &chainedTarget,
-                                           &relay)) {
+                                           &relay,
+                                           errBuf,
+                                           sizeof(errBuf))) {
             g_chatRelay = relay;
             if (wasChained) {
                 app::Log("%s: hooked sChat::DispatchChatEntry @ %p (chained -> %p, tramp=%p)",
@@ -664,8 +839,37 @@ bool InstallChatHookWithRetry(std::uintptr_t base, const char* tag) {
         }
         ::Sleep(25);
     }
-    app::Log("%s: ERROR - failed to hook sChat::DispatchChatEntry @ %p after retries",
-             tag, reinterpret_cast<void*>(chatSite));
+    app::Log("%s: ERROR - failed to hook sChat::DispatchChatEntry @ %p after retries (%s)",
+             tag, reinterpret_cast<void*>(chatSite), errBuf[0] ? errBuf : "unknown");
+    return false;
+}
+
+bool InstallSChatMoveHookWithRetry(std::uintptr_t base, const char* tag) {
+    const std::uintptr_t moveSite = base + mhw::kRvaSChatMove;
+    char errBuf[192]{};
+    for (int retry = 0; retry < 20 && !g_detaching.load(std::memory_order_acquire); ++retry) {
+        bool wasChained = false;
+        std::uintptr_t chainedTarget = 0;
+        std::uintptr_t relay = 0;
+        if (hook::InstallStandaloneDetour5(moveSite,
+                                           reinterpret_cast<void*>(&Hook_SChatMove),
+                                           &g_origSChatMoveRaw,
+                                           mhw::kPrologueSChatMove,
+                                           &wasChained,
+                                           &chainedTarget,
+                                           &relay,
+                                           errBuf,
+                                           sizeof(errBuf))) {
+            g_chatMoveRelay = relay;
+            app::Log("%s: hooked sChat::move @ %p (%s, tramp=%p)",
+                     tag, reinterpret_cast<void*>(moveSite),
+                     wasChained ? "chained" : "vanilla", g_origSChatMoveRaw);
+            return true;
+        }
+        ::Sleep(25);
+    }
+    app::Log("%s: warning - failed to hook sChat::move @ %p (%s)",
+             tag, reinterpret_cast<void*>(moveSite), errBuf[0] ? errBuf : "unknown");
     return false;
 }
 
@@ -734,12 +938,14 @@ DWORD WINAPI InitWorker(LPVOID) {
     if (InstallChatHookWithRetry(base, "init")) {
         app::Log("init: microkernel ready! Type '%s' in game chat.", g_cfg.chatPrefix.c_str());
     }
+    InstallSChatMoveHookWithRetry(base, "init");
     InstallOptionalPresentHookWithRetry(base);
 
     // Phase 3: Two lightweight post-install chain verifications (+1.5s and +4.0s) to self-heal
     // in case a late-loading mod overwrote sChat::DispatchChatEntry without chaining.
     const DWORD checkDelaysMs[2] = {1500U, 2500U};
     const std::uintptr_t chatSite = base + mhw::kRvaSChatDispatchEntry;
+    const std::uintptr_t moveSite = base + mhw::kRvaSChatMove;
     for (DWORD delayMs : checkDelaysMs) {
         for (DWORD slept = 0; slept < delayMs && !g_detaching.load(std::memory_order_acquire); slept += 100U) {
             ::Sleep(100);
@@ -749,6 +955,11 @@ DWORD WINAPI InitWorker(LPVOID) {
             app::Log("chat: detected unchained overwrite at %p, re-chaining...",
                      reinterpret_cast<void*>(chatSite));
             InstallChatHookWithRetry(base, "chat-rechain");
+        }
+        if (g_chatMoveRelay != 0 && hook::WasUnchainedOverwrite5(moveSite, g_chatMoveRelay, mhw::kPrologueSChatMove)) {
+            app::Log("chat: detected unchained overwrite at sChat::move %p, re-chaining...",
+                     reinterpret_cast<void*>(moveSite));
+            InstallSChatMoveHookWithRetry(base, "chatmove-rechain");
         }
     }
     return 0;
@@ -771,6 +982,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         }
         plugin_host::ShutdownAll();
         hook::RemoveAllHooks();
+        rng::Shutdown();
         app::CloseLog();
     }
     return TRUE;

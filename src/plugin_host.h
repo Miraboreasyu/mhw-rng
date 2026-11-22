@@ -26,11 +26,13 @@ struct SubcommandHelpEntry {
 };
 
 using ChatPrintSinkFn = void(*)(const char* utf8Text) noexcept;
+using AsyncChatSinkFn = void(*)(const char* utf8Text) noexcept;
 
 void Init(std::uintptr_t exeBase,
           std::uintptr_t exeEnd,
           const std::string& subPluginDir,
-          ChatPrintSinkFn chatSink);
+          ChatPrintSinkFn chatSink,
+          AsyncChatSinkFn asyncChatSink = nullptr);
 
 void ShutdownAll();
 

@@ -1,7 +1,12 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include "hook.h"
 
 #include <windows.h>
 #include <intrin.h>
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 
@@ -40,38 +45,101 @@ bool InRel32(std::uintptr_t from, std::uintptr_t to) noexcept {
     return d >= INT32_MIN && d <= INT32_MAX;
 }
 
+bool TryReadPtrSEH(std::uintptr_t addr, std::uintptr_t& outVal) noexcept {
+    __try {
+        outVal = *reinterpret_cast<const std::uintptr_t*>(addr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void EmitAbsJmp14(std::uint8_t* dst, std::uintptr_t target) noexcept {
+    dst[0] = 0xFF;
+    dst[1] = 0x25;
+    dst[2] = 0x00;
+    dst[3] = 0x00;
+    dst[4] = 0x00;
+    dst[5] = 0x00;
+    const auto t64 = static_cast<std::uint64_t>(target);
+    std::memcpy(dst + 6U, &t64, 8);
+}
+
 std::uintptr_t TryAllocReadWriteAt(std::uintptr_t addr, std::size_t size) noexcept {
     void* p = ::VirtualAlloc(reinterpret_cast<void*>(addr), size,
                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     return reinterpret_cast<std::uintptr_t>(p);
 }
 
-std::uintptr_t AllocNearPageReadWrite(std::uintptr_t lo, std::uintptr_t hi) noexcept {
-    if (!lo || hi <= lo) return 0;
+std::uintptr_t AllocNearPageRange(std::uintptr_t minAddr,
+                                  std::uintptr_t maxAddr,
+                                  std::uintptr_t anchor) noexcept {
+    if (maxAddr <= minAddr + kCodeArenaSize) return 0;
+
     SYSTEM_INFO si{};
     ::GetSystemInfo(&si);
-    const std::uintptr_t gran = si.dwAllocationGranularity;
-    const std::uintptr_t span = 0x7F000000ULL;
+    const std::uintptr_t gran   = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000ULL;
+    const std::uintptr_t sysLo  = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
+    const std::uintptr_t sysHi  = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
 
-    for (std::uintptr_t a = (lo - gran) & ~(gran - 1); a > gran && lo - a < span; a -= gran) {
-        if (!InRel32(a, hi) || !InRel32(a + kCodeArenaSize, lo)) continue;
-        if (std::uintptr_t p = TryAllocReadWriteAt(a, kCodeArenaSize)) {
-            return p;
+    minAddr = (std::max<std::uintptr_t>)(minAddr, (std::max<std::uintptr_t>)(gran, sysLo));
+    maxAddr = (std::min<std::uintptr_t>)(maxAddr, sysHi);
+    if (anchor < minAddr) anchor = minAddr;
+    if (anchor > maxAddr) anchor = maxAddr;
+
+    // 1. Scan downward from anchor using VirtualQuery (skips entire mapped modules/heaps in O(1))
+    std::uintptr_t cur = anchor;
+    for (int iter = 0; iter < 4096 && cur > minAddr; ++iter) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(reinterpret_cast<LPCVOID>(cur - 1U), &mbi, sizeof(mbi)) == 0) {
+            break;
         }
-    }
-    for (std::uintptr_t a = (hi + gran) & ~(gran - 1); a - hi < span; a += gran) {
-        if (!InRel32(lo, a + kCodeArenaSize)) break;
-        if (std::uintptr_t p = TryAllocReadWriteAt(a, kCodeArenaSize)) {
-            return p;
+        const auto regBase = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+        const auto regEnd  = regBase + mbi.RegionSize;
+        if (mbi.State == MEM_FREE) {
+            const std::uintptr_t lo = (std::max)(minAddr, regBase);
+            const std::uintptr_t hi = (std::min)(cur, regEnd);
+            if (hi >= lo + kCodeArenaSize) {
+                std::uintptr_t cand = (hi - kCodeArenaSize) & ~(gran - 1ULL);
+                for (int tries = 0; tries < 8 && cand >= lo; ++tries) {
+                    if (cand + kCodeArenaSize <= hi) {
+                        if (std::uintptr_t p = TryAllocReadWriteAt(cand, kCodeArenaSize)) {
+                            return p;
+                        }
+                    }
+                    if (cand < gran) break;
+                    cand -= gran;
+                }
+            }
         }
+        if (regBase <= minAddr) break;
+        cur = regBase;
     }
-    for (int i = 0; i < 64; ++i) {
-        void* p = ::VirtualAlloc(nullptr, kCodeArenaSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (!p) break;
-        const auto a = reinterpret_cast<std::uintptr_t>(p);
-        if (InRel32(a, hi) && InRel32(a + kCodeArenaSize, lo)) return a;
-        ::VirtualFree(p, 0, MEM_RELEASE);
+
+    // 2. Scan upward from anchor using VirtualQuery
+    cur = anchor;
+    for (int iter = 0; iter < 4096 && cur + kCodeArenaSize <= maxAddr; ++iter) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0) {
+            break;
+        }
+        const auto regBase = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+        const auto regEnd  = regBase + mbi.RegionSize;
+        if (mbi.State == MEM_FREE) {
+            const std::uintptr_t lo = (std::max)(minAddr, regBase);
+            const std::uintptr_t hi = (std::min)(maxAddr, regEnd);
+            std::uintptr_t cand = (lo + gran - 1ULL) & ~(gran - 1ULL);
+            for (int tries = 0; tries < 8 && cand + kCodeArenaSize <= hi; ++tries) {
+                if (std::uintptr_t p = TryAllocReadWriteAt(cand, kCodeArenaSize)) {
+                    return p;
+                }
+                cand += gran;
+            }
+        }
+        if (regEnd <= cur || regEnd >= maxAddr) break;
+        cur = regEnd;
     }
+
     return 0;
 }
 
@@ -155,8 +223,9 @@ bool EmitDetourSlot(std::uintptr_t site,
                     std::uintptr_t* outChainedTarget) noexcept {
     const auto* cur = reinterpret_cast<const std::uint8_t*>(site);
     const bool matchesExpected = (std::memcmp(cur, expectedPrologue, prologueLen) == 0);
-    const bool isAlreadyJmp    = (cur[0] == 0xE9);
-    if (!matchesExpected && !isAlreadyJmp) {
+    const bool isAlreadyRelJmp = (cur[0] == 0xE9);
+    const bool isAlreadyIndJmp = (prologueLen == 5U && cur[0] == 0xFF && cur[1] == 0x25);
+    if (!matchesExpected && !isAlreadyRelJmp && !isAlreadyIndJmp) {
         return false;
     }
 
@@ -164,10 +233,7 @@ bool EmitDetourSlot(std::uintptr_t site,
 
     auto* out = reinterpret_cast<std::uint8_t*>(slotBase);
     // [0..13] Relay: FF 25 00 00 00 00 <u64 detourFn>
-    out[0] = 0xFF; out[1] = 0x25;
-    out[2] = 0x00; out[3] = 0x00; out[4] = 0x00; out[5] = 0x00;
-    const auto fnAddr = reinterpret_cast<std::uint64_t>(detourFn);
-    std::memcpy(out + 6U, &fnAddr, 8);
+    EmitAbsJmp14(out, reinterpret_cast<std::uintptr_t>(detourFn));
 
     // [16..] Trampoline
     const std::uintptr_t trampAddr = slotBase + 16U;
@@ -176,30 +242,34 @@ bool EmitDetourSlot(std::uintptr_t site,
     bool chained = false;
     std::uintptr_t prevTarget = 0;
 
-    if (isAlreadyJmp && !matchesExpected) {
+    if (isAlreadyRelJmp && !matchesExpected) {
         chained = true;
         std::int32_t prevRel = 0;
         std::memcpy(&prevRel, cur + 1U, 4);
         prevTarget = static_cast<std::uintptr_t>(
             static_cast<std::int64_t>(site + 5U) + prevRel);
-        if (!InRel32(trampAddr + 5U, prevTarget)) return false;
-
-        tramp[0] = 0xE9;
-        const auto chainRel = static_cast<std::int32_t>(
-            static_cast<std::int64_t>(prevTarget) - static_cast<std::int64_t>(trampAddr + 5U));
-        std::memcpy(tramp + 1U, &chainRel, 4);
-        outBytesUsed = 24U;
+        // Use 14B abs jump so chaining works regardless of prevTarget distance from `slotBase`
+        EmitAbsJmp14(tramp, prevTarget);
+        outBytesUsed = 32U;
+    } else if (isAlreadyIndJmp && !matchesExpected) {
+        chained = true;
+        std::int32_t disp = 0;
+        std::memcpy(&disp, cur + 2U, 4);
+        const std::uintptr_t ptrAddr = static_cast<std::uintptr_t>(
+            static_cast<std::int64_t>(site + 6U) + disp);
+        if (!TryReadPtrSEH(ptrAddr, prevTarget) ||
+            prevTarget < 0x10000ULL || prevTarget > 0x00007FFFFFFF0000ULL) {
+            return false;
+        }
+        EmitAbsJmp14(tramp, prevTarget);
+        outBytesUsed = 32U;
     } else {
-        const std::uintptr_t backNext = trampAddr + prologueLen + 5U;
-        if (!InRel32(backNext, site + prologueLen)) return false;
         if (!CopyAndRelocatePrologue(site, expectedPrologue, prologueLen, trampAddr, tramp)) {
             return false;
         }
-        tramp[prologueLen] = 0xE9;
-        const auto backRel = static_cast<std::int32_t>(
-            static_cast<std::int64_t>(site + prologueLen) - static_cast<std::int64_t>(backNext));
-        std::memcpy(tramp + prologueLen + 1U, &backRel, 4);
-        outBytesUsed = 16U + prologueLen + 5U;
+        // Use 14B abs jump back to `site + prologueLen` (16 + <=16 + 14 <= 46B < 64B slot stride)
+        EmitAbsJmp14(tramp + prologueLen, site + prologueLen);
+        outBytesUsed = 16U + prologueLen + 14U;
     }
 
     outEntry                   = DetourEntry{};
@@ -228,8 +298,11 @@ bool InitArena(std::uintptr_t lo, std::uintptr_t hi) {
     g_moduleLow  = lo;
     g_moduleHigh = hi;
     if (g_codeArena) return true;
+    if (!lo || hi <= lo) return false;
 
-    g_codeArena = AllocNearPageReadWrite(lo, hi);
+    const std::uintptr_t minAddr = (hi > 0x7E000000ULL) ? (hi - 0x7E000000ULL) : 0x10000ULL;
+    const std::uintptr_t maxAddr = lo + 0x7E000000ULL;
+    g_codeArena = AllocNearPageRange(minAddr, maxAddr, lo);
     if (!g_codeArena) return false;
 
     g_codeUsed    = 0;
@@ -324,16 +397,36 @@ bool InstallStandaloneDetour5(std::uintptr_t site,
                               const std::uint8_t expected5[5],
                               bool* outWasChained,
                               std::uintptr_t* outChainedTarget,
-                              std::uintptr_t* outRelay) {
+                              std::uintptr_t* outRelay,
+                              char* outErrBuf,
+                              std::size_t errBufCap) {
+    auto setErr = [&](const char* stage) {
+        if (!outErrBuf || errBufCap == 0U) return;
+        std::uint8_t b[8]{};
+        __try {
+            if (site) std::memcpy(b, reinterpret_cast<const void*>(site), 8);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        std::snprintf(outErrBuf, errBufCap,
+                      "%s (gle=%lu, cur=%02X %02X %02X %02X %02X %02X)",
+                      stage, ::GetLastError(), b[0], b[1], b[2], b[3], b[4], b[5]);
+    };
+
     std::lock_guard<std::mutex> lk(g_mx);
     if (!site || !detourFn || !outOrigTrampoline || !expected5 ||
         g_standaloneCount >= kMaxStandalone || !g_moduleLow || g_moduleHigh <= g_moduleLow) {
+        setErr("invalid-args");
         return false;
     }
 
-    // Allocate a dedicated W^X page for this standalone detour (never flips an already-executing page back to RW).
-    const std::uintptr_t page = AllocNearPageReadWrite(g_moduleLow, g_moduleHigh);
-    if (!page) return false;
+    // Allocate a dedicated W^X page within +-2GB of `site` (not full module span)
+    const std::uintptr_t minAddr = (site > 0x7E000000ULL) ? (site - 0x7E000000ULL) : 0x10000ULL;
+    const std::uintptr_t maxAddr = site + 0x7E000000ULL;
+    const std::uintptr_t page    = AllocNearPageRange(minAddr, maxAddr, site);
+    if (!page) {
+        setErr("alloc-near-failed");
+        return false;
+    }
     std::memset(reinterpret_cast<void*>(page), 0xCC, kCodeArenaSize);
 
     std::size_t used = 0;
@@ -344,12 +437,14 @@ bool InstallStandaloneDetour5(std::uintptr_t site,
 
     if (!EmitDetourSlot(site, 5U, detourFn, expected5, page, used, entry,
                         &trampPtr, &chained, &prevTarget)) {
+        setErr("emit-mismatch");
         ::VirtualFree(reinterpret_cast<void*>(page), 0, MEM_RELEASE);
         return false;
     }
 
     DWORD oldProt = 0;
     if (!::VirtualProtect(reinterpret_cast<void*>(page), kCodeArenaSize, PAGE_EXECUTE_READ, &oldProt)) {
+        setErr("protect-page-failed");
         ::VirtualFree(reinterpret_cast<void*>(page), 0, MEM_RELEASE);
         return false;
     }
@@ -361,6 +456,7 @@ bool InstallStandaloneDetour5(std::uintptr_t site,
     _InterlockedExchangePointer(reinterpret_cast<void* volatile*>(outOrigTrampoline), trampPtr);
 
     if (!CompareAndPatch5BytesSafe(site, entry.orig5, entry.jmp5)) {
+        setErr("cas-patch-failed");
         _InterlockedExchangePointer(reinterpret_cast<void* volatile*>(outOrigTrampoline), prevPublished);
         if (prevPublished == nullptr) {
             ::VirtualFree(reinterpret_cast<void*>(page), 0, MEM_RELEASE);
