@@ -114,7 +114,7 @@ std::uintptr_t ReserveNearRegion(std::uintptr_t minAddr,
             const std::uintptr_t hi = (std::min)(cur, regEnd);
             if (hi >= lo + allocSize) {
                 std::uintptr_t cand = (hi - allocSize) & ~(gran - 1ULL);
-                for (int tries = 0; tries < 8 && cand >= lo; ++tries) {
+                for (int tries = 0; tries < 4096 && cand >= lo; ++tries) {
                     if (cand + allocSize <= hi) {
                         if (std::uintptr_t p = TryAllocRegionAt(cand, allocSize, allocType, prot)) {
                             return p;
@@ -142,7 +142,7 @@ std::uintptr_t ReserveNearRegion(std::uintptr_t minAddr,
             const std::uintptr_t lo = (std::max)(minAddr, regBase);
             const std::uintptr_t hi = (std::min)(maxAddr, regEnd);
             std::uintptr_t cand = (lo + gran - 1ULL) & ~(gran - 1ULL);
-            for (int tries = 0; tries < 8 && cand + allocSize <= hi; ++tries) {
+            for (int tries = 0; tries < 4096 && cand + allocSize <= hi; ++tries) {
                 if (std::uintptr_t p = TryAllocRegionAt(cand, allocSize, allocType, prot)) {
                     return p;
                 }

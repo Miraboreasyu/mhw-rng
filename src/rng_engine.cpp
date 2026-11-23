@@ -16,7 +16,7 @@
 #include <mutex>
 #include <vector>
 
-static_assert(sizeof(MhwRngCallerRegs) == 88, "MhwRngCallerRegs size mismatch with rng_trampolines.asm");
+static_assert(sizeof(MhwRngCallerRegs) == 128, "MhwRngCallerRegs size mismatch with rng_trampolines.asm");
 static_assert(offsetof(MhwRngCallerRegs, rbx)       == 0x00, "rbx offset mismatch");
 static_assert(offsetof(MhwRngCallerRegs, rbp)       == 0x08, "rbp offset mismatch");
 static_assert(offsetof(MhwRngCallerRegs, rsi)       == 0x10, "rsi offset mismatch");
@@ -28,6 +28,9 @@ static_assert(offsetof(MhwRngCallerRegs, r15)       == 0x38, "r15 offset mismatc
 static_assert(offsetof(MhwRngCallerRegs, callerRsp) == 0x40, "callerRsp offset mismatch");
 static_assert(offsetof(MhwRngCallerRegs, callerRip) == 0x48, "callerRip offset mismatch");
 static_assert(offsetof(MhwRngCallerRegs, reserved)  == 0x50, "reserved offset mismatch");
+static_assert(offsetof(MhwRngCallerRegs, reserved2) == 0x58, "reserved2 offset mismatch");
+static_assert(offsetof(MhwRngCallerRegs, xmm6)      == 0x60, "xmm6 offset mismatch");
+static_assert(offsetof(MhwRngCallerRegs, xmm7)      == 0x70, "xmm7 offset mismatch");
 
 namespace rng {
 namespace {
@@ -382,11 +385,22 @@ bool RegisterWrapperInternal(MhwRngPluginId ownerId, std::uint32_t normRva, std:
 }
 
 void RegisterBuiltinWrappers() noexcept {
-    static constexpr std::uint32_t kBuiltinRvas[5] = {
-        0x04F71BFU, 0x2396F02U, 0x2396F2DU, 0x197D6A2U, 0x197D6B5U
+    struct BuiltinWrapper {
+        std::uint32_t rva;
+        std::uint16_t frameQwords;
     };
-    for (std::uint32_t r : kBuiltinRvas) {
-        RegisterWrapperInternal(kMhwRngPluginIdKernel, r, 6U);
+    static constexpr BuiltinWrapper kBuiltin[8] = {
+        { 0x04F71BFU,  6U }, // MtRandom::between(lo, hi)
+        { 0x2396F02U,  6U },
+        { 0x2396F2DU,  6U },
+        { 0x197D6A2U,  6U },
+        { 0x197D6B5U,  6U },
+        { 0x0672FBCU, 10U }, // FUN_140672f90 float randRange(min, max) (`sub rsp, 0x48`)
+        { 0x02CAB1EU,  6U }, // FUN_1402caaf0 int range wrapper (`push rdi; sub rsp, 0x20`)
+        { 0x02CD9D1U,  8U }, // FUN_1402cd9b0 float rollPercent (`sub rsp, 0x38`)
+    };
+    for (const BuiltinWrapper& w : kBuiltin) {
+        RegisterWrapperInternal(kMhwRngPluginIdKernel, w.rva, w.frameQwords);
     }
 }
 
@@ -641,8 +655,53 @@ struct DrawExecResult {
     float         finalFloat      = 0.0f;
 };
 
+bool RunFilterChain(const RvaHookChain* chain,
+                    std::uint32_t filterMask,
+                    std::uint32_t targetCondId,
+                    MhwRngSourceKind srcKind,
+                    float origMinVal,
+                    float origMaxVal,
+                    MhwRngDrawContext& ctx,
+                    bool& outAnyOverrode,
+                    bool& outReturnFloatBits) noexcept {
+    outAnyOverrode     = false;
+    outReturnFloatBits = false;
+    if (!chain || filterMask == 0U) return false;
+
+    ctx.callFlags |= (kMhwRngDrawFlagPostDraw | kMhwRngDrawFlagCanModify);
+    for (std::uint32_t i = 0; i < chain->count; ++i) {
+        if ((filterMask & (1U << i)) == 0U) continue;
+        const SlotHookEntry& fhe = g_hookEntries[chain->entryIdx[i]];
+        if (!fhe.active || !fhe.postFn) continue;
+
+        MhwRngHookDecision fdec{kMhwRngActionContinue, targetCondId, ctx.finalValue0, ctx.finalValue1};
+        InvokePluginSlotHookSEH(fhe.postFn, &ctx, &fdec, fhe.userData);
+
+        if (fdec.action == kMhwRngActionReturnValue) {
+            outAnyOverrode     = true;
+            outReturnFloatBits = false;
+            ctx.finalValue0    = fdec.value0;
+            ctx.finalValue1    = fdec.value1;
+            if (srcKind == kMhwRngSrcMt19937Range) {
+                const float uf = static_cast<float>(static_cast<std::int64_t>(static_cast<std::uint64_t>(fdec.value0)));
+                ctx.finalFloat = (uf * kFloatInv2Pow32 + kFloatHalfStep2P32) * (origMaxVal - origMinVal) + origMinVal;
+            }
+            ctx.callFlags |= kMhwRngDrawFlagOverridden;
+            ctx.callFlags &= ~kMhwRngDrawFlagBypassed;
+        } else if (fdec.action == kMhwRngActionReturnFloatBits) {
+            outAnyOverrode     = true;
+            outReturnFloatBits = true;
+            ctx.finalValue0    = fdec.value0;
+            ctx.finalFloat     = BitsToFloat(fdec.value0);
+            ctx.callFlags |= kMhwRngDrawFlagOverridden;
+            ctx.callFlags &= ~kMhwRngDrawFlagBypassed;
+        }
+    }
+    return outAnyOverrode;
+}
+
 void FirePostHooksAndObservers(const RvaHookChain* chain,
-                               const SlotHookEntry* skipEntry,
+                               std::uint32_t skipChainMask,
                                bool isObserveOnlyMode,
                                std::uint32_t rva,
                                MhwRngSourceKind srcKind,
@@ -653,8 +712,9 @@ void FirePostHooksAndObservers(const RvaHookChain* chain,
 
     if (chain && chain->hasPost) {
         for (std::uint32_t i = 0; i < chain->count; ++i) {
+            if ((skipChainMask & (1U << i)) != 0U) continue;
             const SlotHookEntry& he = g_hookEntries[chain->entryIdx[i]];
-            if (!he.active || !he.postFn || &he == skipEntry) continue;
+            if (!he.active || !he.postFn) continue;
             if ((he.flags & kMhwRngHookPost) == 0U) continue;
             if (isObserveOnlyMode && (he.flags & kMhwRngHookObserveOnly) == 0U) continue;
 
@@ -717,7 +777,9 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
     // Check private instance tags if requested
     bool instExplicit = false;
     std::uint32_t instPolicy = kMhwRngInstAuto;
-    if (privateSelfWords) {
+    const bool trackPrivateInst = (privateSelfWords != nullptr) ||
+                                  (srcKind == kMhwRngSrcMt19937HeapDraw && rngInstance != 0);
+    if (trackPrivateInst) {
         QueryInstanceTagInfo(rngInstance, curEpoch, instExplicit, instPolicy);
         baseCallFlags |= kMhwRngDrawFlagIsPrivateInst;
         if (instExplicit) baseCallFlags |= kMhwRngDrawFlagInstExplicitSeeded;
@@ -757,7 +819,7 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
     ctx.origArg2          = origArg2;
     ctx.origMinVal        = origMinVal;
     ctx.origMaxVal        = origMaxVal;
-    ctx.callFlags         = baseCallFlags | (regs ? kMhwRngDrawFlagHasRegs : 0U);
+    ctx.callFlags         = baseCallFlags | (regs ? (kMhwRngDrawFlagHasRegs | kMhwRngDrawFlagHasXmmRegs) : 0U);
     ctx.origReturnRva     = origRetRva;
 
     // 1. Observe-Only Mode: NEVER alter game RNG, just execute vanilla + update telemetry + notify observers
@@ -777,7 +839,7 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
         ctx.finalFloat    = vanF;
 
         if (chain || obsCount != 0U) {
-            FirePostHooksAndObservers(chain, nullptr, true, rva, srcKind, ctx, obsCount);
+            FirePostHooksAndObservers(chain, 0U, true, rva, srcKind, ctx, obsCount);
         }
         if (enteredInFlight) g_inFlightHookCalls.fetch_sub(1U, std::memory_order_acq_rel);
 
@@ -789,7 +851,7 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
         return out;
     }
 
-    // 2. Full Takeover Mode: Run Pre-Hook Chain
+    // 2. Full / Selective Mode: Run Pre-Hook Chain & Collect FilterMasks
     enum class PreOutcome : std::uint8_t {
         UseSlot,
         DirectValue,
@@ -798,10 +860,21 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
         FilterVanilla
     };
     PreOutcome outcome = PreOutcome::UseSlot;
-    const SlotHookEntry* filterEntry = nullptr;
+    std::uint32_t filterVanillaMask  = 0U;
+    std::uint32_t filterSlotMask     = 0U;
+    std::uint32_t executedFilterMask = 0U;
     std::uint32_t preVal0 = 0U, preVal1 = 0U;
 
     if (chain && (chain->hasPre || chain->hasFilter)) {
+        auto recordStaticFilter = [&](std::uint32_t idx, const SlotHookEntry& he) noexcept {
+            if (!he.postFn || idx >= 32U) return;
+            if ((he.flags & kMhwRngHookFilterVanilla) != 0U) {
+                filterVanillaMask |= (1U << idx);
+            } else if ((he.flags & kMhwRngHookFilterSlot) != 0U) {
+                filterSlotMask |= (1U << idx);
+            }
+        };
+
         for (std::uint32_t i = 0; i < chain->count; ++i) {
             const SlotHookEntry& he = g_hookEntries[chain->entryIdx[i]];
             if (!he.active) continue;
@@ -811,16 +884,19 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
                 InvokePluginSlotHookSEH(he.preFn, &ctx, &dec, he.userData);
 
                 if (dec.action == kMhwRngActionContinue) {
+                    recordStaticFilter(i, he);
                     continue;
                 }
                 if (dec.action == kMhwRngActionUseCondition) {
                     targetCondId     = dec.condId;
                     ctx.activeCondId = targetCondId;
+                    recordStaticFilter(i, he);
                     continue; // Allow downstream hooks in chain to inspect/continue/override
                 }
                 if (dec.action == kMhwRngActionClaimCondition) {
                     targetCondId     = dec.condId;
                     ctx.activeCondId = targetCondId;
+                    recordStaticFilter(i, he);
                     break;
                 }
                 if (dec.action == kMhwRngActionReturnValue) {
@@ -847,15 +923,21 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
                 if (dec.action == kMhwRngActionFilterVanilla) {
                     targetCondId     = dec.condId;
                     ctx.activeCondId = targetCondId;
-                    filterEntry      = &he;
-                    outcome          = PreOutcome::FilterVanilla;
-                    break;
+                    if (he.postFn && i < 32U) filterVanillaMask |= (1U << i);
+                    continue;
                 }
-            } else if ((he.flags & kMhwRngHookFilterVanilla) != 0U && he.postFn != nullptr) {
-                filterEntry = &he;
-                outcome     = PreOutcome::FilterVanilla;
-                break;
+                if (dec.action == kMhwRngActionFilterSlot) {
+                    targetCondId     = dec.condId;
+                    ctx.activeCondId = targetCondId;
+                    if (he.postFn && i < 32U) filterSlotMask |= (1U << i);
+                    continue;
+                }
+            } else {
+                recordStaticFilter(i, he);
             }
+        }
+        if (outcome == PreOutcome::UseSlot && filterVanillaMask != 0U) {
+            outcome = PreOutcome::FilterVanilla;
         }
     }
 
@@ -896,6 +978,7 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
         RecordSlotTelemetry(targetSlot, recKey, srcKind, curEpoch, van0);
 
         out.bypassed      = true;
+        out.hadVanilla    = true;
         out.mode          = kMhwRngSlotBypass;
         out.val0          = van0;
         out.val1          = van1;
@@ -912,7 +995,7 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
         float vanF = 0.0f;
         callVanilla(van0, van1, vanF);
 
-        ctx.callFlags    |= kMhwRngDrawFlagPostDraw | kMhwRngDrawFlagHasVanilla | kMhwRngDrawFlagCanModify;
+        ctx.callFlags    |= kMhwRngDrawFlagHasVanilla;
         ctx.vanillaValue0 = van0;
         ctx.vanillaValue1 = van1;
         ctx.vanillaFloat  = vanF;
@@ -920,40 +1003,26 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
         ctx.finalValue1   = van1;
         ctx.finalFloat    = vanF;
 
-        MhwRngHookDecision fdec{kMhwRngActionContinue, targetCondId, van0, van1};
-        if (filterEntry && filterEntry->postFn) {
-            InvokePluginSlotHookSEH(filterEntry->postFn, &ctx, &fdec, filterEntry->userData);
-        }
+        bool anyOverrode     = false;
+        bool anyRetFloatBits = false;
+        executedFilterMask   = filterVanillaMask | filterSlotMask;
+        RunFilterChain(chain, executedFilterMask, targetCondId, srcKind,
+                       origMinVal, origMaxVal, ctx, anyOverrode, anyRetFloatBits);
 
-        if (fdec.action == kMhwRngActionReturnValue) {
-            out.overridden  = true;
-            out.hadVanilla  = true;
-            out.mode        = kMhwRngSlotFixedValue;
-            out.val0        = fdec.value0;
-            out.val1        = fdec.value1;
-            if (privateSelfWords) {
-                privateSelfWords[3] = (fdec.value0 != 0U) ? fdec.value0 : 0x6D2B79F5U;
-            }
-            if (srcKind == kMhwRngSrcMt19937Range) {
-                const float uf = static_cast<float>(static_cast<std::int64_t>(static_cast<std::uint64_t>(fdec.value0)));
-                out.finalFloat = (uf * kFloatInv2Pow32 + kFloatHalfStep2P32) * (origMaxVal - origMinVal) + origMinVal;
-            }
-            ctx.callFlags  |= kMhwRngDrawFlagOverridden;
-            ctx.finalValue0 = out.val0;
-            ctx.finalValue1 = out.val1;
-            ctx.finalFloat  = out.finalFloat;
-        } else if (fdec.action == kMhwRngActionReturnFloatBits) {
+        if (anyOverrode) {
             out.overridden      = true;
             out.hadVanilla      = true;
-            out.returnFloatBits = true;
+            out.returnFloatBits = anyRetFloatBits;
             out.mode            = kMhwRngSlotFixedValue;
-            out.val0            = fdec.value0;
-            out.finalFloat      = BitsToFloat(fdec.value0);
-            ctx.callFlags      |= kMhwRngDrawFlagOverridden;
-            ctx.finalValue0     = out.val0;
-            ctx.finalFloat      = out.finalFloat;
+            out.val0            = ctx.finalValue0;
+            out.val1            = ctx.finalValue1;
+            out.finalFloat      = ctx.finalFloat;
+            if (privateSelfWords) {
+                privateSelfWords[3] = (out.val0 != 0U) ? out.val0 : 0x6D2B79F5U;
+            }
         } else {
             out.bypassed    = true;
+            out.hadVanilla  = true;
             out.mode        = kMhwRngSlotBypass;
             out.val0        = van0;
             out.val1        = van1;
@@ -1005,6 +1074,7 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
                 }
             }
             out.bypassed      = true;
+            out.hadVanilla    = true;
             out.mode          = kMhwRngSlotBypass;
             out.val0          = van0;
             out.val1          = van1;
@@ -1017,11 +1087,21 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
             ctx.finalValue1   = van1;
             ctx.finalFloat    = vanF;
         } else {
-            // Handle private MtRandom instance state policy when slot is MasterDerived
-            if (privateSelfWords && slotMode == kMhwRngSlotMasterDerived &&
+            // Handle private MtRandom / mt19937_heap instance state policy when slot is MasterDerived
+            const bool followOwnState = (slotMode == kMhwRngSlotMasterDerived) &&
                 (instPolicy == kMhwRngInstFollowOwnState ||
-                 (instPolicy == kMhwRngInstAuto && instExplicit))) {
+                 (instPolicy == kMhwRngInstAuto && instExplicit));
+            if (privateSelfWords && followOwnState) {
                 v0 = StepMhwXorshift128(privateSelfWords);
+                SlotSpinGuard guard(targetSlot->lock);
+                if (targetSlot->key.load(std::memory_order_relaxed) == recKey) {
+                    targetSlot->lastValue = v0;
+                }
+            } else if (srcKind == kMhwRngSrcMt19937HeapDraw && rngInstance != 0 && followOwnState) {
+                std::uint32_t own0 = 0U, own1 = 0U;
+                float ownF = 0.0f;
+                callVanilla(own0, own1, ownF);
+                v0 = own0;
                 SlotSpinGuard guard(targetSlot->lock);
                 if (targetSlot->key.load(std::memory_order_relaxed) == recKey) {
                     targetSlot->lastValue = v0;
@@ -1048,10 +1128,34 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
             ctx.finalValue1 = v1;
             ctx.finalFloat  = out.finalFloat;
         }
+
+        if (filterSlotMask != 0U && slotMode != kMhwRngSlotBypass) {
+            bool anyOverrode     = false;
+            bool anyRetFloatBits = false;
+            executedFilterMask   = filterSlotMask;
+            RunFilterChain(chain, executedFilterMask, targetCondId, srcKind,
+                           origMinVal, origMaxVal, ctx, anyOverrode, anyRetFloatBits);
+            if (anyOverrode) {
+                out.overridden      = true;
+                out.bypassed        = false;
+                out.returnFloatBits = anyRetFloatBits;
+                out.mode            = kMhwRngSlotFixedValue;
+                out.val0            = ctx.finalValue0;
+                out.val1            = ctx.finalValue1;
+                out.finalFloat      = ctx.finalFloat;
+                if (privateSelfWords) {
+                    privateSelfWords[3] = (out.val0 != 0U) ? out.val0 : 0x6D2B79F5U;
+                }
+                SlotSpinGuard guard(targetSlot->lock);
+                if (targetSlot->key.load(std::memory_order_relaxed) == recKey) {
+                    targetSlot->lastValue = out.val0;
+                }
+            }
+        }
     }
 
     if (chain || obsCount != 0U) {
-        FirePostHooksAndObservers(chain, filterEntry, false, rva, srcKind, ctx, obsCount);
+        FirePostHooksAndObservers(chain, executedFilterMask, false, rva, srcKind, ctx, obsCount);
     }
     if (enteredInFlight) {
         g_inFlightHookCalls.fetch_sub(1U, std::memory_order_acq_rel);
@@ -1163,9 +1267,10 @@ bool RebuildChainForRvaLocked(std::uint32_t normRva, RngSlot* baseSlot) {
     for (std::uint32_t i = 0; i < mCount; ++i) {
         const SlotHookEntry& he = g_hookEntries[matched[i]];
         nc.entryIdx[i] = matched[i];
-        if ((he.flags & kMhwRngHookPre) != 0U && he.preFn)          nc.hasPre    = true;
-        if ((he.flags & kMhwRngHookPost) != 0U && he.postFn)        nc.hasPost   = true;
-        if ((he.flags & kMhwRngHookFilterVanilla) != 0U)            nc.hasFilter = true;
+        if ((he.flags & kMhwRngHookPre) != 0U && he.preFn)                             nc.hasPre    = true;
+        if ((he.flags & kMhwRngHookPost) != 0U && he.postFn)                           nc.hasPost   = true;
+        if ((he.flags & (kMhwRngHookFilterVanilla | kMhwRngHookFilterSlot)) != 0U &&
+            he.postFn)                                                                 nc.hasFilter = true;
     }
 
     baseSlot->hookChainIdxPlus1.store(static_cast<std::uint16_t>(newChainIdx + 1U), std::memory_order_seq_cst);
@@ -1665,7 +1770,7 @@ MhwRngHookHandle RegisterSlotHookEx(MhwRngPluginId ownerId, const MhwRngHookDesc
         if (desc->preFn)  flags |= kMhwRngHookPre;
         if (desc->postFn) flags |= kMhwRngHookPost;
     }
-    if ((flags & kMhwRngHookFilterVanilla) != 0U && desc->postFn != nullptr) {
+    if ((flags & (kMhwRngHookFilterVanilla | kMhwRngHookFilterSlot)) != 0U && desc->postFn != nullptr) {
         flags |= kMhwRngHookPost;
     }
 
@@ -1876,6 +1981,129 @@ void DetachAllHooksForPluginAndWait(MhwRngPluginId ownerId) noexcept {
             }
         }
     }
+}
+
+namespace {
+
+std::uint32_t CaptureCallerRvasSEH(const MhwRngDrawContext* ctx,
+                                   std::uint32_t* outRvas,
+                                   std::uint32_t maxDepth) noexcept {
+    if (!ctx || !outRvas || maxDepth == 0U) return 0U;
+    if (maxDepth > 32U) maxDepth = 32U;
+
+    const std::uintptr_t base = ctx->exeBase ? ctx->exeBase : g_exeBase;
+    const std::uintptr_t end  = ctx->exeEnd  ? ctx->exeEnd  : g_exeEnd;
+    if (base == 0U || end <= base) return 0U;
+
+    __try {
+        std::uint32_t written = 0U;
+        if (!ctx->callerRegs) {
+            if (!ctx->returnAddrSlot) return 0U;
+            const auto* slotPtr = static_cast<const std::uintptr_t*>(ctx->returnAddrSlot);
+            const std::uintptr_t ret = *slotPtr;
+            if (ret < base || ret >= end) return 0U;
+            std::uint32_t rva = static_cast<std::uint32_t>(ret - base);
+            if (rva != 0U) outRvas[written++] = rva;
+
+            std::size_t stackOffset = 0U;
+            const std::uint32_t hi  = g_wrapperHighWater.load(std::memory_order_acquire);
+            for (int hop = 0; hop < 2 && written < maxDepth; ++hop) {
+                std::uint16_t matchedFq = 0U;
+                for (std::uint32_t i = 0; i < hi; ++i) {
+                    const std::uint64_t p = g_wrappers[i].load(std::memory_order_relaxed);
+                    if (p != 0ULL && static_cast<std::uint32_t>(p) == rva) {
+                        matchedFq = static_cast<std::uint16_t>((p >> 32) & 0xFFFFU);
+                        break;
+                    }
+                }
+                if (matchedFq == 0U) break;
+                stackOffset += matchedFq;
+                const std::uintptr_t outerRet = slotPtr[stackOffset];
+                if (outerRet < base || outerRet >= end) break;
+                rva = static_cast<std::uint32_t>(outerRet - base);
+                if (rva != 0U) outRvas[written++] = rva;
+            }
+            return written;
+        }
+
+        alignas(16) CONTEXT unwindCtx{};
+        unwindCtx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        unwindCtx.Rbx          = ctx->callerRegs->rbx;
+        unwindCtx.Rbp          = ctx->callerRegs->rbp;
+        unwindCtx.Rsi          = ctx->callerRegs->rsi;
+        unwindCtx.Rdi          = ctx->callerRegs->rdi;
+        unwindCtx.R12          = ctx->callerRegs->r12;
+        unwindCtx.R13          = ctx->callerRegs->r13;
+        unwindCtx.R14          = ctx->callerRegs->r14;
+        unwindCtx.R15          = ctx->callerRegs->r15;
+
+        const std::uintptr_t initialRsp = ctx->callerRegs->callerRsp + sizeof(std::uintptr_t);
+        unwindCtx.Rsp                   = initialRsp;
+        unwindCtx.Rip                   = ctx->callerRegs->callerRip;
+
+        for (std::uint32_t step = 0U; step < 48U && written < maxDepth; ++step) {
+            if (unwindCtx.Rip < 0x10000ULL || (unwindCtx.Rsp & 0x7ULL) != 0ULL) break;
+
+            std::uint32_t curInModRva = 0U;
+            if (unwindCtx.Rip >= base && unwindCtx.Rip < end) {
+                curInModRva = static_cast<std::uint32_t>(unwindCtx.Rip - base);
+                if (curInModRva != 0U) {
+                    outRvas[written++] = curInModRva;
+                }
+                if (written >= maxDepth) break;
+            }
+
+            const DWORD64 controlPc = static_cast<DWORD64>(unwindCtx.Rip - 1ULL);
+            DWORD64 imgBase         = 0ULL;
+            PRUNTIME_FUNCTION fnEnt = ::RtlLookupFunctionEntry(controlPc, &imgBase, nullptr);
+            const std::uintptr_t prevRsp = unwindCtx.Rsp;
+
+            if (fnEnt != nullptr) {
+                PVOID handlerData       = nullptr;
+                DWORD64 estFrame        = 0ULL;
+                ::RtlVirtualUnwind(UNW_FLAG_NHANDLER, imgBase, controlPc, fnEnt,
+                                   &unwindCtx, &handlerData, &estFrame, nullptr);
+            } else if (curInModRva != 0U) {
+                std::uint16_t matchedFq = 0U;
+                const std::uint32_t hi  = g_wrapperHighWater.load(std::memory_order_acquire);
+                for (std::uint32_t i = 0; i < hi; ++i) {
+                    const std::uint64_t p = g_wrappers[i].load(std::memory_order_relaxed);
+                    if (p != 0ULL && static_cast<std::uint32_t>(p) == curInModRva) {
+                        matchedFq = static_cast<std::uint16_t>((p >> 32) & 0xFFFFU);
+                        break;
+                    }
+                }
+                if (matchedFq > 0U) {
+                    const std::uintptr_t nextRip = *reinterpret_cast<const std::uintptr_t*>(
+                        prevRsp + static_cast<std::size_t>(matchedFq - 1U) * sizeof(std::uintptr_t));
+                    unwindCtx.Rsp = prevRsp + static_cast<std::size_t>(matchedFq) * sizeof(std::uintptr_t);
+                    unwindCtx.Rip = nextRip;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+
+            if (unwindCtx.Rip == 0ULL ||
+                unwindCtx.Rsp <= prevRsp ||
+                (unwindCtx.Rsp - initialRsp) > 0x40000ULL ||
+                (unwindCtx.Rsp & 0x7ULL) != 0ULL) {
+                break;
+            }
+        }
+        return written;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0U;
+    }
+}
+
+} // namespace
+
+std::uint32_t __fastcall CaptureCallerRvas(const MhwRngDrawContext* ctx,
+                                           std::uint32_t* outRvas,
+                                           std::uint32_t maxDepth) noexcept {
+    return CaptureCallerRvasSEH(ctx, outRvas, maxDepth);
 }
 
 bool RestoreSlotState(const MhwRngSlotState* state) noexcept {
@@ -2321,6 +2549,10 @@ void __fastcall HookImpl_Mt19937HeapInit(void* state,
         });
     if (!dr.bypassed) {
         rng::g_origMt19937Init(state, dr.val0);
+        if (dr.mode != kMhwRngSlotMasterDerived || dr.overridden) {
+            rng::TagExplicitlySeededInstance(reinterpret_cast<std::uintptr_t>(state),
+                                             rng::g_seedEpoch.load(std::memory_order_relaxed));
+        }
     }
 }
 
@@ -2527,4 +2759,10 @@ MHW_RNG_API bool MhwRng_SetInstancePolicy(std::uintptr_t instancePtr, std::uint3
 
 MHW_RNG_API std::uint32_t MhwRng_GetInstancePolicy(std::uintptr_t instancePtr) {
     return rng::GetInstancePolicy(instancePtr);
+}
+
+MHW_RNG_API std::uint32_t MhwRng_CaptureCallerRvas(const MhwRngDrawContext* ctx,
+                                                   std::uint32_t* outRvas,
+                                                   std::uint32_t maxDepth) {
+    return rng::CaptureCallerRvas(ctx, outRvas, maxDepth);
 }

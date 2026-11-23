@@ -47,6 +47,12 @@ bool DispatchPluginSubcommand(const std::string& subcmdLower,
                               const std::vector<std::string>& argsAfterSubcmd,
                               const std::string& rawArgsAfterSubcmd);
 
+// Returns true if the subcommand has a registered plugin completer (even if 0 candidates apply at this arg position)
+bool CompletePluginSubcommand(const std::string& subcmdLower,
+                              const std::vector<std::string>& priorArgsAfterSubcmd,
+                              const std::string& currentPrefix,
+                              std::vector<std::string>& outCandidates);
+
 // Metadata & formatting queries (used by Kernel `$rng` status and by plugins like `inspector`)
 bool        QuerySiteMeta(std::uint32_t rva, MhwRngSiteMeta* outMeta);
 bool        FormatSlotCustom(const MhwRngSlotSnapshot* snap, char* outBuf, std::size_t bufCap);

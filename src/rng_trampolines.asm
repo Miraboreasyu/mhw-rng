@@ -17,9 +17,9 @@ EXTERN HookImpl_CrtRand:PROC
 
 .CODE
 
-; Stack frame layout after `sub rsp, 88h`:
+; Stack frame layout after `sub rsp, 0A8h`:
 ;   [rsp+00h..rsp+1Fh] : 32B shadow space for C++ callee
-;   [rsp+20h..rsp+77h] : MhwRngCallerRegs (88 bytes = 11 QWORDs):
+;   [rsp+20h..rsp+9Fh] : MhwRngCallerRegs (128 bytes = 16 QWORDs):
 ;     +00h (rsp+20h) rbx
 ;     +08h (rsp+28h) rbp
 ;     +10h (rsp+30h) rsi
@@ -28,14 +28,17 @@ EXTERN HookImpl_CrtRand:PROC
 ;     +28h (rsp+48h) r13
 ;     +30h (rsp+50h) r14
 ;     +38h (rsp+58h) r15
-;     +40h (rsp+60h) callerRsp (`lea rax, [rsp+88h]`)
+;     +40h (rsp+60h) callerRsp (`lea rax, [rsp+0A8h]`)
 ;     +48h (rsp+68h) callerRip (`[callerRsp]`)
-;     +50h (rsp+70h) reserved (0)
-;   [rsp+78h..rsp+87h] : 16B alignment pad (entry RSP % 16 == 8 -> sub 88h => 16B aligned)
+;     +50h (rsp+70h) reserved (80h = sizeof(MhwRngCallerRegs))
+;     +58h (rsp+78h) reserved2 (0)
+;     +60h (rsp+80h) xmm6
+;     +70h (rsp+90h) xmm7
+;   [rsp+0A0h..rsp+0A7h] : 8B alignment pad (entry RSP % 16 == 8 -> sub 0A8h => 16B aligned)
 
 RNG_DISPATCH MACRO TargetFn, RegDest
-    sub rsp, 88h
-    .allocstack 88h
+    sub rsp, 0A8h
+    .allocstack 0A8h
     .endprolog
     mov qword ptr [rsp+20h], rbx
     mov qword ptr [rsp+28h], rbp
@@ -45,15 +48,18 @@ RNG_DISPATCH MACRO TargetFn, RegDest
     mov qword ptr [rsp+48h], r13
     mov qword ptr [rsp+50h], r14
     mov qword ptr [rsp+58h], r15
-    lea rax, [rsp+88h]
+    lea rax, [rsp+0A8h]
     mov qword ptr [rsp+60h], rax
     mov rax, qword ptr [rax]
     mov qword ptr [rsp+68h], rax
+    mov qword ptr [rsp+70h], 80h
     xor eax, eax
-    mov qword ptr [rsp+70h], rax
+    mov qword ptr [rsp+78h], rax
+    movups xmmword ptr [rsp+80h], xmm6
+    movups xmmword ptr [rsp+90h], xmm7
     lea RegDest, [rsp+20h]
     call TargetFn
-    add rsp, 88h
+    add rsp, 0A8h
     ret
 ENDM
 

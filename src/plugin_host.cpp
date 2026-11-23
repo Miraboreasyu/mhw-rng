@@ -6,7 +6,9 @@
 #include "rng_engine.h"
 
 #include <windows.h>
+#include <intrin.h>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdarg>
 #include <cstdio>
@@ -17,22 +19,31 @@
 namespace plugin_host {
 namespace {
 
+struct LocaleTextOwned {
+    std::string lang;
+    std::string text;
+};
+
 struct RegisteredSubcmd {
-    MhwRngPluginId     ownerId = 0;
-    std::string        subcmdLower;
-    std::string        usageExample;
-    std::string        helpCn;
-    MhwRngSubcommandFn fn       = nullptr;
-    void*              userData = nullptr;
+    MhwRngPluginId               ownerId = 0;
+    std::string                  subcmdLower;
+    std::string                  usageExample;
+    std::string                  helpCn;
+    std::vector<LocaleTextOwned> helpI18n;
+    MhwRngSubcommandFn           fn                = nullptr;
+    void*                        userData          = nullptr;
+    MhwRngSubcommandCompleteFn   completer         = nullptr;
+    void*                        completerUserData = nullptr;
 };
 
 struct RegisteredSiteMeta {
-    MhwRngPluginId         ownerId = 0;
-    std::uint32_t          rva     = 0;
-    std::string            alias;
-    std::string            descUtf8;
-    MhwRngValueFormatterFn formatter = nullptr;
-    void*                  userData  = nullptr;
+    MhwRngPluginId               ownerId = 0;
+    std::uint32_t                rva     = 0;
+    std::string                  alias;
+    std::string                  descUtf8;
+    std::vector<LocaleTextOwned> descI18n;
+    MhwRngValueFormatterFn       formatter = nullptr;
+    void*                        userData  = nullptr;
 };
 
 struct FallbackResolver {
@@ -49,17 +60,19 @@ struct RegisteredLifecycleHook {
 };
 
 struct LoadedPlugin {
-    MhwRngPluginId         id = 0;
-    std::string            shortName;
-    std::string            shortNameLower;
-    std::string            displayName;
-    std::string            version;
-    std::string            description;
-    std::string            sourcePath;
-    std::string            fileName;
-    std::string            shadowPath;
-    HMODULE                module     = nullptr;
-    MhwRngPluginShutdownFn shutdownFn = nullptr;
+    MhwRngPluginId               id = 0;
+    std::string                  shortName;
+    std::string                  shortNameLower;
+    std::string                  displayName;
+    std::vector<LocaleTextOwned> displayNamesI18n;
+    std::string                  version;
+    std::string                  description;
+    std::vector<LocaleTextOwned> descriptionsI18n;
+    std::string                  sourcePath;
+    std::string                  fileName;
+    std::string                  shadowPath;
+    HMODULE                      module     = nullptr;
+    MhwRngPluginShutdownFn       shutdownFn = nullptr;
 };
 
 // Two-tier lock hierarchy (prevents quiescence deadlocks even if a plugin calls Host APIs inside `OnSlotDraw`):
@@ -69,6 +82,22 @@ struct LoadedPlugin {
 //                       plugin callbacks, `LoadLibrary`, or `FreeLibrary`!
 std::recursive_mutex             g_lifecycleMx;
 std::mutex                       g_registryMx;
+std::atomic<std::uint32_t>       g_inFlightHostCallbacks{0U};
+
+struct InFlightHostGuard {
+    bool armed = false;
+    void Arm() noexcept {
+        if (!armed) {
+            g_inFlightHostCallbacks.fetch_add(1U, std::memory_order_seq_cst);
+            armed = true;
+        }
+    }
+    ~InFlightHostGuard() noexcept {
+        if (armed) {
+            g_inFlightHostCallbacks.fetch_sub(1U, std::memory_order_acq_rel);
+        }
+    }
+};
 
 std::string                      g_subPluginDir;
 std::string                      g_hotloadDir;
@@ -94,6 +123,54 @@ std::string LowerAscii(std::string s) {
         if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
     }
     return s;
+}
+
+std::vector<LocaleTextOwned> CopyLocaleTable(const MhwRngLocaleText* entries, std::size_t count) {
+    std::vector<LocaleTextOwned> out;
+    if (!entries || count == 0U) return out;
+    out.reserve(count);
+    for (std::size_t i = 0U; i < count; ++i) {
+        if (!entries[i].lang || entries[i].lang[0] == '\0' || !entries[i].text || entries[i].text[0] == '\0') {
+            continue;
+        }
+        char primary[12]{};
+        MhwRng_ExtractCanonicalPrimary(entries[i].lang, primary);
+        if (primary[0] != '\0') {
+            out.push_back(LocaleTextOwned{primary, entries[i].text});
+        }
+    }
+    return out;
+}
+
+std::string ResolveOwnedLocale(const std::vector<LocaleTextOwned>& entries, const std::string& fallback) {
+    if (!entries.empty()) {
+        const char* cur = app::GetLanguage();
+        for (const auto& e : entries) {
+            if (!e.text.empty() && MhwRng_LangMatchesPrimary(e.lang.c_str(), cur)) {
+                return e.text;
+            }
+        }
+        if (!MhwRng_LangMatchesPrimary(cur, "en")) {
+            for (const auto& e : entries) {
+                if (!e.text.empty() && MhwRng_LangMatchesPrimary(e.lang.c_str(), "en")) {
+                    return e.text;
+                }
+            }
+        }
+        if (!MhwRng_LangMatchesPrimary(cur, "zh")) {
+            for (const auto& e : entries) {
+                if (!e.text.empty() && MhwRng_LangMatchesPrimary(e.lang.c_str(), "zh")) {
+                    return e.text;
+                }
+            }
+        }
+        for (const auto& e : entries) {
+            if (!e.text.empty()) {
+                return e.text;
+            }
+        }
+    }
+    return fallback;
 }
 
 void CopyTrunc(char* dst, std::size_t cap, const char* src) noexcept {
@@ -175,6 +252,22 @@ bool InvokeSubcommandSEH(MhwRngSubcommandFn fn,
     }
 }
 
+bool InvokeCompleterSEH(MhwRngSubcommandCompleteFn fn,
+                        const char* subcmd,
+                        int argc,
+                        const char* const* argv,
+                        const char* prefix,
+                        MhwRngCompletionSinkFn addCand,
+                        void* sinkCtx,
+                        void* userData) noexcept {
+    __try {
+        fn(subcmd, argc, argv, prefix, addCand, sinkCtx, userData);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool InvokeFormatterSEH(MhwRngValueFormatterFn fn,
                         const MhwRngSlotSnapshot* snap,
                         char* outBuf,
@@ -209,17 +302,29 @@ void InvokeLifecycleSEH(MhwRngLifecycleFn fn,
 
 void BroadcastLifecycleEvent(const MhwRngEventInfo* info) noexcept {
     if (!info) return;
+    InFlightHostGuard guard;
     std::vector<RegisteredLifecycleHook> snapshot;
     {
         std::lock_guard<std::mutex> rlk(g_registryMx);
         if (g_lifecycleHooks.empty()) return;
         snapshot = g_lifecycleHooks;
+        guard.Arm();
     }
     for (const auto& h : snapshot) {
         if (h.fn) {
             InvokeLifecycleSEH(h.fn, info, h.userData);
         }
     }
+}
+
+void BroadcastLanguageChanged(std::uint32_t prevLangId, std::uint32_t) noexcept {
+    MhwRngEventInfo info{};
+    info.eventKind  = kMhwRngEventLanguageChanged;
+    info.engineMode = MhwRng_GetEngineMode();
+    info.masterSeed = MhwRng_GetMasterSeed();
+    info.epoch      = MhwRng_GetEpoch();
+    info.prevValue  = prevLangId;
+    BroadcastLifecycleEvent(&info);
 }
 
 // Requires `g_lifecycleMx` held; NEVER holds `g_registryMx` across `DetachAllHooksForPluginAndWait`!
@@ -262,6 +367,11 @@ void UnloadByIdLifecycleLocked(MhwRngPluginId targetId) {
                            [&](const RegisteredLifecycleHook& l) { return l.ownerId == p.id; }),
             g_lifecycleHooks.end());
     }
+    // Wait for any in-flight non-hot-path callbacks (Lifecycle / QuerySiteMeta / FormatSlotCustom)
+    // before invoking Shutdown or FreeLibrary on the shadow DLL.
+    while (g_inFlightHostCallbacks.load(std::memory_order_seq_cst) != 0U) {
+        _mm_pause();
+    }
     rng::ClearRulesByOwner(p.id);
 
     // 3. Notify plugin & unmap shadow DLL
@@ -277,12 +387,13 @@ void UnloadByIdLifecycleLocked(MhwRngPluginId targetId) {
 
 bool LoadDllPathLifecycleLocked(const std::string& fullDllPath,
                                 const std::string& fileName,
-                                std::string& outMsgCn) {
+                                std::string& outMsg) {
     ::CreateDirectoryA(g_subPluginDir.c_str(), nullptr);
     ::CreateDirectoryA(g_hotloadDir.c_str(), nullptr);
     ::SetFileAttributesA(g_hotloadDir.c_str(), FILE_ATTRIBUTE_HIDDEN);
     CleanupStaleShadowFiles();
 
+    const bool en = app::IsEnglish();
     const std::string baseShort = DeriveShortNameFromFilename(fileName);
     char shadowName[128]{};
     std::snprintf(shadowName, sizeof(shadowName), "%s.%u.%lu.dll",
@@ -290,14 +401,14 @@ bool LoadDllPathLifecycleLocked(const std::string& fullDllPath,
     const std::string shadowPath = g_hotloadDir + "\\" + shadowName;
 
     if (!::CopyFileA(fullDllPath.c_str(), shadowPath.c_str(), FALSE)) {
-        outMsgCn = u8"无法读取插件文件: " + fileName;
+        outMsg = (en ? "Failed to read plugin file: " : u8"无法读取插件文件: ") + fileName;
         return false;
     }
 
     HMODULE mod = ::LoadLibraryA(shadowPath.c_str());
     if (!mod) {
         ::DeleteFileA(shadowPath.c_str());
-        outMsgCn = u8"LoadLibrary 失败: " + fileName;
+        outMsg = (en ? "LoadLibrary failed: " : u8"LoadLibrary 失败: ") + fileName;
         return false;
     }
 
@@ -308,7 +419,7 @@ bool LoadDllPathLifecycleLocked(const std::string& fullDllPath,
     if (!fnGetInfo || !fnInit) {
         ::FreeLibrary(mod);
         ::DeleteFileA(shadowPath.c_str());
-        outMsgCn = u8"非标准 RNG 插件(缺少导出入口): " + fileName;
+        outMsg = (en ? "Not a valid RNG plugin (missing exports): " : u8"非标准 RNG 插件(缺少导出入口): ") + fileName;
         return false;
     }
 
@@ -316,7 +427,7 @@ bool LoadDllPathLifecycleLocked(const std::string& fullDllPath,
     if (!desc || desc->targetApiVersion != kMhwRngApiVersion || !desc->shortName || desc->shortName[0] == '\0') {
         ::FreeLibrary(mod);
         ::DeleteFileA(shadowPath.c_str());
-        outMsgCn = u8"插件 API 版本不匹配: " + fileName;
+        outMsg = (en ? "Plugin API version mismatch: " : u8"插件 API 版本不匹配: ") + fileName;
         return false;
     }
 
@@ -359,24 +470,36 @@ bool LoadDllPathLifecycleLocked(const std::string& fullDllPath,
 
     if (!InvokePluginInitSEH(fnInit, &g_hostApi, newId)) {
         UnloadByIdLifecycleLocked(newId);
-        outMsgCn = u8"插件初始化返回失败: " + std::string(desc->shortName);
+        outMsg = (en ? "Plugin Init returned false: " : u8"插件初始化返回失败: ") + std::string(desc->shortName);
         return false;
     }
 
     std::size_t cmdCnt = 0;
+    std::string dispName = lp.displayName;
     {
         std::lock_guard<std::mutex> rlk(g_registryMx);
         for (const auto& c : g_subcmds) {
             if (c.ownerId == newId) ++cmdCnt;
+        }
+        for (const auto& p : g_plugins) {
+            if (p.id == newId) {
+                dispName = ResolveOwnedLocale(p.displayNamesI18n, p.displayName);
+                break;
+            }
         }
     }
     app::Log("plugin_host: loaded '%s' v%s (%s, id=%u, cmds=%zu)",
              lp.shortName.c_str(), lp.version.c_str(), fileName.c_str(), newId, cmdCnt);
 
     char okBuf[192]{};
-    std::snprintf(okBuf, sizeof(okBuf), u8"%s v%s (%s, 注册%zu条指令)",
-                  lp.shortName.c_str(), lp.version.c_str(), lp.displayName.c_str(), cmdCnt);
-    outMsgCn = okBuf;
+    if (en) {
+        std::snprintf(okBuf, sizeof(okBuf), "%s v%s (%s, %zu cmds)",
+                      lp.shortName.c_str(), lp.version.c_str(), dispName.c_str(), cmdCnt);
+    } else {
+        std::snprintf(okBuf, sizeof(okBuf), u8"%s v%s (%s, 注册%zu条指令)",
+                      lp.shortName.c_str(), lp.version.c_str(), dispName.c_str(), cmdCnt);
+    }
+    outMsg = okBuf;
     return true;
 }
 
@@ -471,11 +594,14 @@ bool __fastcall Host_RegisterSubcommand(MhwRngPluginId selfId,
     std::lock_guard<std::mutex> rlk(g_registryMx);
     for (auto& existing : g_subcmds) {
         if (existing.subcmdLower == low) {
-            existing.ownerId      = selfId;
-            existing.usageExample = usageExample ? usageExample : "";
-            existing.helpCn       = helpCn ? helpCn : "";
-            existing.fn           = fn;
-            existing.userData     = userData;
+            existing.ownerId           = selfId;
+            existing.usageExample      = usageExample ? usageExample : "";
+            existing.helpCn            = helpCn ? helpCn : "";
+            existing.helpI18n.clear();
+            existing.fn                = fn;
+            existing.userData          = userData;
+            existing.completer         = nullptr;
+            existing.completerUserData = nullptr;
             return true;
         }
     }
@@ -484,8 +610,11 @@ bool __fastcall Host_RegisterSubcommand(MhwRngPluginId selfId,
         low,
         usageExample ? usageExample : "",
         helpCn ? helpCn : "",
+        {},
         fn,
-        userData
+        userData,
+        nullptr,
+        nullptr
     });
     return true;
 }
@@ -504,6 +633,7 @@ bool __fastcall Host_RegisterSiteMeta(MhwRngPluginId selfId,
             m.ownerId   = selfId;
             m.alias     = shortAlias ? shortAlias : "";
             m.descUtf8  = descriptionUtf8 ? descriptionUtf8 : "";
+            m.descI18n.clear();
             m.formatter = formatterOrNull;
             m.userData  = userData;
             return true;
@@ -514,6 +644,123 @@ bool __fastcall Host_RegisterSiteMeta(MhwRngPluginId selfId,
         norm,
         shortAlias ? shortAlias : "",
         descriptionUtf8 ? descriptionUtf8 : "",
+        {},
+        formatterOrNull,
+        userData
+    });
+    return true;
+}
+
+const char* __fastcall Host_SelectText(const MhwRngLocaleText* entries,
+                                       std::size_t count,
+                                       const char* fallbackText) {
+    return MhwRng_SelectTextFallback(app::GetLanguage(), entries, count, fallbackText);
+}
+
+bool __fastcall Host_RegisterPluginInfoI18n(MhwRngPluginId selfId,
+                                            const MhwRngLocaleText* displayNames,
+                                            std::size_t displayCount,
+                                            const MhwRngLocaleText* descriptions,
+                                            std::size_t descCount) {
+    if (selfId == 0U) return false;
+    auto namesVec = CopyLocaleTable(displayNames, displayCount);
+    auto descVec  = CopyLocaleTable(descriptions, descCount);
+    std::lock_guard<std::mutex> rlk(g_registryMx);
+    for (auto& p : g_plugins) {
+        if (p.id == selfId) {
+            if (!namesVec.empty()) p.displayNamesI18n = std::move(namesVec);
+            if (!descVec.empty())  p.descriptionsI18n = std::move(descVec);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool __fastcall Host_RegisterSubcommandI18n(MhwRngPluginId selfId,
+                                            const char* subcmd,
+                                            const char* usageExample,
+                                            const MhwRngLocaleText* helpTexts,
+                                            std::size_t helpCount,
+                                            MhwRngSubcommandFn fn,
+                                            void* userData) {
+    if (!subcmd || subcmd[0] == '\0' || !fn) return false;
+    const std::string low = LowerAscii(subcmd);
+    auto table = CopyLocaleTable(helpTexts, helpCount);
+    const std::string fallbackHelp = table.empty() ? std::string() : ResolveOwnedLocale(table, "");
+    std::lock_guard<std::mutex> rlk(g_registryMx);
+    for (auto& existing : g_subcmds) {
+        if (existing.subcmdLower == low) {
+            existing.ownerId           = selfId;
+            existing.usageExample      = usageExample ? usageExample : "";
+            existing.helpCn            = fallbackHelp;
+            existing.helpI18n          = std::move(table);
+            existing.fn                = fn;
+            existing.userData          = userData;
+            existing.completer         = nullptr;
+            existing.completerUserData = nullptr;
+            return true;
+        }
+    }
+    g_subcmds.push_back(RegisteredSubcmd{
+        selfId,
+        low,
+        usageExample ? usageExample : "",
+        fallbackHelp,
+        std::move(table),
+        fn,
+        userData,
+        nullptr,
+        nullptr
+    });
+    return true;
+}
+
+bool __fastcall Host_RegisterSubcommandCompleter(MhwRngPluginId selfId,
+                                                 const char* subcmd,
+                                                 MhwRngSubcommandCompleteFn completer,
+                                                 void* userData) {
+    if (!subcmd || subcmd[0] == '\0' || !completer) return false;
+    const std::string low = LowerAscii(subcmd);
+    std::lock_guard<std::mutex> rlk(g_registryMx);
+    for (auto& existing : g_subcmds) {
+        if (existing.subcmdLower == low && (selfId == 0U || existing.ownerId == selfId)) {
+            existing.completer         = completer;
+            existing.completerUserData = userData;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool __fastcall Host_RegisterSiteMetaI18n(MhwRngPluginId selfId,
+                                          std::uint32_t rva,
+                                          const char* shortAlias,
+                                          const MhwRngLocaleText* descriptions,
+                                          std::size_t descCount,
+                                          MhwRngValueFormatterFn formatterOrNull,
+                                          void* userData) {
+    const std::uint32_t norm = rng::NormalizeUserSiteAddress(rva);
+    if (norm == 0U) return false;
+    auto table = CopyLocaleTable(descriptions, descCount);
+    const std::string fallbackDesc = table.empty() ? std::string() : ResolveOwnedLocale(table, "");
+    std::lock_guard<std::mutex> rlk(g_registryMx);
+    for (auto& m : g_siteMetas) {
+        if (m.rva == norm) {
+            m.ownerId   = selfId;
+            m.alias     = shortAlias ? shortAlias : "";
+            m.descUtf8  = fallbackDesc;
+            m.descI18n  = std::move(table);
+            m.formatter = formatterOrNull;
+            m.userData  = userData;
+            return true;
+        }
+    }
+    g_siteMetas.push_back(RegisteredSiteMeta{
+        selfId,
+        norm,
+        shortAlias ? shortAlias : "",
+        fallbackDesc,
+        std::move(table),
         formatterOrNull,
         userData
     });
@@ -554,6 +801,7 @@ void Init(std::uintptr_t exeBase,
     g_asyncChatSink = asyncChatSink;
 
     rng::SetLifecycleEventSink(&BroadcastLifecycleEvent);
+    app::SetLanguageChangedSink(&BroadcastLanguageChanged);
 
     g_hostApi.apiVersion               = kMhwRngApiVersion;
     g_hostApi.structSize               = sizeof(MhwRngHostApi);
@@ -618,6 +866,22 @@ void Init(std::uintptr_t exeBase,
     g_hostApi.GetInstancePolicy            = &rng::GetInstancePolicy;
     g_hostApi.RegisterTransparentWrapper   = &rng::RegisterTransparentWrapper;
     g_hostApi.UnregisterTransparentWrapper = &rng::UnregisterTransparentWrapper;
+
+    // v3.1 extensions
+    g_hostApi.GetLanguage                  = &MhwRng_GetLanguage;
+    g_hostApi.ExecuteCommand               = &MhwRng_ExecuteCommand;
+
+    // v3.2 extensions
+    g_hostApi.CaptureCallerRvas            = &rng::CaptureCallerRvas;
+
+    // v3.3 standardized i18n extensions
+    g_hostApi.SelectText                   = &Host_SelectText;
+    g_hostApi.RegisterPluginInfoI18n       = &Host_RegisterPluginInfoI18n;
+    g_hostApi.RegisterSubcommandI18n       = &Host_RegisterSubcommandI18n;
+    g_hostApi.RegisterSiteMetaI18n         = &Host_RegisterSiteMetaI18n;
+
+    // v3.4 subcommand Tab-completion extension
+    g_hostApi.RegisterSubcommandCompleter  = &Host_RegisterSubcommandCompleter;
 }
 
 void ShutdownAll() {
@@ -665,7 +929,7 @@ std::size_t LoadAllFromDirectory() {
     return loadedCount;
 }
 
-bool LoadOrReloadSingle(const std::string& nameOrFile, std::string& outMsgCn) {
+bool LoadOrReloadSingle(const std::string& nameOrFile, std::string& outMsg) {
     std::lock_guard<std::recursive_mutex> lk(g_lifecycleMx);
     const std::string q = LowerAscii(nameOrFile);
 
@@ -681,7 +945,7 @@ bool LoadOrReloadSingle(const std::string& nameOrFile, std::string& outMsgCn) {
         }
     }
     if (!existingSource.empty()) {
-        return LoadDllPathLifecycleLocked(existingSource, existingFile, outMsgCn);
+        return LoadDllPathLifecycleLocked(existingSource, existingFile, outMsg);
     }
 
     const std::string cands[] = {
@@ -694,15 +958,17 @@ bool LoadOrReloadSingle(const std::string& nameOrFile, std::string& outMsgCn) {
         const std::string full = g_subPluginDir + "\\" + fn;
         const DWORD attr = ::GetFileAttributesA(full.c_str());
         if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-            return LoadDllPathLifecycleLocked(full, fn, outMsgCn);
+            return LoadDllPathLifecycleLocked(full, fn, outMsg);
         }
     }
 
-    outMsgCn = u8"在 nativePC\\plugins\\mhw_rng\\ 下找不到插件 `" + nameOrFile + "`";
+    outMsg = app::IsEnglish()
+                 ? ("Plugin `" + nameOrFile + "` not found under nativePC\\plugins\\mhw_rng\\")
+                 : (u8"在 nativePC\\plugins\\mhw_rng\\ 下找不到插件 `" + nameOrFile + "`");
     return false;
 }
 
-bool UnloadSingle(const std::string& nameOrFile, std::string& outMsgCn) {
+bool UnloadSingle(const std::string& nameOrFile, std::string& outMsg) {
     std::lock_guard<std::recursive_mutex> lk(g_lifecycleMx);
     const std::string q = LowerAscii(nameOrFile);
     MhwRngPluginId targetId = 0U;
@@ -719,22 +985,29 @@ bool UnloadSingle(const std::string& nameOrFile, std::string& outMsgCn) {
             }
         }
     }
+    const bool en = app::IsEnglish();
     if (targetId != 0U) {
         UnloadByIdLifecycleLocked(targetId);
-        outMsgCn = u8"已卸载插件 `" + sname + u8"` 并清理其全部钩子与锁定";
+        outMsg = en ? ("Unloaded plugin `" + sname + "` and cleared its hooks/rules")
+                    : (u8"已卸载插件 `" + sname + u8"` 并清理其全部钩子与锁定");
         return true;
     }
-    outMsgCn = u8"未找到已加载插件 `" + nameOrFile + "`";
+    outMsg = en ? ("Loaded plugin `" + nameOrFile + "` not found")
+                : (u8"未找到已加载插件 `" + nameOrFile + "`");
     return false;
 }
 
-std::size_t ReloadAll(std::string& outMsgCn) {
+std::size_t ReloadAll(std::string& outMsg) {
     std::lock_guard<std::recursive_mutex> lk(g_lifecycleMx);
     ShutdownAll();
     const std::size_t n = LoadAllFromDirectory();
     char buf[128]{};
-    std::snprintf(buf, sizeof(buf), u8"已热重载全部 %zu 个插件", n);
-    outMsgCn = buf;
+    if (app::IsEnglish()) {
+        std::snprintf(buf, sizeof(buf), "Hot-reloaded %zu plugin(s)", n);
+    } else {
+        std::snprintf(buf, sizeof(buf), u8"已热重载全部 %zu 个插件", n);
+    }
+    outMsg = buf;
     return n;
 }
 
@@ -767,8 +1040,55 @@ bool DispatchPluginSubcommand(const std::string& subcmdLower,
                              ptrs.empty() ? nullptr : ptrs.data(),
                              rawArgsAfterSubcmd.c_str(),
                              ud)) {
-        Host_ChatPrintf(u8"[RNG] 插件执行指令 `%s` 时发生异常，已安全拦截", subcmdLower.c_str());
+        Host_ChatPrintf(app::IsEnglish()
+                            ? "[RNG] Plugin threw an exception running `%s` (safely caught)"
+                            : u8"[RNG] 插件执行指令 `%s` 时发生异常，已安全拦截",
+                        subcmdLower.c_str());
     }
+    return true;
+}
+
+bool CompletePluginSubcommand(const std::string& subcmdLower,
+                              const std::vector<std::string>& priorArgsAfterSubcmd,
+                              const std::string& currentPrefix,
+                              std::vector<std::string>& outCandidates) {
+    outCandidates.clear();
+    InFlightHostGuard guard;
+    MhwRngSubcommandCompleteFn comp = nullptr;
+    void* ud                        = nullptr;
+    {
+        std::lock_guard<std::mutex> rlk(g_registryMx);
+        for (const auto& c : g_subcmds) {
+            if (c.subcmdLower == subcmdLower && c.completer != nullptr) {
+                comp = c.completer;
+                ud   = c.completerUserData;
+                guard.Arm();
+                break;
+            }
+        }
+    }
+    if (!comp) return false;
+
+    std::vector<const char*> ptrs;
+    ptrs.reserve(priorArgsAfterSubcmd.size());
+    for (const std::string& s : priorArgsAfterSubcmd) ptrs.push_back(s.c_str());
+
+    auto sink = +[](const char* cand, void* ctx) {
+        if (!cand || cand[0] == '\0' || !ctx) return;
+        auto* vec = static_cast<std::vector<std::string>*>(ctx);
+        if (vec->size() < 512U) {
+            vec->emplace_back(cand);
+        }
+    };
+
+    InvokeCompleterSEH(comp,
+                       subcmdLower.c_str(),
+                       static_cast<int>(ptrs.size()),
+                       ptrs.empty() ? nullptr : ptrs.data(),
+                       currentPrefix.c_str(),
+                       sink,
+                       &outCandidates,
+                       ud);
     return true;
 }
 
@@ -777,6 +1097,7 @@ bool QuerySiteMeta(std::uint32_t rva, MhwRngSiteMeta* outMeta) {
     std::memset(outMeta, 0, sizeof(*outMeta));
     outMeta->rva = rva;
 
+    InFlightHostGuard guard;
     bool hasExplicit = false;
     std::string expAlias, expDesc;
     std::vector<FallbackResolver> resolvers;
@@ -786,11 +1107,14 @@ bool QuerySiteMeta(std::uint32_t rva, MhwRngSiteMeta* outMeta) {
             if (m.rva == rva) {
                 hasExplicit = true;
                 expAlias    = m.alias;
-                expDesc     = m.descUtf8;
+                expDesc     = ResolveOwnedLocale(m.descI18n, m.descUtf8);
                 break;
             }
         }
         resolvers = g_fallbackResolvers;
+        if (!resolvers.empty()) {
+            guard.Arm();
+        }
     }
 
     if (hasExplicit) {
@@ -820,12 +1144,15 @@ bool QuerySiteMeta(std::uint32_t rva, MhwRngSiteMeta* outMeta) {
     }
 
     std::snprintf(outMeta->alias, sizeof(outMeta->alias), "0x%07X", rva);
-    CopyTrunc(outMeta->description, sizeof(outMeta->description), u8"原始调用点");
+    CopyTrunc(outMeta->description,
+              sizeof(outMeta->description),
+              app::IsEnglish() ? "Raw call site" : u8"原始调用点");
     return false;
 }
 
 bool FormatSlotCustom(const MhwRngSlotSnapshot* snap, char* outBuf, std::size_t bufCap) {
     if (!snap || !outBuf || bufCap == 0U) return false;
+    InFlightHostGuard guard;
     MhwRngValueFormatterFn fn = nullptr;
     void* ud                  = nullptr;
     {
@@ -834,6 +1161,7 @@ bool FormatSlotCustom(const MhwRngSlotSnapshot* snap, char* outBuf, std::size_t 
             if (m.rva == snap->callSiteRva && m.formatter != nullptr) {
                 fn = m.formatter;
                 ud = m.userData;
+                guard.Arm();
                 break;
             }
         }
@@ -857,7 +1185,13 @@ std::vector<LoadedPluginSummary> ListLoadedPlugins() {
             if (c.ownerId == p.id) ++cmdCnt;
         }
         out.push_back(LoadedPluginSummary{
-            p.id, p.shortName, p.displayName, p.version, p.description, p.fileName, cmdCnt
+            p.id,
+            p.shortName,
+            ResolveOwnedLocale(p.displayNamesI18n, p.displayName),
+            p.version,
+            ResolveOwnedLocale(p.descriptionsI18n, p.description),
+            p.fileName,
+            cmdCnt
         });
     }
     return out;
@@ -869,7 +1203,11 @@ std::vector<SubcommandHelpEntry> ListPluginSubcommands() {
     out.reserve(g_subcmds.size());
     for (const auto& c : g_subcmds) {
         out.push_back(SubcommandHelpEntry{
-            c.ownerId, GetPluginShortName(c.ownerId), c.subcmdLower, c.usageExample, c.helpCn
+            c.ownerId,
+            GetPluginShortName(c.ownerId),
+            c.subcmdLower,
+            c.usageExample,
+            ResolveOwnedLocale(c.helpI18n, c.helpCn)
         });
     }
     return out;

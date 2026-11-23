@@ -1,6 +1,7 @@
 #include "log_config.h"
 
 #include <windows.h>
+#include <atomic>
 #include <cctype>
 #include <cstdarg>
 #include <cstdio>
@@ -11,11 +12,16 @@
 namespace app {
 namespace {
 
-FILE*       g_logFile = nullptr;
-std::mutex  g_logMx;
-std::string g_dllDir;
-std::string g_subPluginDir;
-std::once_flag g_dirOnce;
+FILE*                      g_logFile = nullptr;
+std::mutex                 g_logMx;
+std::string                g_dllDir;
+std::string                g_subPluginDir;
+std::once_flag             g_dirOnce;
+std::mutex                 g_langMx;
+char                       g_langSlots[16][16] = { "zh" };
+std::atomic<std::uint32_t> g_langSlotIdx{0U};
+std::atomic<std::uint32_t> g_langId{kMhwRngLangZh};
+std::atomic<LanguageChangedSinkFn> g_langChangedSink{nullptr};
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
@@ -61,6 +67,20 @@ int ParseVk(const std::string& raw, int defVal) {
     if (v.empty()) return defVal;
     const std::string low = ToLowerAscii(v);
     if (low == "none" || low == "off" || low == "0") return 0;
+    if (v == "`" || v == "~" || low == "tilde" || low == "grave" || low == "backtick" ||
+        low == "oem3" || low == "oem_3" || low == "vk_oem_3") {
+        return VK_OEM_3;
+    }
+    if (v == "-" || low == "minus" || low == "oem_minus" || low == "vk_oem_minus") return VK_OEM_MINUS;
+    if (v == "=" || v == "+" || low == "plus" || low == "oem_plus" || low == "vk_oem_plus") return VK_OEM_PLUS;
+    if (v == "\\" || low == "backslash" || low == "oem_5" || low == "vk_oem_5") return VK_OEM_5;
+    if (v == "/" || low == "slash" || low == "oem_2" || low == "vk_oem_2") return VK_OEM_2;
+    if (v == ";" || low == "semicolon" || low == "oem_1" || low == "vk_oem_1") return VK_OEM_1;
+    if (low == "insert" || low == "ins") return VK_INSERT;
+    if (low == "home") return VK_HOME;
+    if (low == "end") return VK_END;
+    if (low == "prior" || low == "pgup" || low == "pageup") return VK_PRIOR;
+    if (low == "next" || low == "pgdn" || low == "pagedown") return VK_NEXT;
     if (v.size() == 1) {
         const unsigned char c = static_cast<unsigned char>(v[0]);
         if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
@@ -163,7 +183,7 @@ void InitLog() {
         SYSTEMTIME st{};
         ::GetLocalTime(&st);
         std::fprintf(g_logFile,
-                     "=== MHW RNG Microkernel v3.0 (mhw_rng.dll) started %04d-%02d-%02d %02d:%02d:%02d ===\n",
+                     "=== MHW RNG Microkernel v3.3 (mhw_rng.dll) started %04d-%02d-%02d %02d:%02d:%02d ===\n",
                      st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
         std::fflush(g_logFile);
     }
@@ -215,6 +235,102 @@ bool ParseU64Auto(const char* str, std::uint64_t& outVal) noexcept {
     if (*endPtr != '\0') return false;
     outVal = static_cast<std::uint64_t>(v);
     return true;
+}
+
+bool NormalizeLanguageTag(const char* raw, char outTag[16], MhwRngLangId& outId) noexcept {
+    if (!raw || !outTag) return false;
+    outTag[0] = '\0';
+    outId = kMhwRngLangOther;
+
+    while (*raw && std::isspace(static_cast<unsigned char>(*raw))) ++raw;
+    if (*raw == '\0') return false;
+
+    std::size_t n = 0U;
+    char primary[12]{};
+    while (raw[n] != '\0' && raw[n] != '-' && raw[n] != '_' &&
+           !std::isspace(static_cast<unsigned char>(raw[n]))) {
+        const unsigned char uc = static_cast<unsigned char>(raw[n]);
+        if (!((uc >= 'a' && uc <= 'z') || (uc >= 'A' && uc <= 'Z'))) return false;
+        if (n >= 8U) return false;
+        primary[n] = (uc >= 'A' && uc <= 'Z') ? static_cast<char>(uc + ('a' - 'A')) : static_cast<char>(uc);
+        ++n;
+    }
+    if (n < 2U) return false;
+    primary[n] = '\0';
+
+    const char* canonical = primary;
+    MhwRngLangId cid = kMhwRngLangOther;
+    if (std::strcmp(primary, "zh") == 0 || std::strcmp(primary, "cn") == 0 ||
+        std::strcmp(primary, "chs") == 0 || std::strcmp(primary, "cht") == 0 ||
+        std::strcmp(primary, "chinese") == 0) {
+        canonical = "zh";
+        cid = kMhwRngLangZh;
+    } else if (std::strcmp(primary, "en") == 0 || std::strcmp(primary, "eng") == 0 ||
+               std::strcmp(primary, "english") == 0) {
+        canonical = "en";
+        cid = kMhwRngLangEn;
+    } else if (std::strcmp(primary, "ja") == 0 || std::strcmp(primary, "jp") == 0 ||
+               std::strcmp(primary, "jpn") == 0 || std::strcmp(primary, "japanese") == 0) {
+        canonical = "ja";
+        cid = kMhwRngLangJa;
+    } else if (std::strcmp(primary, "ko") == 0 || std::strcmp(primary, "kr") == 0 ||
+               std::strcmp(primary, "kor") == 0 || std::strcmp(primary, "korean") == 0) {
+        canonical = "ko";
+        cid = kMhwRngLangKo;
+    }
+
+    std::size_t i = 0U;
+    while (i + 1U < 16U && canonical[i] != '\0') {
+        outTag[i] = canonical[i];
+        ++i;
+    }
+    outTag[i] = '\0';
+    outId = cid;
+    return true;
+}
+
+void SetLanguageChangedSink(LanguageChangedSinkFn fn) noexcept {
+    g_langChangedSink.store(fn, std::memory_order_release);
+}
+
+void SetLanguage(const char* lang) noexcept {
+    char nextTag[16]{};
+    MhwRngLangId nextId = kMhwRngLangOther;
+    if (!NormalizeLanguageTag(lang, nextTag, nextId)) return;
+
+    std::uint32_t prevId = kMhwRngLangZh;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(g_langMx);
+        const std::uint32_t curIdx = g_langSlotIdx.load(std::memory_order_relaxed);
+        const char* curTag = g_langSlots[curIdx];
+        prevId = g_langId.load(std::memory_order_relaxed);
+        if (std::strcmp(curTag, nextTag) != 0 || prevId != static_cast<std::uint32_t>(nextId)) {
+            const std::uint32_t nextIdx = (curIdx + 1U) % 16U;
+            std::memcpy(g_langSlots[nextIdx], nextTag, 16U);
+            g_langId.store(static_cast<std::uint32_t>(nextId), std::memory_order_release);
+            g_langSlotIdx.store(nextIdx, std::memory_order_release);
+            changed = true;
+        }
+    }
+    if (changed) {
+        if (const auto sink = g_langChangedSink.load(std::memory_order_acquire)) {
+            sink(prevId, static_cast<std::uint32_t>(nextId));
+        }
+    }
+}
+
+const char* GetLanguage() noexcept {
+    const std::uint32_t idx = g_langSlotIdx.load(std::memory_order_acquire);
+    return g_langSlots[idx % 16U];
+}
+
+std::uint32_t GetLanguageId() noexcept {
+    return g_langId.load(std::memory_order_acquire);
+}
+
+bool IsEnglish() noexcept {
+    return g_langId.load(std::memory_order_acquire) != static_cast<std::uint32_t>(kMhwRngLangZh);
 }
 
 Config LoadConfig() {
@@ -287,17 +403,28 @@ Config LoadConfig() {
                 cfg.protectSaveSeeds = ParseBool(val, cfg.protectSaveSeeds);
             } else if (klow == "autoloadplugins") {
                 cfg.autoLoadPlugins = ParseBool(val, cfg.autoLoadPlugins);
+            } else if (klow == "consoleenabled") {
+                cfg.consoleEnabled = ParseBool(val, cfg.consoleEnabled);
             } else if (klow == "showchatfeedback") {
                 cfg.showChatFeedback = ParseBool(val, cfg.showChatFeedback);
             } else if (klow == "chatprefix" && !val.empty()) {
                 cfg.chatPrefix = val;
+            } else if (klow == "language" || klow == "lang") {
+                char normTag[16]{};
+                MhwRngLangId normId = kMhwRngLangOther;
+                if (NormalizeLanguageTag(val.c_str(), normTag, normId)) {
+                    cfg.language = normTag;
+                }
+            } else if (klow == "autoexec") {
+                cfg.autoExec = val;
             } else if (klow == "masterseed") {
                 std::uint64_t s = 0;
                 if (ParseU64Auto(val.c_str(), s)) cfg.masterSeed = s;
             }
         } else if (section == "hotkeys") {
-            if (klow == "keytoggletakeover") cfg.vkToggleTakeover = ParseVk(val, 0);
-            else if (klow == "keyresetepoch") cfg.vkResetEpoch    = ParseVk(val, 0);
+            if (klow == "keytoggleconsole")       cfg.vkToggleConsole  = ParseVk(val, VK_OEM_3);
+            else if (klow == "keytoggletakeover") cfg.vkToggleTakeover = ParseVk(val, 0);
+            else if (klow == "keyresetepoch")     cfg.vkResetEpoch     = ParseVk(val, 0);
         } else if (section == "slotoverrides") {
             // Kernel [SlotOverrides] accepts numeric RVA/VA with optional `:condId`, e.g. `0x169BA15 = fixed:0` or `0x169BA15:1 = fixed:0`
             std::string addrPart = key;
@@ -328,15 +455,35 @@ Config LoadConfig() {
     if (!hasBootMode && hasLegacyTakeover) {
         cfg.bootMode = cfg.takeoverOnBoot ? kMhwRngModeSelective : kMhwRngModeOff;
     }
-    Log("config: loaded %s (enabled=%d, bootMode=%u, protectSaveSeeds=%d, autoLoadPlugins=%d, masterSeed=0x%llX, rawRules=%zu)",
+    Log("config: loaded %s (enabled=%d, bootMode=%u, protectSaveSeeds=%d, autoLoadPlugins=%d, lang=%s, autoExec='%s', masterSeed=0x%llX, rawRules=%zu)",
         path.c_str(),
         cfg.enabled ? 1 : 0,
         static_cast<unsigned>(cfg.bootMode),
         cfg.protectSaveSeeds ? 1 : 0,
         cfg.autoLoadPlugins ? 1 : 0,
+        cfg.language.c_str(),
+        cfg.autoExec.c_str(),
         static_cast<unsigned long long>(cfg.masterSeed),
         cfg.rawSlotRules.size());
     return cfg;
 }
 
 } // namespace app
+
+MHW_RNG_API const char* MhwRng_GetLanguage() {
+    return app::GetLanguage();
+}
+
+MHW_RNG_API std::uint32_t MhwRng_GetLanguageId() {
+    return app::GetLanguageId();
+}
+
+MHW_RNG_API void MhwRng_SetLanguage(const char* lang) {
+    app::SetLanguage(lang);
+}
+
+MHW_RNG_API const char* MhwRng_SelectText(const MhwRngLocaleText* entries,
+                                          std::size_t count,
+                                          const char* fallbackText) {
+    return MhwRng_SelectTextFallback(app::GetLanguage(), entries, count, fallbackText);
+}

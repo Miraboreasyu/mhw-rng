@@ -64,22 +64,23 @@ flowchart LR
    - `$rng reset` 通过递增全局 `Epoch` 以 `O(1)` 复杂度重置所有派生流并清零本轮统计。
    - `$rng save [name]` / `$rng restore [name]` / `$rng saves` 支持保存与恢复带 `'MRSS'` 魔数与 CRC32 校验的完整内存 RNG 状态快照。
 
-5. **插件介入流水线**
-   - 支持 Push 模式条件切换（`SetActiveCondition`）、同 RVA 最多 8 个回调按 `priority` 排序的 Pre/Post Hook 链、`FilterVanilla` 原版结果后置过滤/钳位、全局通配观测器、`sChat::move` 主线程异步聊天队列以及内核生命周期事件广播。
+5. **插件介入流水线与游戏内终端**
+   - 支持 Push 模式条件切换（`SetActiveCondition`）、同 RVA 最多 8 个回调按 `priority` 排序的 Pre/Post Hook 链、`FilterVanilla` 原版结果后置过滤/钳位、`FilterSlot` 条件组、全局通配观测器、`sChat::move` 主线程异步聊天队列、内核生命周期事件广播，以及标准化的 `SelectText` / `Register*I18n` 多语言表与 `RegisterSubcommandCompleter` 多级补全。
+   - 内置游戏内 D3D11/D3D12（SDR / HDR10 / scRGB）**命令行终端叠加层**（默认快捷键 `` ` `` / `~`）：支持 UTF-8 `libreadline` 行编辑、历史记录与 `Ctrl+R` 反向搜索、多级动态 `Tab` 补全、鼠标拖拽/双击选词/三击选行与剪贴板复制；默认关闭原版聊天框回显（可通过 `$rng chat on|off` 切换）以免刷屏。
 
 ---
 
 ## 二、官方插件（支持热重载）
 
-所有子插件放置于 `nativePC\plugins\mhw_rng\*.dll`。微内核加载时会先将其影拷贝至 `.hotload\` 临时目录再调用 `LoadLibrary`，游戏运行期间源 DLL 文件不被锁定。玩家或开发者在游戏聊天框输入 `$rng load <名>`、`$rng unload <名>` 或 `$rng reload [名]` 即可完成热加载、卸载与免重启更新。
+所有子插件放置于 `nativePC\plugins\mhw_rng\*.dll`。微内核加载时会先将其影拷贝至 `.hotload\` 临时目录再调用 `LoadLibrary`，游戏运行期间源 DLL 文件不被锁定。玩家或开发者在游戏终端或聊天框输入 `$rng load <名>`、`$rng unload <名>` 或 `$rng reload [名]` 即可完成热加载、卸载与免重启更新。
 
 | 插件 | 模块产物 | 挂钩点位 (RVA) | 核心功能与典型指令 | 独立仓库与文档 |
 | :--- | :--- | :--- | :--- | :--- |
 | **`size`** | `rng_size.dll` | `0x169BA15` | 支持冰原全 71 种大型怪物按 `MonsterID` 条件控制大小金；采用安全开区间 `[0x00000001U, 0xFFFFFF00U]` 避开零权重非法行，并可读取实时 `cSizeTable` 反算指定百分比（如 `$rng size furious_rajang min`、`$rng size rajang* exact 116`） | [mhw-rng-size](https://github.com/Miraboreasyu/mhw-rng-size) \| [技术文档](plugins/size/README.md) |
 | **`endemic`** | `rng_endemic.dll` | `0x166CFE1` / `0x0672FBC` / `0x1669CB6` | 覆盖环境生物地图刷新与捕获抽签，通过调用栈过滤共享随机函数，支持小金/普通/大金档位、按 `ecXXX_YY` 物种分流以及实时查 `rAnimalSize` 反算倍率或厘米数（如 `$rng endemic max`、`$rng endemic ec059_02 exact 25.5cm`） | [mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic) \| [技术文档](plugins/endemic/README.md) |
 | **`thk`** | `rng_thk.dll` + `thk_presets\*.txt` | `0x1339C8C` | 通用 THK 随机节点探测、按怪物实例的决策与出招计数、计数门控、概率组合分枝、有序序列与热重读 `.txt` 预设；内置黑龙一阶段二足+四足全距离预设（怒前 `f=0` 与怒后 `f=4`，`$rng fatalis on` / `$rng thk probe on 91`） | [mhw-rng-thk](https://github.com/Miraboreasyu/mhw-rng-thk) \| [技术文档](plugins/thk/README.md) \| [预设语法指南](plugins/thk/PRESET_GUIDE.md) |
-| **`steam`** | `rng_steam.dll`（`1.1.0`） | `0x066679A` / `0x06667BB` / `0x05CA0A2` | 在 `ObserveOnly` 与 `Takeover` 下实时解码蒸汽机三键顺序、红槽倍率与隐藏保底，支持可选固定按键顺序（`$rng steam lock` 默认锁 `awd`）；`verbose` 默认关闭，仅在未锁序时提示键位，`$rng steam verbose on` 后播报锁序与保底详情；同时作为 SDK v3.0 官方参考示例 | [mhw-rng-steam](https://github.com/Miraboreasyu/mhw-rng-steam) \| [技术文档](plugins/steam/README.md) |
-| **`inspector`** | `rng_inspector.dll` | 无热路径 Hook | 提供 1,697 处静态调用点与 793 个外层函数区间的兜底词典、排行监控与多尺度换算锁定，可按需 `$rng unload inspector` 卸载以释放内存（常用：`$rng top`、`$rng dump`、`$rng find <kw>`、`$rng fix meal 0`） | [mhw-rng-inspector](https://github.com/Miraboreasyu/mhw-rng-inspector) \| [技术文档](plugins/inspector/README.md) |
+| **`steam`** | `rng_steam.dll`（`1.3.0`） | `0x066679A` / `0x06667BB` / `0x05CA0A2` | 在 `ObserveOnly` 与 `Takeover` 下实时解码蒸汽机三键顺序、红槽倍率与隐藏保底，支持可选固定按键顺序（`$rng steam lock` 默认锁 `awd`）；`verbose` 默认关闭，仅在未锁序时提示键位，`$rng steam verbose on` 后播报锁序与保底详情；同时作为 SDK v3 官方参考示例 | [mhw-rng-steam](https://github.com/Miraboreasyu/mhw-rng-steam) \| [技术文档](plugins/steam/README.md) |
+| **`inspector`** | `rng_inspector.dll` | 无热路径 Hook | 提供 1,697 处静态调用点与 793 个外层函数区间的双语词典、排行监控、`.pdata` 多跳调用栈与 `XMM6/7` 追踪（`$rng trace`）及多尺度换算锁定，可按需 `$rng unload inspector` 卸载以释放内存（常用：`$rng top`、`$rng dump`、`$rng find <kw>`、`$rng fix meal 0`、`$rng trace <t\|*>`） | [mhw-rng-inspector](https://github.com/Miraboreasyu/mhw-rng-inspector) \| [技术文档](plugins/inspector/README.md) |
 
 ### 安装与内核基础指令
 
@@ -89,23 +90,26 @@ flowchart LR
    - `nativePC\plugins\mhw_rng.ini`
    - `nativePC\plugins\mhw_rng\rng_size.dll`、`rng_endemic.dll`、`rng_thk.dll`、`rng_steam.dll`、`rng_inspector.dll`
    - `nativePC\plugins\mhw_rng\thk_presets\fatalis_p1_nasty.txt`
-3. **验证就绪**：进入游戏后聊天框会自动显示 `[RNG] mhw_rng v3.0 已就绪（已载入 ... 个插件 | 模式:... | 输入 $rng help）`。
+3. **验证就绪**：进入游戏后按 `` ` `` / `~` 打开内置终端窗口（或查看游戏聊天框提示）即可输入指令，终端内可省略 `$rng` 前缀。
 
 常用内核指令（可通过 `mhw_rng.ini` 中的 `ChatPrefix` 修改前缀）：
 
 | 指令 | 说明 |
 | :--- | :--- |
 | `$rng` / `$rng status` | 查看引擎状态、当前总种子、轮次、已载入插件数与激活规则 |
-| `$rng help` | 列出微内核指令及当前所有已加载插件注册的子指令 |
+| `$rng help [cmd\|plugin]` | 列出核心指令与各插件注册的分组子命令，或查看指定指令/插件用法 |
 | `$rng selective` / `$rng on` / `$rng observe` / `$rng off` | 切换按需接管（默认）/ 全局接管 / 仅观测（原版结果）/ 关闭直通 |
 | `$rng seed <u64>` / `$rng reset` | 切换 64 位总种子或按 `Epoch` 归零全部确定性随机流 |
 | `$rng save [name]` / `$rng restore [name]` / `$rng saves` | 保存、恢复或列出内存中的全表二进制 RNG 状态快照 |
-| `$rng plugins` / `load <name>` / `unload <name>` / `reload [name]` | 管理并免重启热重载子插件（无参数 `reload` 同时重读 `mhw_rng.ini`） |
+| `$rng lang [zh\|en\|...]` / `$rng chat [on\|off]` | 实时切换显示语言（同步广播给所有插件）或开关原版聊天框同步回显 |
+| `$rng exec <file> [quiet]` | 从脚本文件批量执行命令（配合 `mhw_rng.ini` 的 `AutoExec` 可开机自启） |
+| `$rng plugins` / `load` / `unload` / `reload [name\|ini]` | 管理并免重启热重载子插件（无参数 `reload` 保留运行状态并仅应用 INI 变更；`reload ini` 强制重读覆盖） |
+| `$rng rawfix` / `rawseed` / `rawseq` / `rawbypass` / `rawclear` | 无需插件即可直接按数值 RVA 锁定、设种、注入序列或直通原版 |
 | `$rng clearall` | 清空所有槽位规则并向已加载插件广播清理事件 |
 
 ---
 
-## 三、Plugin SDK v3.0 与构建指南
+## 三、Plugin SDK v3（含 v3.1–v3.4 扩展）与构建指南
 
 MIRA 通过单头文件 [include/mhw_rng_api.h](include/mhw_rng_api.h) 向所有插件提供稳定的 C ABI（`kMhwRngApiVersion == 3`），**编译插件不需要链接任何 `.lib` 导入库**。
 
@@ -113,7 +117,7 @@ MIRA 通过单头文件 [include/mhw_rng_api.h](include/mhw_rng_api.h) 向所有
 
 每个插件 DLL 仅需导出 3 个 C 函数：
 - `const MhwRngPluginDescriptor* MhwRngPlugin_GetInfo()`：声明 `targetApiVersion = kMhwRngApiVersion`、全小写唯一 `shortName`、版本与简介。
-- `bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPluginId selfId)`：保存 `host` 与 `selfId`，注册钩子、命令或站点元数据。
+- `bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPluginId selfId)`：保存 `host` 与 `selfId`，注册钩子、命令、多语言表或补全器。
 - `void MhwRngPlugin_Shutdown()`（可选）：在宿主完成回调摘除、在途调用排空、命令与规则清理后执行自有资源释放。
 
 `MhwRngHostApi` 提供的主要接口分组：
@@ -122,10 +126,10 @@ MIRA 通过单头文件 [include/mhw_rng_api.h](include/mhw_rng_api.h) 向所有
 | :--- | :--- | :--- |
 | 全局状态 | `SetEngineMode` / `GetEngineMode` / `SetMasterSeed` / `ResetEpoch` | 切换四态引擎模式、读写总种子与全局轮次 |
 | 条件与槽位规则 | `SetActiveCondition` / `SetCondMasterDerived` / `SetCondCustomSeed` / `SetCondFixedValue` / `SetCondSequence` / `SetCondBypass` / `ReleaseCondSlot` | Push 模式条件切换、按 `(rva, condId)` 写规则及回收 Tombstone 条件槽 |
-| Hook 链与观测 | `RegisterSlotHook` / `RegisterSlotHookEx` / `RegisterGlobalObserver` / `RegisterLifecycleHook` | 按优先级挂载 Pre/Post/`FilterVanilla` 回调、全游戏通配观测器与生命周期事件监听 |
-| 现场与封装展开 | `MhwRngDrawContext`（`callerRegs`、`origArg1/2`、`origMinVal/MaxVal`、`origReturnRva`）/ `RegisterTransparentWrapper` / `SetInstancePolicy` | 读取入口 8 个非易失寄存器与原入参、注册自定义栈帧展开与私有 `MtRandom` 策略 |
+| Hook 链与观测 | `RegisterSlotHook` / `RegisterSlotHookEx`（`FilterVanilla` / `FilterSlot`）/ `RegisterGlobalObserver` / `RegisterLifecycleHook` | 按优先级挂载 Pre/Post/条件过滤回调、全游戏通配观测器与生命周期事件监听 |
+| 现场、栈回溯与封装 | `MhwRngDrawContext`（`callerRegs`、`xmm6/7`、`origArg*`、`origReturnRva`）/ `CaptureCallerRvas` / `RegisterTransparentWrapper` / `SetInstancePolicy` | 读取入口寄存器与 `XMM6/7`、SEH 保护 `.pdata` 多跳调用栈采集、自定义栈帧展开与私有 `MtRandom` 策略 |
 | 快照与状态恢复 | `GetCondSlotInfo` / `SnapshotActiveSlots` / `RestoreSlotState` / `CaptureStateBlob` / `RestoreStateBlob` | 读写单槽游标状态及 CRC32 校验二进制全表快照 |
-| 聊天与元数据 | `RegisterSubcommand` / `RegisterSiteMeta` / `SetFallbackMetaResolver` / `ChatPrintAsync` / `ChatPrintfAsync` / `Log` | 统一挂载 `$rng <subcmd>`、自定义点位状态展示与跨线程主线程聊天队列输出 |
+| 聊天、多语言与补全 | `RegisterSubcommand` / `RegisterSubcommandCompleter` / `SelectText` / `Register*I18n` / `GetLanguage` / `ExecuteCommand` / `RegisterSiteMeta` / `SetFallbackMetaResolver` / `ChatPrintAsync` | 挂载 `$rng <subcmd>`、多级 `Tab` 自动补全、`active->en->zh` 本地化、命令路由与异步主线程聊天输出 |
 
 ### 2. 最小可编译插件示例
 

@@ -78,6 +78,9 @@ bool          RestoreStateBlob(const void* buf, std::uint32_t bufSize) noexcept;
 
 bool          SetInstancePolicy(std::uintptr_t instancePtr, std::uint32_t policy) noexcept;
 std::uint32_t GetInstancePolicy(std::uintptr_t instancePtr) noexcept;
+std::uint32_t __fastcall CaptureCallerRvas(const MhwRngDrawContext* ctx,
+                                           std::uint32_t* outRvas,
+                                           std::uint32_t maxDepth) noexcept;
 
 // Original trampoline setters
 void SetOrigMtRandomCtorSeed(void* fn) noexcept;

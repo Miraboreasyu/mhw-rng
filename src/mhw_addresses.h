@@ -162,16 +162,61 @@ constexpr std::size_t    kOffPlayerRootEntity  = 0x50;
 constexpr std::size_t kOffChatNetMsgType       = 0x1B;      // int8_t (1 = typed, 2/3 = manual shoutout)
 constexpr std::size_t kOffChatNetMsgText       = 0x44;      // char[128] UTF-8
 
-// ---- Input Focus Check (for optional hotkeys) ----
-constexpr std::uintptr_t kRvaSMhInputTextInstance = 0x4CB8498;
-constexpr std::size_t    kOffInputTextEditor      = 0x1D9E8;
-constexpr std::size_t    kOffMhInputTextUnfocused = 0x1DA00;
-constexpr std::size_t    kOffInputEditorState     = 0x188;
+// ---- Input Focus Check & Keyboard State Hook ----
+constexpr std::uintptr_t kRvaSMhInputTextInstance   = 0x4CB8498;
+constexpr std::size_t    kOffInputTextEditor        = 0x1D9E8;
+constexpr std::size_t    kOffMhInputTextUnfocused   = 0x1DA00;
+constexpr std::size_t    kOffInputEditorState       = 0x188;
 
-// cD3DRender::present @ 0x1423AA290 (ONLY hooked if user configures non-zero VK hotkeys in INI!)
-constexpr std::uintptr_t kRvaD3DPresent = 0x23AA290;
+// sKeyboard::move(sKeyboard* this) @ 0x1422E74F0 (16B-aligned, 5B mov [rsp+8], rbx)
+// Clears mOn..holdTimers (+0x138, 0x8C0 bytes) safely after vanilla input processing, avoiding SharpPluginLoader/mhw_hfi updateState collision.
+constexpr std::uintptr_t kRvaSKeyboardMove = 0x22E74F0;
+constexpr std::uint8_t kPrologueSKeyboardMove[5] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08
+};
+constexpr std::size_t    kOffSKeyboardStateBlock  = 0x138;
+constexpr std::size_t    kSizeSKeyboardStateBlock = 0x8C0;
+constexpr std::size_t    kOffSKeyboardOn          = 0x138;
+constexpr std::size_t    kOffSKeyboardTrg         = 0x178;
+constexpr std::size_t    kOffSKeyboardRel         = 0x198;
+constexpr std::size_t    kOffSKeyboardChg         = 0x1B8;
+constexpr std::size_t    kOffSKeyboardRep         = 0x1D8;
+
+// sAppExt & sMouse Cursor / Overlay Control (verified @ 0x1422E58E0, 0x1422E688A, 0x1422E89A0)
+constexpr std::uintptr_t kRvaSAppExtInstance        = 0x51C5320; // sAppExt*
+constexpr std::size_t    kOffAppExtCursorDirty      = 0x2C23;    // uint8_t
+constexpr std::size_t    kOffAppExtForceShowCursor  = 0x2C26;    // uint8_t (unclips & shows OS cursor)
+constexpr std::size_t    kOffAppExtOverlayActive    = 0x2CD9;    // uint8_t (mutes game kb/mouse deltas & clicks)
+constexpr std::uintptr_t kRvaSMouseInstance         = 0x51C5370; // sMouse*
+constexpr std::size_t    kOffSMouseDiscardNextDelta = 0xE0;      // uint8_t
+
+// ---- D3D11 / D3D12 / HDR Present Overlay Constants ----
+// cD3DRender::present(cD3DRender* this, UINT swapInterval, bool param_3) @ 0x1423AA290
+constexpr std::uintptr_t kRvaD3DPresent             = 0x23AA290;
 constexpr std::uint8_t kPrologueD3DPresent[5] = {
     0x48, 0x89, 0x5C, 0x24, 0x18
 };
+
+constexpr std::uintptr_t kRvaSMhRenderInstance      = 0x51C4480; // sMhRender*
+constexpr std::uintptr_t kRvaIsD3D12Byte            = 0x51CC080; // uint8_t: 0 = DX11, != 0 = DX12
+constexpr std::size_t    kOffRenderHdrOutput        = 0x21A;     // uint8_t
+constexpr std::size_t    kOffRenderHdrWhiteNits     = 0x21C;     // float
+
+// cD3DRender struct offsets (15.23)
+constexpr std::size_t kOffD3DDevice12               = 0x18;      // ID3D12Device*
+constexpr std::size_t kOffD3DCmdQueue12             = 0x20;      // ID3D12CommandQueue*
+constexpr std::size_t kOffD3DRtvDescSize12          = 0x1D8;     // uint32_t
+constexpr std::size_t kOffD3DBackBuffers12          = 0x240;     // ID3D12Resource*[3]
+constexpr std::size_t kOffD3DRtvHeap12              = 0x258;     // ID3D12DescriptorHeap*
+constexpr std::size_t kOffD3DRtvStart12             = 0x260;     // SIZE_T
+constexpr std::size_t kOffD3DFullscreenLatch        = 0x26C;     // uint8_t
+constexpr std::size_t kOffD3DDevice11               = 0x13F8;    // ID3D11Device*
+constexpr std::size_t kOffD3DContext11              = 0x1400;    // ID3D11DeviceContext*
+constexpr std::size_t kOffD3DSwapHwnd               = 0x1460;    // HWND
+constexpr std::size_t kOffD3DSwapChain12            = 0x1470;    // IDXGISwapChain3*
+constexpr std::size_t kOffD3DOccludedByte           = 0x1482;    // uint8_t
+constexpr std::size_t kOffD3DSwapChain11            = 0x1488;    // IDXGISwapChain*
+constexpr std::size_t kOffD3DSwapChainCount         = 0x14A0;    // uint32_t
+constexpr std::size_t kOffD3DPresentLock            = 0x1620;    // CRITICAL_SECTION
 
 } // namespace mhw

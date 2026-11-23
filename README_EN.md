@@ -64,8 +64,9 @@ flowchart LR
    - `$rng reset` increments the global `Epoch` to rewind all derived streams and zero per-round counters in `O(1)`.
    - `$rng save [name]` / `$rng restore [name]` / `$rng saves` capture and restore full-table binary snapshots verified with `'MRSS'` magic and CRC32.
 
-5. **Plugin Arbitration Pipeline**
-   - Push-mode condition switching (`SetActiveCondition`), prioritized multi-plugin Hook chains (up to 8 hooks per RVA), `FilterVanilla` post-draw inspection/clamping, global wildcard observers, main-thread async chat queueing via `sChat::move`, and lifecycle event broadcasts.
+5. **Plugin Arbitration Pipeline & In-Game Terminal**
+   - Push-mode condition switching (`SetActiveCondition`), prioritized multi-plugin Hook chains (up to 8 hooks per RVA), `FilterVanilla` / `FilterSlot` post-draw & slot-filtered hooks, global wildcard observers, main-thread async chat queueing via `sChat::move`, lifecycle broadcasts, standardized `SelectText` / `Register*I18n` localization, and `RegisterSubcommandCompleter` multi-level completion.
+   - Built-in D3D11/D3D12 (SDR / HDR10 / scRGB) **in-game overlay terminal window** (default hotkey `` ` `` / `~`) featuring UTF-8 `libreadline` editing, history + `Ctrl+R`, dynamic multi-level plugin `Tab` completion, mouse drag / double-click word / triple-click line selection & clipboard copy, and default-muted native chat echo (`$rng chat on|off`).
 
 ---
 
@@ -78,8 +79,8 @@ Plugins placed in `nativePC\plugins\mhw_rng\*.dll` are loaded through shadow cop
 | **`size`** | `rng_size.dll` | `0x169BA15` | Per-`MonsterID` crown and size control for all 71 large monsters; safe open interval `[0x00000001U, 0xFFFFFF00U]` skips zero-weight disabled rows; live `cSizeTable` inverse solving (`exact`). Examples: `$rng size furious_rajang min`, `$rng size rajang* exact 116` | [mhw-rng-size](https://github.com/Miraboreasyu/mhw-rng-size) \| [README](plugins/size/README.md) |
 | **`endemic`** | `rng_endemic.dll` | `0x166CFE1` / `0x0672FBC` / `0x1669CB6` | Covers both map spawn and capture size rolls, filters shared float helpers by caller return address, supports crown tiers, per-`ecXXX_YY` rules, and live `rAnimalSize` scale/cm solving. Examples: `$rng endemic max`, `$rng endemic ec059_02 exact 25.5cm` | [mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic) \| [README](plugins/endemic/README.md) |
 | **`thk`** | `rng_thk.dll` + `thk_presets\*.txt` | `0x1339C8C` | Pure-RNG THK AI node probing, per-monster move/decision counters, count-gated rules, weighted branch splits, move sequences, and hot-reloadable `.txt` presets; includes Fatalis Phase 1 bipedal + quadruped preset (`f=0,4`). Examples: `$rng fatalis on`, `$rng thk probe on 91` | [mhw-rng-thk](https://github.com/Miraboreasyu/mhw-rng-thk) \| [README](plugins/thk/README.md) \| [PRESET_GUIDE](plugins/thk/PRESET_GUIDE.md) |
-| **`steam`** | `rng_steam.dll` (`1.1.0`) | `0x066679A` / `0x06667BB` / `0x05CA0A2` | Real-time Steamworks 3-key order, red round, and hidden-pity decoding in both `ObserveOnly` and `Takeover`; optional sequence lock (bare `$rng steam lock` defaults to `awd`); default `verbose off` keeps locked rounds and pity triggers quiet (`$rng steam verbose on` enables them). Also serves as the SDK v3.0 showcase | [mhw-rng-steam](https://github.com/Miraboreasyu/mhw-rng-steam) \| [README](plugins/steam/README.md) |
-| **`inspector`** | `rng_inspector.dll` | None (zero hot-path overhead) | Static fallback dictionary of 1,697 call sites and 793 outer function ranges, live activity ranking/export, and scale-aware value injection; can be unloaded at runtime via `$rng unload inspector`. Examples: `$rng top`, `$rng dump`, `$rng fix meal 0` | [mhw-rng-inspector](https://github.com/Miraboreasyu/mhw-rng-inspector) \| [README](plugins/inspector/README.md) |
+| **`steam`** | `rng_steam.dll` (`1.3.0`) | `0x066679A` / `0x06667BB` / `0x05CA0A2` | Real-time Steamworks 3-key order, red round, and hidden-pity decoding in both `ObserveOnly` and `Takeover`; optional sequence lock (bare `$rng steam lock` defaults to `awd`); default `verbose off` keeps locked rounds and pity triggers quiet (`$rng steam verbose on` enables them). Also serves as the SDK v3 showcase | [mhw-rng-steam](https://github.com/Miraboreasyu/mhw-rng-steam) \| [README](plugins/steam/README.md) |
+| **`inspector`** | `rng_inspector.dll` | None (zero hot-path overhead) | Bilingual static fallback dictionary of 1,697 call sites and 793 outer function ranges, live activity ranking/export, `.pdata` multi-hop stack & `XMM6/7` tracer (`$rng trace`), and scale-aware value injection; unloadable via `$rng unload inspector`. Examples: `$rng top`, `$rng dump`, `$rng find <kw>`, `$rng fix meal 0`, `$rng trace <t\|*>` | [mhw-rng-inspector](https://github.com/Miraboreasyu/mhw-rng-inspector) \| [README](plugins/inspector/README.md) |
 
 ### Installation & Core Commands
 
@@ -89,23 +90,26 @@ Plugins placed in `nativePC\plugins\mhw_rng\*.dll` are loaded through shadow cop
    - `nativePC\plugins\mhw_rng.ini`
    - `nativePC\plugins\mhw_rng\rng_size.dll`, `rng_endemic.dll`, `rng_thk.dll`, `rng_steam.dll`, `rng_inspector.dll`
    - `nativePC\plugins\mhw_rng\thk_presets\fatalis_p1_nasty.txt`
-3. **Verify**: Once in-game chat initializes, MIRA posts `[RNG] mhw_rng v3.0 已就绪（...）`.
+3. **Verify**: Press `` ` `` / `~` in-game to open the overlay terminal (no `$rng` prefix needed inside it), or check the startup notice in chat.
 
 Core built-in commands (prefix configurable via `ChatPrefix` in [mhw_rng.ini](mhw_rng.ini)):
 
 | Command | Description |
 | :--- | :--- |
 | `$rng` / `$rng status` | Show engine mode, active seed, epoch, loaded plugin count, and active rules |
-| `$rng help` | List core commands and all loaded plugin subcommands |
+| `$rng help [cmd\|plugin]` | List core commands and grouped plugin subcommands, or show detailed usage |
 | `$rng selective` / `$rng on` / `$rng observe` / `$rng off` | Switch between Selective (default), full Takeover, ObserveOnly (vanilla RNG), and Off |
 | `$rng seed <u64>` / `$rng reset` | Set 64-bit master seed or reset epoch counters/streams |
 | `$rng save [name]` / `$rng restore [name]` / `$rng saves` | Capture, restore, or list in-memory RNG state snapshots |
-| `$rng plugins` / `load <name>` / `unload <name>` / `reload [name]` | Inspect, load, unload, or hot-reload plugins (bare `reload` also reloads `mhw_rng.ini`) |
+| `$rng lang [zh\|en\|...]` / `$rng chat [on\|off]` | Switch display language live (broadcast to plugins) or toggle native chat echo |
+| `$rng exec <file> [quiet]` | Execute batch commands from a script file (supports `AutoExec` in `mhw_rng.ini`) |
+| `$rng plugins` / `load <name>` / `unload <name>` / `reload [name\|ini]` | Inspect, load, unload, or hot-reload plugins (bare `reload` preserves runtime mode/seed unless INI changed; `reload ini` forces INI values) |
+| `$rng rawfix` / `rawseed` / `rawseq` / `rawbypass` / `rawclear` | Directly control raw RVAs without any plugin loaded |
 | `$rng clearall` | Clear all slot overrides and broadcast `kMhwRngEventClearAllRules` to plugins |
 
 ---
 
-## 3. Plugin SDK v3.0 & Build Guide
+## 3. Plugin SDK v3 (with v3.1–v3.4 Extensions) & Build Guide
 
 MIRA exposes a single-header C ABI via [include/mhw_rng_api.h](include/mhw_rng_api.h) (`kMhwRngApiVersion == 3`), requiring **no `.lib` import library** to compile plugins.
 
@@ -122,10 +126,10 @@ Key `MhwRngHostApi` capabilities:
 | :--- | :--- | :--- |
 | Global Control | `SetEngineMode` / `GetEngineMode` / `SetMasterSeed` / `ResetEpoch` | Control 4-state engine mode, seed, and epoch |
 | Conditions & Slots | `SetActiveCondition` / `SetCondMasterDerived` / `SetCondCustomSeed` / `SetCondFixedValue` / `SetCondSequence` / `SetCondBypass` / `ReleaseCondSlot` | Push condition routing, per-`(rva, condId)` slot configuration, and tombstone slot reclamation |
-| Hooks & Observers | `RegisterSlotHook` / `RegisterSlotHookEx` / `RegisterGlobalObserver` / `RegisterLifecycleHook` | Prioritized Pre/Post/`FilterVanilla` hook chains, wildcard observers, and lifecycle notifications |
-| Context & Wrappers | `MhwRngDrawContext` (`callerRegs`, `origArg1/2`, `origMinVal/MaxVal`, `origReturnRva`) / `RegisterTransparentWrapper` / `SetInstancePolicy` | Read preserved entry GPRs and original arguments, unwrap custom wrappers, and configure private `MtRandom` policy |
+| Hooks & Observers | `RegisterSlotHook` / `RegisterSlotHookEx` (`FilterVanilla` / `FilterSlot`) / `RegisterGlobalObserver` / `RegisterLifecycleHook` | Prioritized Pre/Post/filter hook chains, wildcard observers, and lifecycle notifications |
+| Context, Unwind & Wrappers | `MhwRngDrawContext` (`callerRegs`, `xmm6/7`, `origArg*`, `origReturnRva`) / `CaptureCallerRvas` / `RegisterTransparentWrapper` / `SetInstancePolicy` | Read preserved entry GPRs & `XMM6/7`, SEH `.pdata` caller stack unwinding, custom wrapper unwrapping, and private `MtRandom` policy |
 | Snapshots | `GetCondSlotInfo` / `SnapshotActiveSlots` / `RestoreSlotState` / `CaptureStateBlob` / `RestoreStateBlob` | Inspect slot state or capture/restore CRC32-checked binary blobs |
-| Chat & Metadata | `RegisterSubcommand` / `RegisterSiteMeta` / `SetFallbackMetaResolver` / `ChatPrintAsync` / `ChatPrintfAsync` / `Log` | Register `$rng <subcmd>` handlers, format site telemetry, and emit thread-safe async chat notices |
+| Chat, i18n & Completion | `RegisterSubcommand` / `RegisterSubcommandCompleter` / `SelectText` / `Register*I18n` / `GetLanguage` / `ExecuteCommand` / `RegisterSiteMeta` / `SetFallbackMetaResolver` / `ChatPrintAsync` | Register `$rng <subcmd>` handlers, multi-level Tab completion, `active->en->zh` localization, command routing, and thread-safe async chat notices |
 
 ### 2. Minimal Plugin Example
 

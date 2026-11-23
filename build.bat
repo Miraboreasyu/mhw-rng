@@ -50,6 +50,9 @@ cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
     /D "WIN32" /D "NDEBUG" /D "_WINDOWS" /D "_USRDLL" /D "NOMINMAX" /D "MHW_RNG_EXPORTS" ^
     /utf-8 ^
     /I "%SRCDIR%" /I "%INCDIR%" ^
+    "%SRCDIR%\command_router.cpp" ^
+    "%SRCDIR%\console_core.cpp" ^
+    "%SRCDIR%\console_overlay.cpp" ^
     "%SRCDIR%\dllmain.cpp" ^
     "%SRCDIR%\hook.cpp" ^
     "%SRCDIR%\log_config.cpp" ^
@@ -59,7 +62,7 @@ cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
     /Fe:"%OUTDIR%\mhw_rng.dll" ^
     /Fo:"%OUTDIR%\\" ^
     /LD ^
-    /link kernel32.lib user32.lib /OPT:REF /OPT:ICF ^
+    /link kernel32.lib user32.lib gdi32.lib /OPT:REF /OPT:ICF ^
     /OUT:"%OUTDIR%\mhw_rng.dll"
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
@@ -111,6 +114,10 @@ if %ERRORLEVEL% NEQ 0 exit /b 1
 echo.
 echo ===== [5/6] Building Plugin: rng_thk.dll =====
 if exist "%PLUGOUT%\rng_fatalis.dll" del /f /q "%PLUGOUT%\rng_fatalis.dll" >nul 2>&1
+if exist "%PLUGOUT%\rng_fatalis.exp" del /f /q "%PLUGOUT%\rng_fatalis.exp" >nul 2>&1
+if exist "%PLUGOUT%\rng_fatalis.lib" del /f /q "%PLUGOUT%\rng_fatalis.lib" >nul 2>&1
+if exist "%OUTDIR%\fatalis_plugin.obj" del /f /q "%OUTDIR%\fatalis_plugin.obj" >nul 2>&1
+if exist "%OUTDIR%\rng_catalog.obj" del /f /q "%OUTDIR%\rng_catalog.obj" >nul 2>&1
 cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
     /W4 /WX- /EHsc /MT ^
     /D "WIN32" /D "NDEBUG" /D "_WINDOWS" /D "_USRDLL" /D "NOMINMAX" ^

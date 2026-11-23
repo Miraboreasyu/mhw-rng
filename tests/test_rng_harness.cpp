@@ -14,6 +14,8 @@
 #ifndef MHW_RNG_EXPORTS
 #define MHW_RNG_EXPORTS
 #endif
+#include "command_router.h"
+#include "console_core.h"
 #include "hook.h"
 #include "log_config.h"
 #include "mhw_addresses.h"
@@ -2295,6 +2297,1222 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::printf("[OK] Selective mode + ProtectSaveSeeds verified on real MHW 15.23 `FUN_14135d9a0`!\n");
+    }
+
+    // 14. Verify `cmd_router`: `lang zh|en` across core + all 5 plugins, `rawseq`, `reload` state preservation & INI delta detection, and `exec` + recursion guard
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        std::string tmpMsg;
+        if (!plugin_host::LoadOrReloadSingle("inspector", tmpMsg)) {
+            std::printf("FAIL [CmdRouter-1]: failed to reload inspector: %s\n", tmpMsg.c_str());
+            return 1;
+        }
+        host->SetEngineMode(kMhwRngModeTakeover);
+        host->ClearAllRules();
+        g_capturedChatLines.clear();
+
+        cmd_router::Init(&cfg, &CaptureChatSink);
+
+        // (a) Language toggle `en` <-> `zh` across core + all 5 plugins (+ direct C export check)
+        if (!MhwRng_ExecuteCommand("lang en") ||
+            std::strcmp(MhwRng_GetLanguage(), "en") != 0 || !app::IsEnglish()) {
+            std::printf("FAIL [CmdRouter-2a]: `MhwRng_ExecuteCommand(\"lang en\")` failed!\n");
+            return 1;
+        }
+        g_capturedChatLines.clear();
+        cmd_router::HandleCommandLine("$rng status", true);
+        const bool hasEngStatus = !g_capturedChatLines.empty() &&
+                                  g_capturedChatLines[0].find("Mode:") != std::string::npos;
+        cmd_router::HandleCommandLine("$rng size help", true);
+        cmd_router::HandleCommandLine("$rng endemic help", true);
+        cmd_router::HandleCommandLine("$rng steam help", true);
+        cmd_router::HandleCommandLine("$rng thk help", true);
+        cmd_router::HandleCommandLine("$rng names", true);
+        const bool hasEngNames = !g_capturedChatLines.empty() &&
+                                 g_capturedChatLines.back().find("Boss AI:") != std::string::npos;
+        if (!hasEngStatus || !hasEngNames) {
+            std::printf("FAIL [CmdRouter-2b]: English output missing after `$rng lang en`!\n");
+            return 1;
+        }
+
+        if (!MhwRng_ExecuteCommand("lang zh") ||
+            std::strcmp(MhwRng_GetLanguage(), "zh") != 0 || app::IsEnglish()) {
+            std::printf("FAIL [CmdRouter-2c]: `MhwRng_ExecuteCommand(\"lang zh\")` failed!\n");
+            return 1;
+        }
+
+        // (b) `$rng rawseq` + `rawclear`
+        if (!cmd_router::HandleCommandLine("$rng rawseq 0x05000600 10,20,30 hold", true)) {
+            std::printf("FAIL [CmdRouter-3a]: `$rng rawseq` failed!\n");
+            return 1;
+        }
+        MhwRngSlotSnapshot rsSnap{};
+        if (!host->GetCondSlotInfo(0x05000600U, 0U, &rsSnap) ||
+            rsSnap.mode != kMhwRngSlotSequence || rsSnap.seqLength != 3U ||
+            rsSnap.seqEndPolicy != kMhwRngSeqHoldLast) {
+            std::printf("FAIL [CmdRouter-3b]: rawseq slot mismatch (mode=%u len=%u pol=%u)\n",
+                        rsSnap.mode, rsSnap.seqLength, rsSnap.seqEndPolicy);
+            return 1;
+        }
+        if (!cmd_router::HandleCommandLine("$rng rawclear 0x05000600", true) ||
+            !host->GetCondSlotInfo(0x05000600U, 0U, &rsSnap) ||
+            rsSnap.mode != kMhwRngSlotMasterDerived) {
+            std::printf("FAIL [CmdRouter-3c]: `$rng rawclear` failed!\n");
+            return 1;
+        }
+
+        // (c) `$rng reload` runtime preservation + AutoExec + INI delta override + `$rng exec` (>200B line & recursion limit)
+        const std::string testIniPath  = app::IniPath();
+        const std::string autoExecFile = plugDir + "\\_test_autoexec.txt";
+        const std::string longExecFile = plugDir + "\\_test_exec_long.txt";
+        const std::string subExecFile  = plugDir + "\\_test_exec_sub.txt";
+        const std::string loopExecFile = plugDir + "\\_test_exec_loop.txt";
+
+        bool hadOrigIni = false;
+        std::string origIniContent;
+        {
+            FILE* fOld = nullptr;
+            if (fopen_s(&fOld, testIniPath.c_str(), "rb") == 0 && fOld) {
+                hadOrigIni = true;
+                char buf[4096]{};
+                std::size_t n = 0;
+                while ((n = std::fread(buf, 1, sizeof(buf), fOld)) > 0) origIniContent.append(buf, n);
+                std::fclose(fOld);
+            }
+        }
+
+        auto writeTextFile = [](const std::string& p, const std::string& body) -> bool {
+            FILE* f = nullptr;
+            if (fopen_s(&f, p.c_str(), "wb") != 0 || !f) return false;
+            std::fwrite(body.data(), 1, body.size(), f);
+            std::fclose(f);
+            return true;
+        };
+
+        if (!writeTextFile(autoExecFile,
+                           "# autoexec comment\r\n"
+                           "rawseq 0x05000610 42 hold\r\n")) {
+            std::printf("FAIL [CmdRouter-4]: could not write temp autoexec file\n");
+            return 1;
+        }
+        if (!writeTextFile(testIniPath,
+                           "[General]\r\n"
+                           "Enabled=1\r\n"
+                           "BootMode=Selective\r\n"
+                           "MasterSeed=12345\r\n"
+                           "Language=zh\r\n"
+                           "AutoExec=_test_autoexec.txt\r\n")) {
+            std::printf("FAIL [CmdRouter-4]: could not write temp ini file\n");
+            return 1;
+        }
+        cfg = app::LoadConfig();
+        host->SetEngineMode(kMhwRngModeObserveOnly);
+        MhwRng_SetMasterSeed(777888999ULL, false);
+
+        // Reload with UNCHANGED INI: must preserve ObserveOnly + 777888999 and run AutoExec!
+        cmd_router::HandleCommandLine("$rng reload", true);
+        MhwRngSlotSnapshot aeSnap{};
+        if (host->GetEngineMode() != kMhwRngModeObserveOnly ||
+            host->GetMasterSeed() != 777888999ULL ||
+            !host->GetCondSlotInfo(0x05000610U, 0U, &aeSnap) ||
+            aeSnap.mode != kMhwRngSlotSequence || aeSnap.seqLength != 1U) {
+            std::printf("FAIL [CmdRouter-4b]: `$rng reload` did not preserve runtime mode/seed or failed AutoExec (mode=%u seed=%llu)\n",
+                        host->GetEngineMode(), static_cast<unsigned long long>(host->GetMasterSeed()));
+            return 1;
+        }
+
+        // Edit INI BootMode & MasterSeed -> `$rng reload` must pick up the delta!
+        writeTextFile(testIniPath,
+                      "[General]\r\n"
+                      "Enabled=1\r\n"
+                      "BootMode=Takeover\r\n"
+                      "MasterSeed=555666777\r\n"
+                      "Language=zh\r\n"
+                      "AutoExec=\r\n");
+        cmd_router::HandleCommandLine("$rng reload", true);
+        if (host->GetEngineMode() != kMhwRngModeTakeover ||
+            host->GetMasterSeed() != 555666777ULL) {
+            std::printf("FAIL [CmdRouter-4c]: `$rng reload` did not apply INI delta (mode=%u seed=%llu)\n",
+                        host->GetEngineMode(), static_cast<unsigned long long>(host->GetMasterSeed()));
+            return 1;
+        }
+        // Verify `$rng reload ini` forces re-applying INI even over changed runtime mode/seed
+        host->SetEngineMode(kMhwRngModeObserveOnly);
+        MhwRng_SetMasterSeed(111222333ULL, false);
+        cmd_router::HandleCommandLine("$rng reload ini", true);
+        if (host->GetEngineMode() != kMhwRngModeTakeover ||
+            host->GetMasterSeed() != 555666777ULL) {
+            std::printf("FAIL [CmdRouter-4d]: `$rng reload ini` did not force INI values (mode=%u seed=%llu)\n",
+                        host->GetEngineMode(), static_cast<unsigned long long>(host->GetMasterSeed()));
+            return 1;
+        }
+
+        // Long (>200B) line + BOM + `.txt` extension fallback + recursion guard (>4 depth)
+        std::string longSeqCmd = "rawseq 0x05000620 ";
+        for (int i = 1; i <= 60; ++i) {
+            if (i > 1) longSeqCmd += ",";
+            longSeqCmd += std::to_string(i);
+        }
+        longSeqCmd += " loop";
+        std::string longScript("\xEF\xBB\xBF", 3);
+        longScript += "; semicolon comment\r\n// slash comment\r\n# hash comment\r\n";
+        longScript += longSeqCmd + "\r\n";
+        longScript += "$rng exec _test_exec_sub\r\n";
+        writeTextFile(longExecFile, longScript);
+        writeTextFile(subExecFile, "exec _test_exec_loop\r\n");
+        writeTextFile(loopExecFile, "exec _test_exec_loop quiet\r\n");
+
+        if (!cmd_router::HandleCommandLine("$rng exec _test_exec_long", true)) {
+            std::printf("FAIL [CmdRouter-5a]: `$rng exec` failed on valid script!\n");
+            return 1;
+        }
+        MhwRngSlotSnapshot longSnap{};
+        if (!host->GetCondSlotInfo(0x05000620U, 0U, &longSnap) ||
+            longSnap.mode != kMhwRngSlotSequence || longSnap.seqLength != 60U) {
+            std::printf("FAIL [CmdRouter-5b]: >200B script line truncated or failed (len=%u)!\n", longSnap.seqLength);
+            return 1;
+        }
+
+        ::DeleteFileA(autoExecFile.c_str());
+        ::DeleteFileA(longExecFile.c_str());
+        ::DeleteFileA(subExecFile.c_str());
+        ::DeleteFileA(loopExecFile.c_str());
+        ::DeleteFileA(dumpPath.c_str());
+        if (hadOrigIni) writeTextFile(testIniPath, origIniContent);
+        else ::DeleteFileA(testIniPath.c_str());
+        cmd_router::ResetSnapshots();
+        host->ClearAllRules();
+        MhwRng_SetMasterSeed(20261122ULL, true);
+        std::printf("[OK] cmd_router (`lang zh|en`, `rawseq`, `reload` preservation + delta, `exec` >200B & recursion guard) verified!\n");
+    }
+
+    // 15. Verify Builtin Transparent Wrapper Unwrapping (`0x0672FBC` [10qw], `0x02CAB1E` [6qw], `0x02CD9D1` [8qw])
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        constexpr MhwRngPluginId kTestPluginId = 999U;
+        host->SetEngineMode(kMhwRngModeTakeover);
+        host->ClearAllRules();
+
+        // Emit three 14-byte outer call sites (`sub rsp,28h; call rel32; add rsp,28h; ret`) at `base + 0x05000700/20/40`
+        std::uint8_t* wrapCallers = img + 0x05000700ULL;
+        std::uint32_t retRvas[3]{};
+        const std::uint32_t targetWrapRvas[3] = {0x0672F90U, 0x02CAAF0U, 0x02CD9B0U};
+        const std::uint32_t expectedWrapRet[3] = {0x0672FBCU, 0x02CAB1EU, 0x02CD9D1U};
+        for (int i = 0; i < 3; ++i) {
+            std::uint8_t* p = wrapCallers + i * 0x20U;
+            // 48 83 EC 28 | E8 rel32 | 48 83 C4 28 C3 (`call` at +4 -> ret at +9)
+            p[0] = 0x48; p[1] = 0x83; p[2] = 0xEC; p[3] = 0x28;
+            p[4] = 0xE8;
+            const std::uintptr_t nextPc = reinterpret_cast<std::uintptr_t>(p + 9);
+            const std::uintptr_t dstPc  = base + targetWrapRvas[i];
+            const std::int32_t rel = static_cast<std::int32_t>(static_cast<std::intptr_t>(dstPc) - static_cast<std::intptr_t>(nextPc));
+            std::memcpy(p + 5, &rel, sizeof(rel));
+            p[9] = 0x48; p[10] = 0x83; p[11] = 0xC4; p[12] = 0x28; p[13] = 0xC3;
+            retRvas[i] = static_cast<std::uint32_t>(0x05000700U + i * 0x20U + 9U);
+        }
+        ::FlushInstructionCache(::GetCurrentProcess(), wrapCallers, 0x80U);
+
+        struct BuiltinWrapObs {
+            std::uint32_t gotCallRva = 0U;
+            std::uint32_t gotOrigRet = 0U;
+        } bwObs{};
+        const MhwRngHookHandle hBw = host->RegisterGlobalObserver(
+            kTestPluginId, 0U, (1U << kMhwRngSrcMtNrandGlobal),
+            +[](const MhwRngDrawContext* ctx, void* ud) {
+                auto* o = static_cast<BuiltinWrapObs*>(ud);
+                o->gotCallRva = ctx->callSiteRva;
+                o->gotOrigRet = ctx->origReturnRva;
+            },
+            &bwObs);
+
+        // Call #1: `0x0672F90` (`ret 0x0672FBC`, 10 qwords) -> `float(float min, float max)`
+        bwObs = {};
+        (void)reinterpret_cast<float(__fastcall*)(float, float)>(wrapCallers + 0x00U)(10.0f, 20.0f);
+        if (bwObs.gotCallRva != retRvas[0] || bwObs.gotOrigRet != expectedWrapRet[0]) {
+            std::printf("FAIL [Wrapper-1 0x0672FBC]: gotCall=0x%X (exp 0x%X) origRet=0x%X (exp 0x%X)\n",
+                        bwObs.gotCallRva, retRvas[0], bwObs.gotOrigRet, expectedWrapRet[0]);
+            return 1;
+        }
+
+        // Call #2: `0x02CAAF0` (`ret 0x02CAB1E`, 6 qwords) -> `int(int min, int max)`
+        bwObs = {};
+        const int rInt = reinterpret_cast<int(__fastcall*)(int, int)>(wrapCallers + 0x20U)(10, 20);
+        if (bwObs.gotCallRva != retRvas[1] || bwObs.gotOrigRet != expectedWrapRet[1] || rInt < 10 || rInt > 20) {
+            std::printf("FAIL [Wrapper-2 0x02CAB1E]: gotCall=0x%X (exp 0x%X) origRet=0x%X (exp 0x%X) r=%d\n",
+                        bwObs.gotCallRva, retRvas[1], bwObs.gotOrigRet, expectedWrapRet[1], rInt);
+            return 1;
+        }
+
+        // Call #3: `0x02CD9B0` (`ret 0x02CD9D1`, 8 qwords) -> `float/bool(void*, float pct)`
+        bwObs = {};
+        (void)reinterpret_cast<std::uint32_t(__fastcall*)(void*, float)>(wrapCallers + 0x40U)(nullptr, 50.0f);
+        if (bwObs.gotCallRva != retRvas[2] || bwObs.gotOrigRet != expectedWrapRet[2]) {
+            std::printf("FAIL [Wrapper-3 0x02CD9D1]: gotCall=0x%X (exp 0x%X) origRet=0x%X (exp 0x%X)\n",
+                        bwObs.gotCallRva, retRvas[2], bwObs.gotOrigRet, expectedWrapRet[2]);
+            return 1;
+        }
+
+        host->UnregisterGlobalObserver(kTestPluginId, hBw);
+        std::printf("[OK] Builtin transparent wrappers (0x0672FBC/10qw, 0x02CAB1E/6qw, 0x02CD9D1/8qw) verified!\n");
+    }
+
+    // 16. Verify `SetInstancePolicy` on Real `0x142A74400` (`mt19937_heap_init`) & `0x142A744B0` (`mt19937_heap_draw`)
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        constexpr MhwRngPluginId kTestPluginId = 999U;
+        using HeapInitFn = void(__fastcall*)(void* state, std::uint32_t seed);
+        using HeapDrawFn = std::uint32_t(__fastcall*)(void* state);
+
+        // Emit two 14-byte in-module call stubs (`sub rsp,28h; call rel32; add rsp,28h; ret`)
+        // at `base + 0x05000780` (calling heap_init, ret RVA `0x05000789`)
+        // and `base + 0x050007A0` (calling heap_draw, ret RVA `0x050007A9`).
+        auto emitCallStub = [&](std::uint32_t stubRva, std::uintptr_t targetRva) -> std::uintptr_t {
+            std::uint8_t* p = img + stubRva;
+            p[0] = 0x48; p[1] = 0x83; p[2] = 0xEC; p[3] = 0x28;
+            p[4] = 0xE8;
+            const std::uintptr_t nextPc = reinterpret_cast<std::uintptr_t>(p + 9);
+            const std::uintptr_t dstPc  = base + targetRva;
+            const std::int32_t rel = static_cast<std::int32_t>(static_cast<std::intptr_t>(dstPc) - static_cast<std::intptr_t>(nextPc));
+            std::memcpy(p + 5, &rel, sizeof(rel));
+            p[9] = 0x48; p[10] = 0x83; p[11] = 0xC4; p[12] = 0x28; p[13] = 0xC3;
+            ::FlushInstructionCache(::GetCurrentProcess(), p, 14U);
+            return reinterpret_cast<std::uintptr_t>(p);
+        };
+        const auto fnHeapInitStub = reinterpret_cast<HeapInitFn>(emitCallStub(0x05000780U, mhw::kRvaMt19937HeapInit));
+        const auto fnHeapDrawStub = reinterpret_cast<HeapDrawFn>(emitCallStub(0x050007A0U, mhw::kRvaMt19937HeapDraw));
+        constexpr std::uint32_t kHeapInitRetRva = 0x05000789U;
+
+        alignas(16) std::vector<std::uint32_t> bufRef(624U, 0U);
+        alignas(16) std::uint8_t stateRef[0x20]{};
+        *reinterpret_cast<void**>(stateRef + 8) = bufRef.data();
+
+        alignas(16) std::vector<std::uint32_t> bufTest(624U, 0U);
+        alignas(16) std::uint8_t stateTest[0x20]{};
+        *reinterpret_cast<void**>(stateTest + 8) = bufTest.data();
+
+        // Capture pure vanilla MT19937 draws in `Off` mode with seed 0x1234ABCDU
+        host->SetEngineMode(kMhwRngModeOff);
+        fnHeapInitStub(stateRef, 0x1234ABCDU);
+        std::uint32_t expHeap[6]{};
+        for (int i = 0; i < 6; ++i) expHeap[i] = fnHeapDrawStub(stateRef);
+
+        // Now switch to `Takeover` and explicitly override `kHeapInitRetRva` -> `0x1234ABCDU`
+        // so `HookImpl_Mt19937HeapInit` tags `stateTest` via `TagExplicitlySeededInstance`!
+        host->SetEngineMode(kMhwRngModeTakeover);
+        host->SetCondFixedValue(kTestPluginId, kHeapInitRetRva, 0U, 0x1234ABCDU);
+        fnHeapInitStub(stateTest, 0x99999999U);
+
+        // Auto mode on explicitly seeded MT19937 heap must follow its own state (matches vanilla 0, 1)
+        const std::uint32_t gotAuto0 = fnHeapDrawStub(stateTest);
+        const std::uint32_t gotAuto1 = fnHeapDrawStub(stateTest);
+
+        // ForceSlotControl switches `stateTest` to MIRA slot-controlled output (differs from expHeap[2])
+        host->SetInstancePolicy(reinterpret_cast<std::uintptr_t>(stateTest), kMhwRngInstForceSlotControl);
+        const std::uint32_t gotForced = fnHeapDrawStub(stateTest);
+
+        // Restore FollowOwnState / Auto: note vanilla index did NOT advance during `ForceSlotControl`, so next own draw is `expHeap[2]`!
+        host->SetInstancePolicy(reinterpret_cast<std::uintptr_t>(stateTest), kMhwRngInstFollowOwnState);
+        const std::uint32_t gotOwn2 = fnHeapDrawStub(stateTest);
+        host->SetInstancePolicy(reinterpret_cast<std::uintptr_t>(stateTest), kMhwRngInstAuto);
+        const std::uint32_t gotOwn3 = fnHeapDrawStub(stateTest);
+
+        host->ClearSlotAllConditions(kHeapInitRetRva);
+
+        if (gotAuto0 != expHeap[0] || gotAuto1 != expHeap[1] ||
+            gotForced == expHeap[2] || gotOwn2 != expHeap[2] || gotOwn3 != expHeap[3]) {
+            std::printf("FAIL [HeapMT-Policy]: auto=[%X,%X](exp %X,%X) forced=%X(vs %X) own=[%X,%X](exp %X,%X)\n",
+                        gotAuto0, gotAuto1, expHeap[0], expHeap[1],
+                        gotForced, expHeap[2], gotOwn2, gotOwn3, expHeap[2], expHeap[3]);
+            return 1;
+        }
+        std::printf("[OK] MT19937 heap `SetInstancePolicy` (Auto / ForceSlotControl / FollowOwnState) verified on 0x142A74400/B0!\n");
+    }
+
+    // 17. Verify Concurrent Hot-Reload + `SetMasterSeed` / `QuerySiteMeta` / `FormatSlotCustom` Drain Safety
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        std::atomic<bool> stopStress{false};
+        std::atomic<std::uint64_t> metaCalls{0};
+        std::vector<std::thread> stressWorkers;
+        for (int t = 0; t < 4; ++t) {
+            stressWorkers.emplace_back([&, t]() {
+                std::uint64_t iter = 0;
+                while (!stopStress.load(std::memory_order_relaxed)) {
+                    MhwRngSiteMeta meta{};
+                    host->QuerySiteMeta(0x0133A876U, &meta);
+                    MhwRngSlotSnapshot snap{};
+                    snap.callSiteRva   = 0x00666795U;
+                    snap.mode          = kMhwRngSlotMasterDerived;
+                    snap.hasPluginHook = 1U;
+                    char fmtBuf[128]{};
+                    host->FormatSlotCustom(&snap, fmtBuf, sizeof(fmtBuf));
+                    if (t == 0 && (iter % 16ULL) == 0ULL) {
+                        MhwRng_SetMasterSeed(20261122ULL + iter, false);
+                    }
+                    ++iter;
+                    metaCalls.fetch_add(1ULL, std::memory_order_relaxed);
+                }
+            });
+        }
+
+        for (int r = 0; r < 10; ++r) {
+            std::string rmsg;
+            if (!plugin_host::LoadOrReloadSingle((r % 2 == 0) ? "steam" : "inspector", rmsg)) {
+                stopStress.store(true, std::memory_order_relaxed);
+                for (auto& w : stressWorkers) w.join();
+                std::printf("FAIL [ConcurrentReload]: reload failed at iter %d: %s\n", r, rmsg.c_str());
+                return 1;
+            }
+            ::Sleep(2);
+        }
+
+        stopStress.store(true, std::memory_order_relaxed);
+        for (auto& w : stressWorkers) w.join();
+        if (metaCalls.load() == 0ULL) {
+            std::printf("FAIL [ConcurrentReload]: zero worker iterations\n");
+            return 1;
+        }
+        std::printf("[OK] Concurrent hot-reload (10 cycles) + 4-thread HostApi drain (%llu calls) verified!\n",
+                    static_cast<unsigned long long>(metaCalls.load()));
+    }
+
+    // 18. Verify Multi-Plugin Chained `FilterVanilla` & `FilterSlot` (`Takeover` / `Sequence` / `Selective` / `Pre+FilterSlot`)
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        constexpr MhwRngPluginId kTestPluginId = 999U;
+        host->SetEngineMode(kMhwRngModeTakeover);
+        host->ClearAllRules();
+
+        auto emitCallStub18 = [&](std::uint32_t stubRva, std::uintptr_t targetRva) -> std::uintptr_t {
+            std::uint8_t* p = img + stubRva;
+            p[0] = 0x48; p[1] = 0x83; p[2] = 0xEC; p[3] = 0x28;
+            p[4] = 0xE8;
+            const std::uintptr_t nextPc = reinterpret_cast<std::uintptr_t>(p + 9);
+            const std::uintptr_t dstPc  = base + targetRva;
+            const std::int32_t rel = static_cast<std::int32_t>(static_cast<std::intptr_t>(dstPc) - static_cast<std::intptr_t>(nextPc));
+            std::memcpy(p + 5, &rel, sizeof(rel));
+            p[9] = 0x48; p[10] = 0x83; p[11] = 0xC4; p[12] = 0x28; p[13] = 0xC3;
+            ::FlushInstructionCache(::GetCurrentProcess(), p, 14U);
+            return reinterpret_cast<std::uintptr_t>(p);
+        };
+
+        const auto fnStubVanilla = reinterpret_cast<TestNrandFn>(emitCallStub18(0x05000800U, mhw::kRvaMtRandomNrand));
+        const auto fnStubSlot    = reinterpret_cast<TestNrandFn>(emitCallStub18(0x05000820U, mhw::kRvaMtRandomNrand));
+        constexpr std::uint32_t kRvaFilterVanilla = 0x05000809U;
+        constexpr std::uint32_t kRvaFilterSlot    = 0x05000829U;
+
+        // (a) Chained FilterVanilla: priority -10 sets 100U, priority +10 adds +23U -> 123U; read-only Post sees 123U!
+        struct FvChainState {
+            int aCalls = 0, bCalls = 0, cCalls = 0;
+            bool flagsOk = true;
+            std::uint32_t cFinal = 0U;
+        } fvSt{};
+
+        MhwRngHookDesc fvA{};
+        fvA.structSize = sizeof(fvA);
+        fvA.rva        = kRvaFilterVanilla;
+        fvA.priority   = -10;
+        fvA.flags      = kMhwRngHookFilterVanilla;
+        fvA.userData   = &fvSt;
+        fvA.postFn     = +[](const MhwRngDrawContext* ctx, MhwRngHookDecision* dec, void* ud) {
+            auto* s = static_cast<FvChainState*>(ud);
+            ++s->aCalls;
+            if ((ctx->callFlags & (kMhwRngDrawFlagPostDraw | kMhwRngDrawFlagCanModify | kMhwRngDrawFlagHasVanilla)) !=
+                (kMhwRngDrawFlagPostDraw | kMhwRngDrawFlagCanModify | kMhwRngDrawFlagHasVanilla)) {
+                s->flagsOk = false;
+            }
+            dec->action = kMhwRngActionReturnValue;
+            dec->value0 = 100U;
+        };
+
+        MhwRngHookDesc fvB{};
+        fvB.structSize = sizeof(fvB);
+        fvB.rva        = kRvaFilterVanilla;
+        fvB.priority   = 10;
+        fvB.flags      = kMhwRngHookFilterVanilla;
+        fvB.userData   = &fvSt;
+        fvB.postFn     = +[](const MhwRngDrawContext* ctx, MhwRngHookDecision* dec, void* ud) {
+            auto* s = static_cast<FvChainState*>(ud);
+            ++s->bCalls;
+            if ((ctx->callFlags & kMhwRngDrawFlagCanModify) == 0U || ctx->finalValue0 != 100U) {
+                s->flagsOk = false;
+            }
+            dec->action = kMhwRngActionReturnValue;
+            dec->value0 = ctx->finalValue0 + 23U;
+        };
+
+        MhwRngHookDesc fvPost{};
+        fvPost.structSize = sizeof(fvPost);
+        fvPost.rva        = kRvaFilterVanilla;
+        fvPost.priority   = 20;
+        fvPost.flags      = kMhwRngHookPost;
+        fvPost.userData   = &fvSt;
+        fvPost.postFn     = +[](const MhwRngDrawContext* ctx, MhwRngHookDecision*, void* ud) {
+            auto* s = static_cast<FvChainState*>(ud);
+            ++s->cCalls;
+            if ((ctx->callFlags & kMhwRngDrawFlagCanModify) != 0U) s->flagsOk = false;
+            s->cFinal = ctx->finalValue0;
+        };
+
+        const MhwRngHookHandle hFvA = host->RegisterSlotHookEx(kTestPluginId, &fvA);
+        const MhwRngHookHandle hFvB = host->RegisterSlotHookEx(kTestPluginId, &fvB);
+        const MhwRngHookHandle hFvC = host->RegisterSlotHookEx(kTestPluginId, &fvPost);
+        for (int i = 0; i < 3; ++i) {
+            const std::uint32_t v = fnStubVanilla(sInst);
+            if (v != 123U) {
+                std::printf("FAIL [FilterVanillaChain]: iter %d expected 123, got %u\n", i, v);
+                return 1;
+            }
+        }
+        host->UnregisterSlotHookHandle(kTestPluginId, hFvA);
+        host->UnregisterSlotHookHandle(kTestPluginId, hFvB);
+        host->UnregisterSlotHookHandle(kTestPluginId, hFvC);
+        if (!fvSt.flagsOk || fvSt.aCalls != 3 || fvSt.bCalls != 3 || fvSt.cCalls != 3 || fvSt.cFinal != 123U) {
+            std::printf("FAIL [FilterVanillaChain]: a=%d b=%d c=%d ok=%d cFinal=%u\n",
+                        fvSt.aCalls, fvSt.bCalls, fvSt.cCalls, fvSt.flagsOk, fvSt.cFinal);
+            return 1;
+        }
+
+        // (b) Chained FilterSlot on Sequence + Selective + Pre|FilterSlot
+        MhwRngHookDesc fsLo{};
+        fsLo.structSize = sizeof(fsLo);
+        fsLo.rva        = kRvaFilterSlot;
+        fsLo.priority   = -10;
+        fsLo.flags      = kMhwRngHookFilterSlot;
+        fsLo.postFn     = +[](const MhwRngDrawContext* ctx, MhwRngHookDecision* dec, void*) {
+            if (ctx->finalValue0 < 50U) {
+                dec->action = kMhwRngActionReturnValue;
+                dec->value0 = 50U;
+            }
+        };
+
+        MhwRngHookDesc fsHi{};
+        fsHi.structSize = sizeof(fsHi);
+        fsHi.rva        = kRvaFilterSlot;
+        fsHi.priority   = 10;
+        fsHi.flags      = kMhwRngHookFilterSlot;
+        fsHi.postFn     = +[](const MhwRngDrawContext* ctx, MhwRngHookDecision* dec, void*) {
+            if (ctx->finalValue0 > 300U) {
+                dec->action = kMhwRngActionReturnValue;
+                dec->value0 = 300U;
+            }
+        };
+
+        const MhwRngHookHandle hFsLo = host->RegisterSlotHookEx(kTestPluginId, &fsLo);
+        const MhwRngHookHandle hFsHi = host->RegisterSlotHookEx(kTestPluginId, &fsHi);
+        const std::uint32_t rawSeqVals[4] = {10U, 200U, 30U, 450U};
+        const std::uint32_t expSeqVals[4] = {50U, 200U, 50U, 300U};
+        host->SetCondSequence(kTestPluginId, kRvaFilterSlot, 0U, rawSeqVals, 4U, kMhwRngSeqLoop);
+        for (int i = 0; i < 4; ++i) {
+            const std::uint32_t got = fnStubSlot(sInst);
+            if (got != expSeqVals[i]) {
+                std::printf("FAIL [FilterSlot-Seq]: step %d got %u, expected %u\n", i, got, expSeqVals[i]);
+                return 1;
+            }
+        }
+
+        // Now verify FilterSlot in Selective mode over vanilla RNG draws
+        host->ClearSlotAllConditions(kRvaFilterSlot);
+        host->SetEngineMode(kMhwRngModeSelective);
+        for (int i = 0; i < 16; ++i) {
+            const std::uint32_t got = fnStubSlot(sInst);
+            if (got < 50U || got > 300U) {
+                std::printf("FAIL [FilterSlot-Selective]: got %u outside [50, 300]\n", got);
+                return 1;
+            }
+        }
+        host->UnregisterSlotHookHandle(kTestPluginId, hFsLo);
+        host->UnregisterSlotHookHandle(kTestPluginId, hFsHi);
+
+        // Pre + FilterSlot combo with condition routing (`condId = 3`)
+        host->SetEngineMode(kMhwRngModeTakeover);
+        const std::uint32_t cond3Vals[3] = {1U, 2U, 3U};
+        host->SetCondSequence(kTestPluginId, kRvaFilterSlot, 3U, cond3Vals, 3U, kMhwRngSeqLoop);
+        MhwRngHookDesc preFilt{};
+        preFilt.structSize = sizeof(preFilt);
+        preFilt.rva        = kRvaFilterSlot;
+        preFilt.priority   = 0;
+        preFilt.flags      = kMhwRngHookPre | kMhwRngHookFilterSlot;
+        preFilt.preFn      = +[](const MhwRngDrawContext*, MhwRngHookDecision* dec, void*) {
+            dec->action = kMhwRngActionUseCondition;
+            dec->condId = 3U;
+        };
+        preFilt.postFn     = +[](const MhwRngDrawContext* ctx, MhwRngHookDecision* dec, void*) {
+            dec->action = kMhwRngActionReturnValue;
+            dec->value0 = ctx->finalValue0 + 1000U;
+        };
+        const MhwRngHookHandle hPreFilt = host->RegisterSlotHookEx(kTestPluginId, &preFilt);
+        for (int i = 0; i < 3; ++i) {
+            const std::uint32_t got = fnStubSlot(sInst);
+            if (got != static_cast<std::uint32_t>(1001 + i)) {
+                std::printf("FAIL [FilterSlot-PreCombo]: iter %d got %u, expected %d\n", i, got, 1001 + i);
+                return 1;
+            }
+        }
+        host->UnregisterSlotHookHandle(kTestPluginId, hPreFilt);
+        host->ClearSlotAllConditions(kRvaFilterSlot);
+        std::printf("[OK] Multi-plugin chained FilterVanilla + FilterSlot (Takeover/Selective/PreCombo) verified!\n");
+    }
+
+    // 19. Verify `XMM6/XMM7` Capture + 4-Hop `.pdata` `CaptureCallerRvas` + Standardized `$rng trace`
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        constexpr MhwRngPluginId kTestPluginId = 999U;
+        host->SetEngineMode(kMhwRngModeTakeover);
+        host->ClearAllRules();
+
+        // (a) Non-volatile XMM6 / XMM7 capture thunk at `base + 0x05000980`
+        //   void CallWithXmm67(void* sInst_rcx, const float* xmm6_rdx, const float* xmm7_r8)
+        std::uint8_t* xmmThunk = img + 0x05000980U;
+        std::uint32_t xmmRetRva = 0U;
+        {
+            std::size_t o = 0U;
+            auto put = [&](std::initializer_list<std::uint8_t> b) {
+                for (std::uint8_t x : b) xmmThunk[o++] = x;
+            };
+            put({0x48, 0x83, 0xEC, 0x48});                   // sub rsp, 48h
+            put({0x0F, 0x29, 0x74, 0x24, 0x20});             // movaps [rsp+20h], xmm6
+            put({0x0F, 0x29, 0x7C, 0x24, 0x30});             // movaps [rsp+30h], xmm7
+            put({0x0F, 0x10, 0x32});                         // movups xmm6, [rdx]
+            put({0x41, 0x0F, 0x10, 0x38});                   // movups xmm7, [r8]
+            put({0xE8});                                     // call fnNrand
+            const std::uintptr_t nextPc = reinterpret_cast<std::uintptr_t>(xmmThunk + o + 4U);
+            const std::uintptr_t dstPc  = base + mhw::kRvaMtRandomNrand;
+            const std::int32_t rel = static_cast<std::int32_t>(static_cast<std::intptr_t>(dstPc) - static_cast<std::intptr_t>(nextPc));
+            std::memcpy(xmmThunk + o, &rel, sizeof(rel));
+            o += 4U;
+            xmmRetRva = static_cast<std::uint32_t>(0x05000980U + o);
+            put({0x0F, 0x28, 0x74, 0x24, 0x20});             // movaps xmm6, [rsp+20h]
+            put({0x0F, 0x28, 0x7C, 0x24, 0x30});             // movaps xmm7, [rsp+30h]
+            put({0x48, 0x83, 0xC4, 0x48, 0xC3});             // add rsp, 48h; ret
+            ::FlushInstructionCache(::GetCurrentProcess(), xmmThunk, o);
+        }
+
+        struct XmmObs {
+            bool hasFlag = false;
+            float xmm6   = 0.0f;
+            float xmm7   = 0.0f;
+        } xmmObs{};
+        const MhwRngHookHandle hXmm = host->RegisterGlobalObserver(
+            kTestPluginId, xmmRetRva, (1U << kMhwRngSrcMtNrandGlobal),
+            +[](const MhwRngDrawContext* ctx, void* ud) {
+                auto* x = static_cast<XmmObs*>(ud);
+                x->hasFlag = ((ctx->callFlags & kMhwRngDrawFlagHasXmmRegs) != 0U) && (ctx->callerRegs != nullptr);
+                if (x->hasFlag) {
+                    x->xmm6 = ctx->callerRegs->xmm6.f32[0];
+                    x->xmm7 = ctx->callerRegs->xmm7.f32[0];
+                }
+            },
+            &xmmObs);
+        alignas(16) const float inXmm6[4] = {123.5f, 1.0f, 2.0f, 3.0f};
+        alignas(16) const float inXmm7[4] = {-456.25f, 4.0f, 5.0f, 6.0f};
+        using CallXmmFn = std::uint32_t(__fastcall*)(void*, const float*, const float*);
+        (void)reinterpret_cast<CallXmmFn>(xmmThunk)(sInst, inXmm6, inXmm7);
+        host->UnregisterGlobalObserver(kTestPluginId, hXmm);
+        if (!xmmObs.hasFlag || std::fabs(xmmObs.xmm6 - 123.5f) > 1e-5f ||
+            std::fabs(xmmObs.xmm7 - (-456.25f)) > 1e-5f) {
+            std::printf("FAIL [XMM6/7]: has=%d xmm6=%.3f xmm7=%.3f\n",
+                        xmmObs.hasFlag, xmmObs.xmm6, xmmObs.xmm7);
+            return 1;
+        }
+
+        // (b) 4-hop nested `.pdata` functions (`Hop3 -> Hop2 -> Hop1 -> Hop0 -> nrand`) via RtlAddFunctionTable
+        constexpr std::uint32_t kHop0Start = 0x05000900U;
+        constexpr std::uint32_t kHop1Start = 0x05000920U;
+        constexpr std::uint32_t kHop2Start = 0x05000940U;
+        constexpr std::uint32_t kHop3Start = 0x05000960U;
+
+        auto emitStdHop = [&](std::uint32_t startRva, std::uintptr_t targetRva) -> std::uint32_t {
+            std::uint8_t* p = img + startRva;
+            p[0] = 0x48; p[1] = 0x83; p[2] = 0xEC; p[3] = 0x28;
+            p[4] = 0xE8;
+            const std::uintptr_t nextPc = reinterpret_cast<std::uintptr_t>(p + 9);
+            const std::uintptr_t dstPc  = base + targetRva;
+            const std::int32_t rel = static_cast<std::int32_t>(static_cast<std::intptr_t>(dstPc) - static_cast<std::intptr_t>(nextPc));
+            std::memcpy(p + 5, &rel, sizeof(rel));
+            p[9] = 0x48; p[10] = 0x83; p[11] = 0xC4; p[12] = 0x28; p[13] = 0xC3;
+            ::FlushInstructionCache(::GetCurrentProcess(), p, 14U);
+            return startRva + 9U;
+        };
+
+        const std::uint32_t kHop0Ret = emitStdHop(kHop0Start, mhw::kRvaMtRandomNrand);
+        const std::uint32_t kHop1Ret = emitStdHop(kHop1Start, kHop0Start);
+        // Hop2 uses `push rbx; sub rsp, 30h; call Hop1; add rsp, 30h; pop rbx; ret`
+        const std::uint32_t kHop2Ret = kHop2Start + 10U;
+        {
+            std::uint8_t* p = img + kHop2Start;
+            p[0] = 0x53;                                     // push rbx
+            p[1] = 0x48; p[2] = 0x83; p[3] = 0xEC; p[4] = 0x30; // sub rsp, 30h
+            p[5] = 0xE8;                                     // call Hop1
+            const std::uintptr_t nextPc = reinterpret_cast<std::uintptr_t>(p + 10);
+            const std::uintptr_t dstPc  = base + kHop1Start;
+            const std::int32_t rel = static_cast<std::int32_t>(static_cast<std::intptr_t>(dstPc) - static_cast<std::intptr_t>(nextPc));
+            std::memcpy(p + 6, &rel, sizeof(rel));
+            p[10] = 0x48; p[11] = 0x83; p[12] = 0xC4; p[13] = 0x30; // add rsp, 30h
+            p[14] = 0x5B; p[15] = 0xC3;                      // pop rbx; ret
+            ::FlushInstructionCache(::GetCurrentProcess(), p, 16U);
+        }
+        const std::uint32_t kHop3Ret = emitStdHop(kHop3Start, kHop2Start);
+
+        // Build aligned UNWIND_INFO structures in `img + 0x05000A00..0x05000A30`
+        const std::uint32_t kUw0 = 0x05000A00U;
+        const std::uint32_t kUw1 = 0x05000A10U;
+        const std::uint32_t kUw2 = 0x05000A20U;
+        const std::uint32_t kUw3 = 0x05000A30U;
+        auto writeUnwindSmall28 = [&](std::uint32_t rva) {
+            std::uint8_t* u = img + rva;
+            u[0] = 0x01; // Version=1, Flags=0
+            u[1] = 0x04; // SizeOfProlog=4
+            u[2] = 0x01; // CountOfCodes=1
+            u[3] = 0x00; // FrameReg/Off=0
+            u[4] = 0x04; // CodeOffset=4
+            u[5] = 0x42; // UWOP_ALLOC_SMALL (2) | OpInfo=4 ((4+1)*8 = 0x28)
+            u[6] = 0x00; u[7] = 0x00;
+        };
+        writeUnwindSmall28(kUw0);
+        writeUnwindSmall28(kUw1);
+        writeUnwindSmall28(kUw3);
+        {
+            std::uint8_t* u = img + kUw2;
+            u[0] = 0x01; // Version=1, Flags=0
+            u[1] = 0x05; // SizeOfProlog=5
+            u[2] = 0x02; // CountOfCodes=2
+            u[3] = 0x00; // FrameReg/Off=0
+            u[4] = 0x05; // CodeOffset=5 (`sub rsp, 30h`)
+            u[5] = 0x52; // UWOP_ALLOC_SMALL (2) | OpInfo=5 ((5+1)*8 = 0x30)
+            u[6] = 0x01; // CodeOffset=1 (`push rbx`)
+            u[7] = 0x30; // UWOP_PUSH_NONVOL (0) | OpInfo=3 (RBX)
+        }
+
+        alignas(16) static RUNTIME_FUNCTION synPdata[4]{};
+        synPdata[0] = RUNTIME_FUNCTION{kHop0Start, kHop0Start + 14U, kUw0};
+        synPdata[1] = RUNTIME_FUNCTION{kHop1Start, kHop1Start + 14U, kUw1};
+        synPdata[2] = RUNTIME_FUNCTION{kHop2Start, kHop2Start + 16U, kUw2};
+        synPdata[3] = RUNTIME_FUNCTION{kHop3Start, kHop3Start + 14U, kUw3};
+        if (!::RtlAddFunctionTable(synPdata, 4U, base)) {
+            std::printf("FAIL [PdataUnwind]: RtlAddFunctionTable failed\n");
+            return 1;
+        }
+
+        struct UnwindCheckState {
+            const MhwRngHostApi* host = nullptr;
+            std::uint32_t count = 0U;
+            std::uint32_t rvas[8]{};
+        } uwSt{host, 0U, {}};
+        const MhwRngHookHandle hUw = host->RegisterGlobalObserver(
+            kTestPluginId, kHop0Ret, (1U << kMhwRngSrcMtNrandGlobal),
+            +[](const MhwRngDrawContext* ctx, void* ud) {
+                auto* s = static_cast<UnwindCheckState*>(ud);
+                s->count = MhwRng_HostCaptureCallerRvas(s->host, ctx, s->rvas, 8U);
+            },
+            &uwSt);
+        (void)reinterpret_cast<TestNrandFn>(base + kHop3Start)(sInst);
+        host->UnregisterGlobalObserver(kTestPluginId, hUw);
+
+        if (uwSt.count < 4U ||
+            uwSt.rvas[0] != kHop0Ret || uwSt.rvas[1] != kHop1Ret ||
+            uwSt.rvas[2] != kHop2Ret || uwSt.rvas[3] != kHop3Ret) {
+            std::printf("FAIL [PdataUnwind]: count=%u got=[%X, %X, %X, %X] exp=[%X, %X, %X, %X]\n",
+                        uwSt.count, uwSt.rvas[0], uwSt.rvas[1], uwSt.rvas[2], uwSt.rvas[3],
+                        kHop0Ret, kHop1Ret, kHop2Ret, kHop3Ret);
+            ::RtlDeleteFunctionTable(synPdata);
+            return 1;
+        }
+
+        // (c) Verify `$rng trace` in `rng_inspector.dll` (trace on -> 3 calls -> log -> dump -> off -> clear)
+        cmd_router::Init(&cfg, &CaptureChatSink);
+        g_capturedChatLines.clear();
+        if (!cmd_router::HandleCommandLine("$rng trace 0x5000909", true)) {
+            std::printf("FAIL [InspectorTrace-1]: `$rng trace 0x5000909` command failed\n");
+            ::RtlDeleteFunctionTable(synPdata);
+            return 1;
+        }
+        for (int i = 0; i < 3; ++i) {
+            (void)reinterpret_cast<TestNrandFn>(base + kHop3Start)(sInst);
+        }
+        g_capturedChatLines.clear();
+        cmd_router::HandleCommandLine("$rng trace log", true);
+        const std::string expChainSub = "0x5000909 <- 0x5000929 <- 0x500094A <- 0x5000969";
+        bool sawChainInChat = false;
+        for (const std::string& line : g_capturedChatLines) {
+            if (line.find(expChainSub) != std::string::npos && line.find("3 hits") != std::string::npos) {
+                sawChainInChat = true;
+                break;
+            }
+        }
+        const std::string traceDumpPath = buildDir + "\\_test_mhw_rng_trace.txt";
+        const std::string traceDumpCmd  = "$rng trace dump " + traceDumpPath;
+        cmd_router::HandleCommandLine(traceDumpCmd.c_str(), true);
+        bool sawChainInDump = false;
+        {
+            FILE* tfp = nullptr;
+            if (fopen_s(&tfp, traceDumpPath.c_str(), "rb") == 0 && tfp) {
+                std::string body;
+                char buf[1024]{};
+                std::size_t nr = 0;
+                while ((nr = std::fread(buf, 1, sizeof(buf), tfp)) > 0) body.append(buf, nr);
+                std::fclose(tfp);
+                sawChainInDump = (body.find(expChainSub) != std::string::npos);
+            }
+        }
+        ::DeleteFileA(traceDumpPath.c_str());
+        cmd_router::HandleCommandLine("$rng trace off", true);
+        cmd_router::HandleCommandLine("$rng trace clear", true);
+        ::RtlDeleteFunctionTable(synPdata);
+
+        if (!sawChainInChat || !sawChainInDump) {
+            std::printf("FAIL [InspectorTrace-2]: chat=%d dump=%d\n", sawChainInChat, sawChainInDump);
+            return 1;
+        }
+        std::printf("[OK] XMM6/XMM7 capture + 4-hop `.pdata` CaptureCallerRvas + `$rng trace` verified!\n");
+    }
+
+    // 20. Verify Standardized i18n API (SDK v3.3), Fallback Chain & Zero-CJK Sweep in `$rng lang en`
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        constexpr MhwRngPluginId kTestPluginId = 999U;
+
+        auto containsCjkUtf8 = [](const std::string& s) -> bool {
+            const std::size_t n = s.size();
+            for (std::size_t i = 0U; i < n;) {
+                const auto b0 = static_cast<unsigned char>(s[i]);
+                if (b0 < 0x80U) {
+                    ++i;
+                    continue;
+                }
+                std::uint32_t cp = 0U;
+                std::size_t len = 1U;
+                if ((b0 & 0xE0U) == 0xC0U && i + 1U < n) {
+                    cp = ((b0 & 0x1FU) << 6) | (static_cast<unsigned char>(s[i + 1U]) & 0x3FU);
+                    len = 2U;
+                } else if ((b0 & 0xF0U) == 0xE0U && i + 2U < n) {
+                    cp = ((b0 & 0x0FU) << 12) |
+                         ((static_cast<unsigned char>(s[i + 1U]) & 0x3FU) << 6) |
+                         (static_cast<unsigned char>(s[i + 2U]) & 0x3FU);
+                    len = 3U;
+                } else if ((b0 & 0xF8U) == 0xF0U && i + 3U < n) {
+                    cp = ((b0 & 0x07U) << 18) |
+                         ((static_cast<unsigned char>(s[i + 1U]) & 0x3FU) << 12) |
+                         ((static_cast<unsigned char>(s[i + 2U]) & 0x3FU) << 6) |
+                         (static_cast<unsigned char>(s[i + 3U]) & 0x3FU);
+                    len = 4U;
+                }
+                if ((cp >= 0x3000U && cp <= 0x303FU) ||
+                    (cp >= 0x4E00U && cp <= 0x9FFFU) ||
+                    (cp >= 0xFF00U && cp <= 0xFFEFU)) {
+                    return true;
+                }
+                i += len;
+            }
+            return false;
+        };
+
+        // (a) Verify `SelectText` / `MhwRng_TrTable` fallback chain & `kMhwRngEventLanguageChanged`
+        struct LangEvState {
+            int calls = 0;
+            std::uint64_t lastPrev = 999ULL;
+            std::uint32_t lastMode = 0U;
+        } langEv{};
+        const MhwRngHookHandle hLangLife = host->RegisterLifecycleHook(
+            kTestPluginId,
+            +[](const MhwRngEventInfo* info, void* ud) {
+                if (!info || info->eventKind != kMhwRngEventLanguageChanged) return;
+                auto* st = static_cast<LangEvState*>(ud);
+                ++st->calls;
+                st->lastPrev = info->prevValue;
+                st->lastMode = info->engineMode;
+            },
+            &langEv);
+
+        const MhwRngLocaleText tblZhEnJa[3] = {
+            {"zh", u8"中文文案"},
+            {"en", "English text"},
+            {"ja", u8"日本語テキスト"}
+        };
+        const MhwRngLocaleText tblZhEn[2] = {
+            {"zh", u8"仅中英-中"},
+            {"en", "En-Fallback"}
+        };
+        const MhwRngLocaleText tblZhOnly[1] = {
+            {"zh", u8"仅中文兜底"}
+        };
+        const MhwRngLocaleText tblFrOnly[1] = {
+            {"fr", "Texte FR"}
+        };
+
+        MhwRng_SetLanguage("zh");
+        if (std::strcmp(MhwRng_GetLanguage(), "zh") != 0 ||
+            MhwRng_GetLanguageId() != kMhwRngLangZh ||
+            std::strcmp(MhwRng_TrTable(host, tblZhEnJa, 3U, "fb"), u8"中文文案") != 0) {
+            std::printf("FAIL [i18n-zh]: lang=%s id=%u\n", MhwRng_GetLanguage(), MhwRng_GetLanguageId());
+            host->UnregisterLifecycleHook(kTestPluginId, hLangLife);
+            return 1;
+        }
+
+        MhwRng_SetLanguage("ja-JP");
+        if (std::strcmp(MhwRng_GetLanguage(), "ja") != 0 ||
+            MhwRng_GetLanguageId() != kMhwRngLangJa ||
+            langEv.calls != 1 || langEv.lastPrev != kMhwRngLangZh ||
+            std::strcmp(MhwRng_TrTable(host, tblZhEnJa, 3U, "fb"), u8"日本語テキスト") != 0 ||
+            std::strcmp(MhwRng_TrTable(host, tblZhEn,   2U, "fb"), "En-Fallback") != 0 ||
+            std::strcmp(MhwRng_TrTable(host, tblZhOnly, 1U, "fb"), u8"仅中文兜底") != 0 ||
+            std::strcmp(MhwRng_TrTable(host, tblFrOnly, 1U, "fb"), "Texte FR") != 0 ||
+            std::strcmp(MhwRng_TrTable(host, nullptr,   0U, "fb"), "fb") != 0) {
+            std::printf("FAIL [i18n-ja]: lang=%s id=%u ev=%d prev=%llu\n",
+                        MhwRng_GetLanguage(), MhwRng_GetLanguageId(), langEv.calls,
+                        static_cast<unsigned long long>(langEv.lastPrev));
+            host->UnregisterLifecycleHook(kTestPluginId, hLangLife);
+            return 1;
+        }
+
+        MhwRng_SetLanguage("fr");
+        if (std::strcmp(MhwRng_GetLanguage(), "fr") != 0 ||
+            MhwRng_GetLanguageId() != kMhwRngLangOther ||
+            std::strcmp(MhwRng_Tr(host, u8"中", "EN"), "EN") != 0) {
+            std::printf("FAIL [i18n-fr]: lang=%s id=%u\n", MhwRng_GetLanguage(), MhwRng_GetLanguageId());
+            host->UnregisterLifecycleHook(kTestPluginId, hLangLife);
+            return 1;
+        }
+
+        // (b) Switch to `en` via chat command and sweep all core + official plugin commands for zero CJK leaks
+        cmd_router::Init(&cfg, &CaptureChatSink);
+        g_capturedChatLines.clear();
+        const std::string dumpEnPath = buildDir + "\\_test_dump_en.txt";
+        const std::vector<std::string> enCmds = {
+            "$rng lang en",
+            "$rng status",
+            "$rng plugins",
+            "$rng help",
+            "$rng help steam",
+            "$rng top all",
+            "$rng list",
+            "$rng find meal",
+            "$rng find fatalis",
+            "$rng info em.size",
+            "$rng trace em.size",
+            "$rng size rajang max",
+            "$rng size status",
+            "$rng size monsters rajang",
+            "$rng endemic ec059 max",
+            "$rng endemic status",
+            "$rng steam status",
+            "$rng steam help",
+            "$rng fatalis on",
+            "$rng fatalis status",
+            "$rng fatalis history",
+            "$rng thk status",
+            "$rng dump " + dumpEnPath
+        };
+        for (const std::string& cmd : enCmds) {
+            if (!cmd_router::HandleCommandLine(cmd.c_str(), true)) {
+                std::printf("FAIL [i18n-cmd]: command failed: %s\n", cmd.c_str());
+                ::DeleteFileA(dumpEnPath.c_str());
+                host->UnregisterLifecycleHook(kTestPluginId, hLangLife);
+                return 1;
+            }
+        }
+        cmd_router::HandleCommandLine("$rng trace off", true);
+        cmd_router::HandleCommandLine("$rng trace clear", true);
+
+        for (const std::string& line : g_capturedChatLines) {
+            if (containsCjkUtf8(line)) {
+                std::printf("FAIL [i18n-NoCJK-Chat]: unexpected CJK text in en mode: %s\n", line.c_str());
+                ::DeleteFileA(dumpEnPath.c_str());
+                host->UnregisterLifecycleHook(kTestPluginId, hLangLife);
+                return 1;
+            }
+        }
+        {
+            FILE* dfp = nullptr;
+            if (fopen_s(&dfp, dumpEnPath.c_str(), "rb") != 0 || !dfp) {
+                std::printf("FAIL [i18n-DumpEn]: failed to open %s\n", dumpEnPath.c_str());
+                host->UnregisterLifecycleHook(kTestPluginId, hLangLife);
+                return 1;
+            }
+            std::string body;
+            char dbuf[1024]{};
+            std::size_t nr = 0U;
+            while ((nr = std::fread(dbuf, 1, sizeof(dbuf), dfp)) > 0U) body.append(dbuf, nr);
+            std::fclose(dfp);
+            ::DeleteFileA(dumpEnPath.c_str());
+            if (body.find("Monster crown/size multiplier") == std::string::npos || containsCjkUtf8(body)) {
+                std::printf("FAIL [i18n-NoCJK-Dump]: CJK leaked or missing English em.size in dump\n");
+                host->UnregisterLifecycleHook(kTestPluginId, hLangLife);
+                return 1;
+            }
+        }
+
+        // Verify dynamic QuerySiteMeta in `en` and immediate restoration in `zh` WITHOUT reloading plugins
+        const std::uint32_t probeRvas[5] = {
+            0x0169BA15U, // size: em.size
+            0x005CA0A2U, // steam: steam.autowin
+            0x01D2A3CCU, // endemic: endemic.special_size
+            0x01339C8CU, // thk: ai.thk_rand
+            0x00F99246U  // inspector fallback: meal.trigger
+        };
+        for (std::uint32_t rva : probeRvas) {
+            MhwRngSiteMeta m{};
+            host->QuerySiteMeta(rva, &m);
+            if (m.description[0] == '\0' || containsCjkUtf8(m.description)) {
+                std::printf("FAIL [i18n-MetaEn]: rva=0x%07X desc=%s\n", rva, m.description);
+                host->UnregisterLifecycleHook(kTestPluginId, hLangLife);
+                return 1;
+            }
+        }
+
+        cmd_router::HandleCommandLine("$rng lang zh", true);
+        for (std::uint32_t rva : probeRvas) {
+            MhwRngSiteMeta m{};
+            host->QuerySiteMeta(rva, &m);
+            if (!containsCjkUtf8(m.description)) {
+                std::printf("FAIL [i18n-MetaZh]: rva=0x%07X did not restore Chinese without reload (%s)\n",
+                            rva, m.description);
+                host->UnregisterLifecycleHook(kTestPluginId, hLangLife);
+                return 1;
+            }
+        }
+
+        cmd_router::HandleCommandLine("$rng fatalis off", true);
+        cmd_router::HandleCommandLine("$rng size clear", true);
+        cmd_router::HandleCommandLine("$rng endemic clear", true);
+        host->ClearAllRules();
+        host->UnregisterLifecycleHook(kTestPluginId, hLangLife);
+        std::printf("[OK] Standardized i18n API (SDK v3.3), fallback chain, zero-CJK en sweep & hot lang switch verified!\n");
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 21: In-Game Overlay Terminal Core (Readline UTF-8, History, Dynamic Tab Complete)
+    // ------------------------------------------------------------------------
+    {
+        console::Reset();
+        console::Init(&cfg);
+        auto combinedSink = +[](const char* utf8Text) noexcept {
+            CaptureChatSink(utf8Text);
+            console::PushOutputLine(utf8Text);
+        };
+        cmd_router::Init(&cfg, combinedSink);
+
+        // Toggle open & check UTF-8 codepoint-safe editing
+        if (console::IsOpen() || !console::ToggleOpen() || !console::IsOpen()) {
+            std::printf("FAIL [console-toggle]: ToggleOpen failed\n");
+            return 1;
+        }
+        console::InsertUtf8(u8"size \u91D1\u72EE\u5B50 max"); // "size 金狮子 max"
+        for (int i = 0; i < 4; ++i) console::OnKeyDown(VK_LEFT, false, false, false);
+        for (int i = 0; i < 3; ++i) console::OnKeyDown(VK_BACK, false, false, false);
+        console::InsertUtf8("rajang");
+        console::ConsoleSnapshot snap{};
+        console::CaptureSnapshot(0U, snap);
+        if (snap.inputLine != "size rajang max") {
+            std::printf("FAIL [console-utf8]: got '%s'\n", snap.inputLine.c_str());
+            return 1;
+        }
+
+        // Test readline Ctrl+U / Ctrl+Y / Ctrl+A / Ctrl+K
+        console::OnKeyDown(VK_END, false, false, false);
+        console::OnKeyDown('U', true, false, false); // kill whole line
+        console::CaptureSnapshot(0U, snap);
+        if (!snap.inputLine.empty()) {
+            std::printf("FAIL [console-ctrlu]: expected empty, got '%s'\n", snap.inputLine.c_str());
+            return 1;
+        }
+        console::OnKeyDown('Y', true, false, false); // yank back
+        console::OnKeyDown('A', true, false, false); // Home
+        console::OnKeyDown(VK_RIGHT, true, false, false); // word right -> before "rajang"
+        console::OnKeyDown('K', true, false, false); // kill to end -> "size "
+        console::CaptureSnapshot(0U, snap);
+        if (snap.inputLine != "size ") {
+            std::printf("FAIL [console-ctrlk]: got '%s'\n", snap.inputLine.c_str());
+            return 1;
+        }
+
+        // Dynamic Tab completion: plugin usage keywords + plugin names + monsters + multi-match cycle
+        console::OnKeyDown('U', true, false, false);
+        console::InsertUtf8("steam l");
+        console::OnKeyDown(VK_TAB, false, false, false);
+        console::CaptureSnapshot(0U, snap);
+        if (snap.inputLine != "steam lock ") {
+            std::printf("FAIL [console-tab-steam]: expected 'steam lock ', got '%s'\n", snap.inputLine.c_str());
+            return 1;
+        }
+
+        console::OnKeyDown('U', true, false, false);
+        console::InsertUtf8("reload ins");
+        console::OnKeyDown(VK_TAB, false, false, false);
+        console::CaptureSnapshot(0U, snap);
+        if (snap.inputLine != "reload inspector ") {
+            std::printf("FAIL [console-tab-reload]: expected 'reload inspector ', got '%s'\n", snap.inputLine.c_str());
+            return 1;
+        }
+
+        console::OnKeyDown('U', true, false, false);
+        console::InsertUtf8("size furious");
+        console::OnKeyDown(VK_TAB, false, false, false);
+        console::CaptureSnapshot(0U, snap);
+        if (snap.inputLine != "size furious_rajang ") {
+            std::printf("FAIL [console-tab-size]: expected 'size furious_rajang ', got '%s'\n", snap.inputLine.c_str());
+            return 1;
+        }
+
+        // Multi-level sub-sub-command completion across all 5 plugins (SDK v3.4 completer API)
+        auto checkTabComplete = [&](const char* input, const char* expectedLine, const char* tag) -> bool {
+            console::OnKeyDown('U', true, false, false);
+            console::InsertUtf8(input);
+            console::OnKeyDown(VK_TAB, false, false, false);
+            console::CaptureSnapshot(0U, snap);
+            if (snap.inputLine != expectedLine) {
+                std::printf("FAIL [console-tab-%s]: input='%s' expected='%s' got='%s'\n",
+                            tag, input, expectedLine, snap.inputLine.c_str());
+                return false;
+            }
+            return true;
+        };
+        if (!checkTabComplete("steam style x", "steam style xbox ", "steam-style") ||
+            !checkTabComplete("steam lock wd", "steam lock wda ", "steam-lock") ||
+            !checkTabComplete("steam status x", "steam status x", "steam-status-noop") ||
+            !checkTabComplete("fatalis far m", "fatalis far multi ", "fatalis-far") ||
+            !checkTabComplete("thk probe l", "thk probe log ", "thk-probe") ||
+            !checkTabComplete("thk rule a", "thk rule add ", "thk-rule") ||
+            !checkTabComplete("thk preset load f", "thk preset load fatalis_p1_nasty ", "thk-preset-load") ||
+            !checkTabComplete("size rajang e", "size rajang exact ", "size-sub") ||
+            !checkTabComplete("size min e", "size min e", "size-min-noop") ||
+            !checkTabComplete("endemic ec059 n", "endemic ec059 normal ", "endemic-sub") ||
+            !checkTabComplete("endemic min n", "endemic min n", "endemic-min-noop") ||
+            !checkTabComplete("fix em.size r", "fix em.size raw:", "fix-raw") ||
+            !checkTabComplete("seq em.size 10,20 h", "seq em.size 10,20 hold ", "seq-pol") ||
+            !checkTabComplete("trace dum", "trace dump ", "trace-dump") ||
+            !checkTabComplete("trace log d", "trace log d", "trace-log-noop")) {
+            return 1;
+        }
+        // Ambiguous sub-sub-command: `thk preset tag bipedal_lock ` -> LCP `'o'`, then cycles `off` -> `on`
+        if (!checkTabComplete("thk preset tag bipedal_lock ", "thk preset tag bipedal_lock o", "thk-tag-lcp")) {
+            return 1;
+        }
+        console::OnKeyDown(VK_TAB, false, false, false);
+        console::CaptureSnapshot(0U, snap);
+        if (snap.inputLine != "thk preset tag bipedal_lock off") {
+            std::printf("FAIL [console-tab-thk-tag-off]: expected '... off', got '%s'\n", snap.inputLine.c_str());
+            return 1;
+        }
+        console::OnKeyDown(VK_TAB, false, false, false);
+        console::CaptureSnapshot(0U, snap);
+        if (snap.inputLine != "thk preset tag bipedal_lock on") {
+            std::printf("FAIL [console-tab-thk-tag-cycle]: expected '... on', got '%s'\n", snap.inputLine.c_str());
+            return 1;
+        }
+
+        // Ambiguous prefix "st" -> "status" <-> "steam" cycling via Tab / Shift+Tab
+        console::OnKeyDown('U', true, false, false);
+        console::InsertUtf8("st");
+        console::OnKeyDown(VK_TAB, false, false, false);
+        console::CaptureSnapshot(0U, snap);
+        const std::string firstCand = snap.inputLine;
+        console::OnKeyDown(VK_TAB, false, false, false);
+        console::CaptureSnapshot(0U, snap);
+        const std::string secondCand = snap.inputLine;
+        console::OnKeyDown(VK_TAB, false, true, false); // Shift+Tab cycles back
+        console::CaptureSnapshot(0U, snap);
+        if ((firstCand != "status" && firstCand != "steam") ||
+            secondCand == firstCand ||
+            snap.inputLine != firstCand ||
+            snap.completionHint.empty()) {
+            std::printf("FAIL [console-tab-cycle]: c1='%s' c2='%s' back='%s' hint='%s'\n",
+                        firstCand.c_str(), secondCand.c_str(), snap.inputLine.c_str(), snap.completionHint.c_str());
+            return 1;
+        }
+
+        // Command submission (prefixless) -> pendingCmds -> HandleCommandLine(..., false) -> scrollback output
+        auto runConsoleLine = [&](const char* cmdText) -> bool {
+            console::OnKeyDown('U', true, false, false);
+            console::InsertUtf8(cmdText);
+            console::OnKeyDown(VK_RETURN, false, false, false);
+            std::string pending;
+            if (!console::PopPendingCommand(pending)) return false;
+            return cmd_router::HandleCommandLine(pending.c_str(), false);
+        };
+        if (!runConsoleLine("chat on") || !cfg.showChatFeedback ||
+            !runConsoleLine("chat off") || cfg.showChatFeedback ||
+            !runConsoleLine("status")) {
+            std::printf("FAIL [console-exec]: command execution via console failed\n");
+            return 1;
+        }
+
+        // History Up/Down preserving draft & Ctrl+R reverse search
+        console::OnKeyDown('U', true, false, false);
+        console::InsertUtf8("draft_text");
+        console::OnKeyDown(VK_UP, false, false, false);
+        console::CaptureSnapshot(0U, snap);
+        if (snap.inputLine != "status") {
+            std::printf("FAIL [console-hist-up]: expected 'status', got '%s'\n", snap.inputLine.c_str());
+            return 1;
+        }
+        console::OnKeyDown(VK_DOWN, false, false, false);
+        console::CaptureSnapshot(0U, snap);
+        if (snap.inputLine != "draft_text") {
+            std::printf("FAIL [console-hist-draft]: expected 'draft_text', got '%s'\n", snap.inputLine.c_str());
+            return 1;
+        }
+        console::OnKeyDown('R', true, false, false); // Ctrl+R
+        console::InsertUtf8("chat o");
+        console::CaptureSnapshot(0U, snap);
+        if (snap.inputLine != "chat off" || snap.searchPrompt.empty()) {
+            std::printf("FAIL [console-ctrlr]: got '%s' prompt='%s'\n",
+                        snap.inputLine.c_str(), snap.searchPrompt.c_str());
+            return 1;
+        }
+        if (snap.lines.size() < 4U) {
+            std::printf("FAIL [console-scrollback]: expected >=4 output lines, got %zu\n", snap.lines.size());
+            return 1;
+        }
+        console::OnKeyDown(VK_ESCAPE, false, false, false); // exit Ctrl+R
+        if (!runConsoleLine("?") || !runConsoleLine("help plugins")) {
+            std::printf("FAIL [console-help]: help execution via console failed\n");
+            return 1;
+        }
+        {
+            console::ConsoleSnapshot helpSnap{};
+            console::CaptureSnapshot(32U, helpSnap);
+            bool sawInspectorGroup = false;
+            bool sawThkGroup       = false;
+            bool sawPluginsHelp    = false;
+            for (const auto& l : helpSnap.lines) {
+                if (l.text.find("[inspector]") != std::string::npos) sawInspectorGroup = true;
+                if (l.text.find("[thk]") != std::string::npos) sawThkGroup = true;
+                if (l.text.find("$rng plugins") != std::string::npos) sawPluginsHelp = true;
+            }
+            if (!sawInspectorGroup || !sawThkGroup || !sawPluginsHelp) {
+                std::printf("FAIL [console-help]: insp=%d thk=%d plugins=%d\n",
+                            sawInspectorGroup ? 1 : 0, sawThkGroup ? 1 : 0, sawPluginsHelp ? 1 : 0);
+                return 1;
+            }
+        }
+        // Verify scroll-to-top never hides bottom lines and ClampScrollOffset keeps ScrollBy(-N) responsive
+        console::ScrollBy(500);
+        {
+            console::ConsoleSnapshot topSnap{};
+            console::CaptureSnapshot(6U, topSnap);
+            if (topSnap.totalLines >= 6U && topSnap.lines.size() != 6U) {
+                std::printf("FAIL [console-scroll-top]: expected 6 visible lines, got %zu (total=%zu)\n",
+                            topSnap.lines.size(), topSnap.totalLines);
+                return 1;
+            }
+            console::ClampScrollOffset(topSnap.totalLines - 6U);
+            console::ScrollBy(-2);
+            console::ConsoleSnapshot downSnap{};
+            console::CaptureSnapshot(6U, downSnap);
+            if (downSnap.scrollOffset != topSnap.totalLines - 8U || downSnap.lines.size() != 6U) {
+                std::printf("FAIL [console-scroll-clamp]: offset=%zu lines=%zu\n",
+                            downSnap.scrollOffset, downSnap.lines.size());
+                return 1;
+            }
+        }
+        console::OnKeyDown(VK_ESCAPE, false, false, false); // close console
+        if (console::IsOpen()) {
+            std::printf("FAIL [console-esc]: Esc did not close console\n");
+            return 1;
+        }
+        cmd_router::Init(&cfg, &CaptureChatSink);
+        std::printf("[OK] Terminal core (UTF-8 readline, history, Ctrl+R, dynamic plugin Tab completion, chat echo toggle) verified!\n");
     }
 
     plugin_host::ShutdownAll();
