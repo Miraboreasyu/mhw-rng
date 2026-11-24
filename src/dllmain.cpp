@@ -115,6 +115,7 @@ std::atomic<std::uint32_t>  g_kbOpenDownCount{0U};
 std::atomic<std::uint32_t>  g_wpOpenDownCount{0U};
 std::atomic<std::uint8_t>   g_swallowVkMask{0U};
 std::atomic<bool>           g_detaching{false};
+std::atomic<bool>           g_kbMoveHooked{false};
 bool                        g_mouseOverrideApplied = false;
 std::uint8_t                g_savedForceCursor     = 0U;
 std::uint8_t                g_savedOverlayActive   = 0U;
@@ -405,6 +406,9 @@ void ReassertKbHookOnWindowThread() noexcept {
 void __fastcall Hook_SChatMove(std::uintptr_t sChat) {
     ReassertKbHookOnWindowThread();
     DrainConsoleCommandsOnMainThread(sChat);
+    if (!g_kbMoveHooked.load(std::memory_order_acquire) && !g_detaching.load(std::memory_order_relaxed)) {
+        plugin_host::DispatchMainThreadTicks();
+    }
     if (g_startupNoticePending.load(std::memory_order_acquire)) {
         TryFlushStartupNotice(sChat);
     }
@@ -507,6 +511,11 @@ void __fastcall Hook_SKeyboardMove(std::uintptr_t sKb) {
             _InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(&g_origSKeyboardMoveRaw), nullptr, nullptr))) {
         orig(sKb);
     }
+    if (!g_detaching.load(std::memory_order_relaxed)) {
+        plugin_host::DispatchMainThreadTicks();
+    }
+    if (!g_cfg.consoleEnabled) return;
+
     const bool isOpen = console::IsOpen();
     SyncConsoleMouseStateSEH(g_exeBase, isOpen, g_mouseOverrideApplied, g_savedForceCursor, g_savedOverlayActive);
     if (!IsValidUserPtr(sKb)) return;
@@ -1470,7 +1479,6 @@ void InstallPresentHookWithRetry(std::uintptr_t base, const char* tag) {
 }
 
 void InstallSKeyboardMoveHookWithRetry(std::uintptr_t base, const char* tag) {
-    if (!g_cfg.consoleEnabled) return;
     const std::uintptr_t kbSite = base + mhw::kRvaSKeyboardMove;
     char errBuf[192]{};
     for (int retry = 0; retry < 20 && !g_detaching.load(std::memory_order_acquire); ++retry) {
@@ -1487,6 +1495,7 @@ void InstallSKeyboardMoveHookWithRetry(std::uintptr_t base, const char* tag) {
                                            errBuf,
                                            sizeof(errBuf))) {
             g_kbMoveRelay = relay;
+            g_kbMoveHooked.store(true, std::memory_order_release);
             app::Log("%s: hooked sKeyboard::move @ %p (%s, tramp=%p)",
                      tag, reinterpret_cast<void*>(kbSite),
                      wasChained ? "chained" : "vanilla", g_origSKeyboardMoveRaw);
@@ -1545,8 +1554,8 @@ DWORD WINAPI InitWorker(LPVOID) {
     if (chatOk) {
         app::Log("init: microkernel ready! Type '%s' in game chat.", g_cfg.chatPrefix.c_str());
         const auto plugins = plugin_host::ListLoadedPlugins();
-        QueueStartupNoticeFmt(en ? "[RNG] mhw_rng v3.3 ready (%zu plugins | Mode:%s | Type %s help)"
-                                 : u8"[RNG] mhw_rng v3.3 已就绪（已载入 %zu 个插件 | 模式:%s | 输入 %s help）",
+        QueueStartupNoticeFmt(en ? "[RNG] mhw_rng v3.5 ready (%zu plugins | Mode:%s | Type %s help)"
+                                 : u8"[RNG] mhw_rng v3.5 已就绪（已载入 %zu 个插件 | 模式:%s | 输入 %s help）",
                               plugins.size(),
                               cmd_router::EngineModeLabel(MhwRng_GetEngineMode()),
                               g_cfg.chatPrefix.c_str());

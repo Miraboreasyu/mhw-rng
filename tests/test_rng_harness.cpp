@@ -20,11 +20,17 @@
 #include "log_config.h"
 #include "mhw_addresses.h"
 #include "mhw_rng_api.h"
+#include "mhw_rng_math.h"
+#include "mhw_1523_world.h"
+#include "mhw_world_api.h"
+#include "mhw_catalog_api.h"
 #include "plugin_host.h"
 #include "rng_engine.h"
 
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -279,11 +285,11 @@ int main(int argc, char** argv) {
 
     plugin_host::Init(base, end, plugDir, &CaptureChatSink, &CaptureAsyncChatSink);
     const std::size_t loadedCnt = plugin_host::LoadAllFromDirectory();
-    if (loadedCnt != 6U) {
-        std::printf("FAIL: Expected == 6 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
+    if (loadedCnt != 7U) {
+        std::printf("FAIL: Expected == 7 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
         return 1;
     }
-    std::printf("[OK] Shadow-copy loaded %zu official plugins (`inspector` + `size` + `endemic` + `thk` + `steam` + `crit`)!\n", loadedCnt);
+    std::printf("[OK] Shadow-copy loaded %zu official modules (`world` + `inspector` + `size` + `endemic` + `thk` + `steam` + `crit`)!\n", loadedCnt);
 
     // 3. Build TWO real-world 38-row `cSizeTable`s:
     //    - Table 0 (`fullCrownTbl`): Standard Crown table (`88% .. 125%`, all 38 rows have `weight > 0`)
@@ -3207,10 +3213,16 @@ int main(int argc, char** argv) {
             "$rng endemic rare off",
             "$rng steam status",
             "$rng steam help",
+            "$rng world status",
+            "$rng world help",
+            "$rng world events on",
+            "$rng world events off",
             "$rng crit status",
             "$rng crit help",
             "$rng crit rate 100",
             "$rng crit random",
+            "$rng crit autoreset off",
+            "$rng crit autoreset on",
             "$rng crit mv_bank 50",
             "$rng crit mv_tier 50 125 200",
             "$rng crit mv_tier 25 60 delta=-10,0,+25",
@@ -3416,7 +3428,13 @@ int main(int argc, char** argv) {
             !checkTabComplete("fix em.size r", "fix em.size raw:", "fix-raw") ||
             !checkTabComplete("seq em.size 10,20 h", "seq em.size 10,20 hold ", "seq-pol") ||
             !checkTabComplete("trace dum", "trace dump ", "trace-dump") ||
-            !checkTabComplete("trace log d", "trace log d", "trace-log-noop")) {
+            !checkTabComplete("trace log d", "trace log d", "trace-log-noop") ||
+            !checkTabComplete("world s", "world status ", "world-status") ||
+            !checkTabComplete("world ev", "world events ", "world-events") ||
+            !checkTabComplete("world events of", "world events off ", "world-events-off") ||
+            !checkTabComplete("crit aut", "crit autoreset ", "crit-autoreset") ||
+            !checkTabComplete("crit autoreset of", "crit autoreset off ", "crit-autoreset-off") ||
+            !checkTabComplete("reload w", "reload world ", "reload-world")) {
             return 1;
         }
         // `endemic rare <Tab>`, `endemic <Tab>`, and `endemic clear <Tab>` with empty prefixes MUST list species names
@@ -4469,6 +4487,483 @@ int main(int argc, char** argv) {
         std::printf("[OK] Test 23: `rng_endemic.dll` v1.3.0 (master rare, GL rare Moly, group rare, mutex tie-breaker & async log) verified!\n");
     }
 
+    // ------------------------------------------------------------------------
+    // Test 24: Verify Kernel SDK v3.5 Primitives (MainThreadTick, EventBus & Service Registry)
+    // ------------------------------------------------------------------------
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        static constexpr MhwRngPluginId kSdkTestId = 0x7024U;
+
+        // (a) MainThreadTick registration, pumping, monotonic seq & unregister
+        struct TickState {
+            std::atomic<int> hits{0};
+            std::uint64_t    lastSeq = 0ULL;
+        } tickState;
+        const MhwRngHookHandle hTick = MhwRng_HostRegisterMainThreadTick(
+            host, kSdkTestId,
+            +[](std::uint64_t seq, void* ud) {
+                auto* ts = static_cast<TickState*>(ud);
+                ts->hits.fetch_add(1, std::memory_order_relaxed);
+                ts->lastSeq = seq;
+            },
+            &tickState);
+        if (hTick == kMhwRngInvalidHandle) {
+            std::printf("FAIL [sdk35-tick]: RegisterMainThreadTick returned invalid handle\n");
+            return 1;
+        }
+        MhwRng_PumpMainThreadTicks();
+        const std::uint64_t s1 = tickState.lastSeq;
+        MhwRng_PumpMainThreadTicks();
+        MhwRng_PumpMainThreadTicks();
+        if (tickState.hits.load() != 3 || tickState.lastSeq <= s1) {
+            std::printf("FAIL [sdk35-tick]: expected 3 monotonic hits, got %d (s1=%llu, s3=%llu)\n",
+                        tickState.hits.load(),
+                        static_cast<unsigned long long>(s1),
+                        static_cast<unsigned long long>(tickState.lastSeq));
+            MhwRng_HostUnregisterMainThreadTick(host, kSdkTestId, hTick);
+            return 1;
+        }
+        MhwRng_HostUnregisterMainThreadTick(host, kSdkTestId, hTick);
+        MhwRng_PumpMainThreadTicks();
+        if (tickState.hits.load() != 3) {
+            std::printf("FAIL [sdk35-tick-unreg]: tick fired after unregister\n");
+            return 1;
+        }
+
+        // (b) Event Bus: exact match, prefix wildcard, global `*`, recursion guard (<= 8) & unsubscribe
+        struct BusState {
+            int           exactHits  = 0;
+            int           prefixHits = 0;
+            int           allHits    = 0;
+            int           recHits    = 0;
+            std::uint32_t lastMagic  = 0U;
+        } bus;
+        const MhwRngHookHandle hEx = MhwRng_HostSubscribeEvent(
+            host, kSdkTestId, "test.alpha.hit",
+            +[](const MhwRngCustomEvent* ev, void* ud) {
+                auto* b = static_cast<BusState*>(ud);
+                ++b->exactHits;
+                if (ev && ev->payload && ev->payloadSize == sizeof(std::uint32_t)) {
+                    b->lastMagic = *static_cast<const std::uint32_t*>(ev->payload);
+                }
+            },
+            &bus);
+        const MhwRngHookHandle hPf = MhwRng_HostSubscribeEvent(
+            host, kSdkTestId, "test.alpha.*",
+            +[](const MhwRngCustomEvent*, void* ud) { ++static_cast<BusState*>(ud)->prefixHits; },
+            &bus);
+        const MhwRngHookHandle hAll = MhwRng_HostSubscribeEvent(
+            host, kSdkTestId, "*",
+            +[](const MhwRngCustomEvent*, void* ud) { ++static_cast<BusState*>(ud)->allHits; },
+            &bus);
+        const MhwRngHookHandle hRec = MhwRng_HostSubscribeEvent(
+            host, kSdkTestId, "test.recurse",
+            +[](const MhwRngCustomEvent*, void* ud) {
+                auto* b = static_cast<BusState*>(ud);
+                ++b->recHits;
+                MhwRng_HostEmitEvent(MhwRng_GetHostApi(), kSdkTestId, "test.recurse");
+            },
+            &bus);
+
+        const std::uint32_t magic = 0xDEADBEEFU;
+        MhwRng_HostEmitEvent(host, kSdkTestId, "test.alpha.hit", &magic, sizeof(magic));
+        MhwRng_HostEmitEvent(host, kSdkTestId, "test.alpha.clear");
+        MhwRng_HostEmitEvent(host, kSdkTestId, "test.recurse");
+        const int allBeforeUnsub = bus.allHits;
+        MhwRng_HostUnsubscribeEvent(host, kSdkTestId, hEx);
+        MhwRng_HostUnsubscribeEvent(host, kSdkTestId, hPf);
+        MhwRng_HostUnsubscribeEvent(host, kSdkTestId, hRec);
+        MhwRng_HostUnsubscribeEvent(host, kSdkTestId, hAll);
+        MhwRng_HostEmitEvent(host, kSdkTestId, "test.alpha.hit", &magic, sizeof(magic));
+
+        if (bus.exactHits != 1 || bus.prefixHits != 2 || allBeforeUnsub < 10 ||
+            bus.recHits != 8 || bus.lastMagic != magic || bus.allHits != allBeforeUnsub) {
+            std::printf("FAIL [sdk35-bus]: exact=%d prefix=%d allBefore=%d allAfter=%d rec=%d magic=0x%X\n",
+                        bus.exactHits, bus.prefixHits, allBeforeUnsub, bus.allHits, bus.recHits, bus.lastMagic);
+            return 1;
+        }
+
+        // (c) Concurrent 4-thread ServiceGuard readers racing 4x hot-reload of `mhw_world.dll`
+        std::atomic<bool>          stopReaders{false};
+        std::atomic<std::uint64_t> okServiceReads{0ULL};
+        std::thread                readers[4];
+        for (int ti = 0; ti < 4; ++ti) {
+            readers[ti] = std::thread([&]() {
+                while (!stopReaders.load(std::memory_order_acquire)) {
+                    {
+                        MhwRngServiceGuard<MhwWorldApi> world(host, kMhwWorldServiceName, kMhwWorldServiceVersion);
+                        if (world) {
+                            MhwWorldState st{};
+                            char summary[128]{};
+                            if (world->GetState && world->GetState(&st) &&
+                                world->FormatWorldSummary && world->FormatWorldSummary(summary, sizeof(summary), true)) {
+                                (void)world->GetSessionGen();
+                                okServiceReads.fetch_add(1U, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                    std::this_thread::yield();
+                }
+            });
+        }
+        std::string worldReloadMsg;
+        for (int iter = 0; iter < 4; ++iter) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (!plugin_host::LoadOrReloadSingle("world", worldReloadMsg)) {
+                stopReaders.store(true, std::memory_order_release);
+                for (auto& th : readers) th.join();
+                std::printf("FAIL [sdk35-service-reload]: iter=%d msg=%s\n", iter, worldReloadMsg.c_str());
+                return 1;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        stopReaders.store(true, std::memory_order_release);
+        for (auto& th : readers) th.join();
+
+        MhwRng_PumpMainThreadTicks();
+        MhwWorldState stAfter{};
+        if (okServiceReads.load() == 0ULL || !MhwWorld_TryGetState(host, &stAfter) || stAfter.tickCount == 0ULL) {
+            std::printf("FAIL [sdk35-service-stress]: okReads=%llu tickCount=%llu\n",
+                        static_cast<unsigned long long>(okServiceReads.load()),
+                        static_cast<unsigned long long>(stAfter.tickCount));
+            return 1;
+        }
+        std::printf("[OK] Test 24: Kernel SDK v3.5 (MainThreadTick, EventBus & concurrent ServiceGuard vs 4x `world` hot-reload, %llu safe leases) verified!\n",
+                    static_cast<unsigned long long>(okServiceReads.load()));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 25: End-to-End `mhw_world.dll` + 5 Refactored Plugins + `mhw.catalog` + `steam` Showcase
+    // ------------------------------------------------------------------------
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        static constexpr MhwRngPluginId kWorldTestId = 0x7025U;
+
+        struct PopupCapture {
+            std::atomic<int> hits{0};
+            char             lastMsg[256]{};
+        };
+        static PopupCapture g_popupCap;
+        g_popupCap.hits.store(0, std::memory_order_relaxed);
+        g_popupCap.lastMsg[0] = '\0';
+
+        auto popupStub = +[](void*, const char* msg, float, float, std::uint8_t, float, float) {
+            g_popupCap.hits.fetch_add(1, std::memory_order_relaxed);
+            if (msg) {
+                std::snprintf(g_popupCap.lastMsg, sizeof(g_popupCap.lastMsg), "%s", msg);
+            }
+        };
+
+        void* const savedPlayerRoot = *reinterpret_cast<void* const*>(base + mhw1523::kRvaSPlayerRoot);
+        void* const savedPlayer     = *reinterpret_cast<void* const*>(base + mhw1523::kRvaSPlayer);
+        void* const savedQuest      = *reinterpret_cast<void* const*>(base + mhw1523::kRvaSQuest);
+        void* const savedArea       = *reinterpret_cast<void* const*>(base + mhw1523::kRvaSMhArea);
+        void* const savedTime       = *reinterpret_cast<void* const*>(base + mhw1523::kRvaSTime);
+        void* const savedGui        = *reinterpret_cast<void* const*>(base + mhw1523::kRvaSMhGui);
+        const std::uint32_t savedDefFloatBits = *reinterpret_cast<const std::uint32_t*>(base + 0x2E4FE58U);
+        void* const savedCritMultTblPtr       = *reinterpret_cast<void* const*>(base + 0x5011F58U);
+
+        std::uint8_t savedDisplayBytes[12]{};
+        std::memcpy(savedDisplayBytes, img + mhw1523::kRvaDisplayPopup, sizeof(savedDisplayBytes));
+        DWORD oldPopupProt = PAGE_EXECUTE_READ;
+        if (!::VirtualProtect(img + mhw1523::kRvaDisplayPopup, 16, PAGE_EXECUTE_READWRITE, &oldPopupProt)) {
+            std::printf("FAIL [world-e2e]: VirtualProtect on kRvaDisplayPopup failed\n");
+            return 1;
+        }
+        {
+            std::uint8_t* pfn = img + mhw1523::kRvaDisplayPopup;
+            pfn[0] = 0x48;
+            pfn[1] = 0xB8;
+            const auto stubPtr = reinterpret_cast<std::uintptr_t>(popupStub);
+            std::memcpy(pfn + 2, &stubPtr, 8);
+            pfn[10] = 0xFF;
+            pfn[11] = 0xE0;
+            ::FlushInstructionCache(::GetCurrentProcess(), pfn, 16);
+        }
+
+        auto restoreWorldTestMem = [&]() {
+            *reinterpret_cast<void**>(base + mhw1523::kRvaSPlayerRoot) = savedPlayerRoot;
+            *reinterpret_cast<void**>(base + mhw1523::kRvaSPlayer)     = savedPlayer;
+            *reinterpret_cast<void**>(base + mhw1523::kRvaSQuest)      = savedQuest;
+            *reinterpret_cast<void**>(base + mhw1523::kRvaSMhArea)     = savedArea;
+            *reinterpret_cast<void**>(base + mhw1523::kRvaSTime)       = savedTime;
+            *reinterpret_cast<void**>(base + mhw1523::kRvaSMhGui)      = savedGui;
+            *reinterpret_cast<std::uint32_t*>(base + 0x2E4FE58U)       = savedDefFloatBits;
+            *reinterpret_cast<void**>(base + 0x5011F58U)               = savedCritMultTblPtr;
+            DWORD dummyProt = 0;
+            ::VirtualProtect(img + mhw1523::kRvaDisplayPopup, 16, PAGE_EXECUTE_READWRITE, &dummyProt);
+            std::memcpy(img + mhw1523::kRvaDisplayPopup, savedDisplayBytes, sizeof(savedDisplayBytes));
+            ::VirtualProtect(img + mhw1523::kRvaDisplayPopup, 16, oldPopupProt, &dummyProt);
+            ::FlushInstructionCache(::GetCurrentProcess(), img + mhw1523::kRvaDisplayPopup, 16);
+        };
+
+        std::vector<std::uint8_t> synPlayerRoot(0x100, 0U);
+        std::vector<std::uint8_t> synWorldPlayer(0x100, 0U);
+        std::vector<std::uint8_t> synUnit1(0xE200, 0U);
+        std::vector<std::uint8_t> synUnit2(0xE200, 0U);
+        std::vector<std::uint8_t> synStatusMgr(0xA00, 0U);
+        std::vector<std::uint8_t> synCritTbl(0x800, 0U);
+        std::vector<std::uint8_t> synQuest(0x2B000, 0U);
+        std::vector<std::uint8_t> synArea(0xE000, 0U);
+        std::vector<std::uint8_t> synTime(0x100, 0U);
+        std::vector<std::uint8_t> synGui(0x40, 0U);
+        void*                     dummyGuiVft[4]{};
+
+        *reinterpret_cast<std::uint32_t*>(synUnit1.data() + mhw1523::kOffUnitValidMask)     = 0x0EU;
+        *reinterpret_cast<std::uint32_t*>(synUnit1.data() + mhw1523::kOffPlayerLocalFlags)  = 1U;
+        *reinterpret_cast<void**>(synUnit1.data() + mhw1523::kOffPlayerStatusMgr)           = synStatusMgr.data();
+        *reinterpret_cast<std::uint32_t*>(synUnit2.data() + mhw1523::kOffUnitValidMask)     = 0x0EU;
+        *reinterpret_cast<std::uint32_t*>(synUnit2.data() + mhw1523::kOffPlayerLocalFlags)  = 1U;
+        *reinterpret_cast<void**>(synUnit2.data() + mhw1523::kOffPlayerStatusMgr)           = synStatusMgr.data();
+        *reinterpret_cast<void**>(synStatusMgr.data() + 0x08U)                              = synUnit1.data();
+        *reinterpret_cast<std::uint8_t*>(synStatusMgr.data() + 0x9BAU)                      = 1U;
+        *reinterpret_cast<float*>(synCritTbl.data() + 0x7A8U)                               = 1.25f;
+        *reinterpret_cast<float*>(synCritTbl.data() + 0x7ACU)                               = 0.75f;
+        *reinterpret_cast<float*>(base + 0x2E4FE58U)                                        = 1.0f;
+        *reinterpret_cast<void**>(base + 0x5011F58U)                                        = synCritTbl.data();
+        *reinterpret_cast<void**>(synGui.data())                                            = dummyGuiVft;
+
+        *reinterpret_cast<void**>(base + mhw1523::kRvaSPlayerRoot) = nullptr;
+        *reinterpret_cast<void**>(base + mhw1523::kRvaSPlayer)     = nullptr;
+        *reinterpret_cast<void**>(base + mhw1523::kRvaSQuest)      = synQuest.data();
+        *reinterpret_cast<void**>(base + mhw1523::kRvaSMhArea)     = synArea.data();
+        *reinterpret_cast<void**>(base + mhw1523::kRvaSTime)       = synTime.data();
+        *reinterpret_cast<void**>(base + mhw1523::kRvaSMhGui)      = synGui.data();
+
+        std::vector<std::string> worldTopics;
+        const MhwRngHookHandle hWorldSub = MhwRng_HostSubscribeEvent(
+            host, kWorldTestId, "mhw.world.*",
+            +[](const MhwRngCustomEvent* ev, void* ud) {
+                if (ev && ev->topic) static_cast<std::vector<std::string>*>(ud)->emplace_back(ev->topic);
+            },
+            &worldTopics);
+
+        // Step A: Title baseline -> Enter Hub
+        MhwRng_PumpMainThreadTicks();
+        MhwWorldState ws{};
+        if (!MhwWorld_TryGetState(host, &ws) || ws.inScene != 0U || ws.inQuest != 0U) {
+            restoreWorldTestMem();
+            MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+            std::printf("FAIL [world-title-base]: inScene=%u inQuest=%u\n", ws.inScene, ws.inQuest);
+            return 1;
+        }
+
+        worldTopics.clear();
+        *reinterpret_cast<void**>(synPlayerRoot.data() + mhw1523::kOffPlayerRootEntity)  = synUnit1.data();
+        *reinterpret_cast<void**>(synWorldPlayer.data() + mhw1523::kOffSPlayerLocalUnit) = synUnit1.data();
+        *reinterpret_cast<void**>(base + mhw1523::kRvaSPlayerRoot) = synPlayerRoot.data();
+        *reinterpret_cast<void**>(base + mhw1523::kRvaSPlayer)     = synWorldPlayer.data();
+        *reinterpret_cast<std::uint8_t*>(synArea.data() + mhw1523::kOffAreaIsVillage) = 1U;
+        *reinterpret_cast<std::uint32_t*>(synArea.data() + mhw1523::kOffAreaStageId)  = 301U;
+        *reinterpret_cast<float*>(synTime.data() + mhw1523::kOffTimeCurHour)          = 10.5f;
+        *reinterpret_cast<std::uint32_t*>(synTime.data() + mhw1523::kOffTimeWeatherId) = 0U;
+        MhwRng_PumpMainThreadTicks();
+
+        auto hasTopic = [&](const char* t) {
+            return std::find(worldTopics.begin(), worldTopics.end(), t) != worldTopics.end();
+        };
+        if (!MhwWorld_TryGetState(host, &ws) || ws.inScene == 0U || ws.isVillage == 0U || ws.inQuest != 0U ||
+            !hasTopic(kMhwWorldEvSceneEnter)) {
+            restoreWorldTestMem();
+            MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+            std::printf("FAIL [world-hub]: inScene=%u isVillage=%u inQuest=%u\n",
+                        ws.inScene, ws.isVillage, ws.inQuest);
+            return 1;
+        }
+
+        // Step B: Enter Guiding Lands Quest + Queue Popup + Weather/Hour Advance
+        worldTopics.clear();
+        *reinterpret_cast<std::uint32_t*>(synQuest.data() + mhw1523::kOffQuestState)          = 2U;
+        *reinterpret_cast<std::uint32_t*>(synQuest.data() + mhw1523::kOffQuestCategory)       = 2U;
+        *reinterpret_cast<std::uint32_t*>(synQuest.data() + mhw1523::kOffQuestId)             = 9001U;
+        *reinterpret_cast<std::uint8_t*>(synQuest.data() + mhw1523::kOffQuestIsGuidingLands)  = 1U;
+        *reinterpret_cast<std::int32_t*>(synQuest.data() + mhw1523::kOffQuestRemTicks)        = 3000;
+        *reinterpret_cast<std::int32_t*>(synQuest.data() + mhw1523::kOffQuestInitRemTicks)    = 3000;
+        const std::uint8_t glLevels[6] = { 7U, 7U, 7U, 4U, 1U, 7U };
+        std::memcpy(synQuest.data() + mhw1523::kOffQuestGlRegionLevels, glLevels, 6);
+        *reinterpret_cast<std::uint8_t*>(synArea.data() + mhw1523::kOffAreaIsVillage) = 0U;
+        *reinterpret_cast<std::uint32_t*>(synArea.data() + mhw1523::kOffAreaStageId)  = 109U;
+
+        (void)MhwWorld_TryDisplayPopup(host, "Hello MIRA v3.5", 3.0f);
+        MhwRng_PumpMainThreadTicks();
+        if (!MhwWorld_TryGetState(host, &ws) || ws.inQuest == 0U || ws.isGuidingLands == 0U ||
+            ws.glRegionLevels[0] != 7U || !hasTopic(kMhwWorldEvQuestEnter) || !hasTopic(kMhwWorldEvStageChanged) ||
+            g_popupCap.hits.load() < 1 || std::strcmp(g_popupCap.lastMsg, "Hello MIRA v3.5") != 0) {
+            restoreWorldTestMem();
+            MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+            std::printf("FAIL [world-gl-quest]: inQuest=%u gl=%u lv0=%u popupHits=%d msg='%s'\n",
+                        ws.inQuest, ws.isGuidingLands, ws.glRegionLevels[0],
+                        g_popupCap.hits.load(), g_popupCap.lastMsg);
+            return 1;
+        }
+
+        worldTopics.clear();
+        *reinterpret_cast<float*>(synTime.data() + mhw1523::kOffTimeCurHour)           = 12.2f;
+        *reinterpret_cast<std::uint32_t*>(synTime.data() + mhw1523::kOffTimeWeatherId) = 3U;
+        MhwRng_PumpMainThreadTicks();
+        if (!MhwWorld_TryGetState(host, &ws) || ws.isSpecialWeather == 0U ||
+            !hasTopic(kMhwWorldEvHourChanged) || !hasTopic(kMhwWorldEvWeatherChanged)) {
+            restoreWorldTestMem();
+            MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+            std::printf("FAIL [world-time-weather]: isSpecialWeather=%u hr=%.1f wid=%u\n",
+                        ws.isSpecialWeather, static_cast<double>(ws.gameHour), ws.weatherId);
+            return 1;
+        }
+
+        // Step C: Verify refactored plugin statuses + `mhw.catalog` service + `crit autoreset`
+        cmd_router::HandleCommandLine("$rng lang en", true);
+        auto checkChatContains = [&](const char* needle) -> bool {
+            for (const auto& l : g_capturedChatLines) {
+                if (l.find(needle) != std::string::npos) return true;
+            }
+            return false;
+        };
+
+        g_capturedChatLines.clear();
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "status"}, "rare status");
+        if (!checkChatContains("Stage 109") || !checkChatContains("7/7/7/4/1/7")) {
+            restoreWorldTestMem();
+            MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+            std::printf("FAIL [endemic-world-status]: missing live GL world info\n");
+            return 1;
+        }
+
+        for (const char* sub : { "size", "thk", "crit" }) {
+            g_capturedChatLines.clear();
+            plugin_host::DispatchPluginSubcommand(sub, {"status"}, "status");
+            if (!checkChatContains("World context:")) {
+                restoreWorldTestMem();
+                MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+                std::printf("FAIL [%s-world-status]: missing World context line\n", sub);
+                return 1;
+            }
+        }
+
+        std::uint32_t catalogRva = 0U;
+        MhwRngSiteMeta catalogMeta{};
+        {
+            MhwRngServiceGuard<MhwCatalogApi> cat(host, kMhwCatalogServiceName, kMhwCatalogServiceVersion);
+            if (!MhwCatalog_TryResolveAlias(host, "em.size", &catalogRva) || catalogRva != 0x169BA15U ||
+                !cat || !cat->QueryCatalogSite || !cat->QueryCatalogSite(0x169BA15U, &catalogMeta) || catalogMeta.found == 0U) {
+                restoreWorldTestMem();
+                MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+                std::printf("FAIL [catalog-service]: rva=0x%X found=%u\n", catalogRva, catalogMeta.found);
+                return 1;
+            }
+        }
+
+        // Verify `crit autoreset on` vs `off` on quest restart using real 0x01F51380 crit hook
+        {
+            alignas(16) std::uint8_t origAtk[0x280]{};
+            alignas(16) std::uint8_t atkNode[0x100]{};
+            alignas(16) std::uint8_t hitInfo[0x100]{};
+            alignas(16) std::uint8_t mutAtk[0x200]{};
+            *reinterpret_cast<float*>(origAtk + 0x20U) = 50.0f;
+            *reinterpret_cast<void**>(atkNode + 0xA8U) = origAtk;
+            *reinterpret_cast<void**>(hitInfo + 0x38U) = atkNode;
+            void* pHit = hitInfo;
+            struct { void** hitInfoPtr; void* player; } critCtx{ &pHit, synUnit1.data() };
+            using ApplyCritFn = void(__fastcall*)(void*, void*, std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t);
+            const auto fnApplyCrit = reinterpret_cast<ApplyCritFn>(base + 0x01F51380U);
+
+            plugin_host::DispatchPluginSubcommand("crit", {"autoreset", "on"}, "autoreset on");
+            plugin_host::DispatchPluginSubcommand("crit", {"random"}, "random");
+            plugin_host::DispatchPluginSubcommand("crit", {"rate", "100"}, "rate 100");
+            plugin_host::DispatchPluginSubcommand("crit", {"reset"}, "reset");
+
+            std::memset(mutAtk, 0, sizeof(mutAtk));
+            *reinterpret_cast<float*>(mutAtk + 0x20U) = 200.0f;
+            fnApplyCrit(&critCtx, mutAtk, 0U, 0U, 0U, 0U);
+            g_capturedChatLines.clear();
+            plugin_host::DispatchPluginSubcommand("crit", {"status"}, "status");
+            if (!checkChatContains("hits=1")) {
+                restoreWorldTestMem();
+                MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+                std::printf("FAIL [crit-autoreset-pre]: expected hits=1 before quest restart\n");
+                return 1;
+            }
+
+            // Trigger in-quest restart (questId changes 9001 -> 9002) while `autoreset on`
+            *reinterpret_cast<std::uint32_t*>(synQuest.data() + mhw1523::kOffQuestId) = 9002U;
+            MhwRng_PumpMainThreadTicks();
+            g_capturedChatLines.clear();
+            plugin_host::DispatchPluginSubcommand("crit", {"status"}, "status");
+            if (!checkChatContains("hits=0")) {
+                restoreWorldTestMem();
+                MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+                std::printf("FAIL [crit-autoreset-on]: expected hits=0 after quest restart\n");
+                return 1;
+            }
+
+            // Disable `autoreset` -> quest restart must preserve `hits=1`
+            plugin_host::DispatchPluginSubcommand("crit", {"autoreset", "off"}, "autoreset off");
+            std::memset(mutAtk, 0, sizeof(mutAtk));
+            *reinterpret_cast<float*>(mutAtk + 0x20U) = 200.0f;
+            fnApplyCrit(&critCtx, mutAtk, 0U, 0U, 0U, 0U);
+            *reinterpret_cast<std::uint32_t*>(synQuest.data() + mhw1523::kOffQuestId) = 9003U;
+            MhwRng_PumpMainThreadTicks();
+            g_capturedChatLines.clear();
+            plugin_host::DispatchPluginSubcommand("crit", {"status"}, "status");
+            if (!checkChatContains("hits=1")) {
+                restoreWorldTestMem();
+                MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+                std::printf("FAIL [crit-autoreset-off]: expected hits=1 preserved when autoreset off\n");
+                return 1;
+            }
+            plugin_host::DispatchPluginSubcommand("crit", {"autoreset", "on"}, "autoreset on");
+            plugin_host::DispatchPluginSubcommand("crit", {"off"}, "off");
+        }
+
+        // Step D: Return to Title -> verify `title_return` & `quest_leave`
+        worldTopics.clear();
+        *reinterpret_cast<void**>(base + mhw1523::kRvaSPlayerRoot) = nullptr;
+        *reinterpret_cast<void**>(base + mhw1523::kRvaSPlayer)     = nullptr;
+        *reinterpret_cast<std::uint32_t*>(synQuest.data() + mhw1523::kOffQuestState)    = 0U;
+        *reinterpret_cast<std::uint32_t*>(synQuest.data() + mhw1523::kOffQuestCategory) = 0U;
+        MhwRng_PumpMainThreadTicks();
+        if (!hasTopic(kMhwWorldEvTitleReturn) || !hasTopic(kMhwWorldEvQuestLeave)) {
+            restoreWorldTestMem();
+            MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+            std::printf("FAIL [world-title-return]: expected title_return + quest_leave events\n");
+            return 1;
+        }
+
+        // Step E: Graceful degradation when `mhw_world.dll` is unloaded + `steam` minimal showcase intact
+        std::string worldUnloadMsg;
+        if (!plugin_host::UnloadSingle("world", worldUnloadMsg)) {
+            restoreWorldTestMem();
+            MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+            std::printf("FAIL [world-unload]: %s\n", worldUnloadMsg.c_str());
+            return 1;
+        }
+        MhwWorldState wsMissing{};
+        if (MhwWorld_TryGetState(host, &wsMissing)) {
+            restoreWorldTestMem();
+            MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+            std::printf("FAIL [world-degrade]: MhwWorld_TryGetState succeeded after unload\n");
+            return 1;
+        }
+        for (const char* sub : { "size", "endemic", "thk", "crit", "steam" }) {
+            if (!plugin_host::DispatchPluginSubcommand(sub, {"status"}, "status")) {
+                restoreWorldTestMem();
+                MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+                std::printf("FAIL [world-degrade-%s]: status dispatch failed\n", sub);
+                return 1;
+            }
+        }
+        (void)plugin_host::DispatchPluginSubcommand("steam", {"help"}, "help");
+        if (!plugin_host::LoadOrReloadSingle("world", worldUnloadMsg)) {
+            restoreWorldTestMem();
+            MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+            std::printf("FAIL [world-reload]: %s\n", worldUnloadMsg.c_str());
+            return 1;
+        }
+
+        MhwRng_HostUnsubscribeEvent(host, kWorldTestId, hWorldSub);
+        restoreWorldTestMem();
+        std::printf("[OK] Test 25: `mhw_world.dll` + 5 refactored plugins + `mhw.catalog` + `steam` showcase + graceful unload verified!\n");
+    }
+
     plugin_host::ShutdownAll();
     hook::RemoveAllHooks();
     rng::Shutdown();
@@ -4479,6 +4974,6 @@ int main(int argc, char** argv) {
     }
     ::VirtualFree(thunkMem, 0, MEM_RELEASE);
     ::VirtualFree(img, 0, MEM_RELEASE);
-    std::printf("=== ALL MICROKERNEL v3.0 & OFFICIAL PLUGIN AUDIT TESTS PASSED ===\n");
+    std::printf("=== ALL MICROKERNEL v3.5 & OFFICIAL PLUGIN AUDIT TESTS PASSED ===\n");
     return 0;
 }

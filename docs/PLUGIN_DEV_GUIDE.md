@@ -1,13 +1,17 @@
-# MIRA Standalone Plugin Developer Guide (SDK v3.4)
+# MIRA Standalone Plugin Developer Guide (SDK v3.5)
 
 This guide enables any developer or AI harness to build **new standalone MIRA (`mhw_rng`) plugins** cleanly **outside** the core `mhw_rng` repository, without touching `mhw_rng`'s `build.bat`, `.gitmodules`, or `tests/`.
 
-> **Target Platform**: *Monster Hunter: World – Iceborne* Steam `15.23` (`Build 15539686`, `ImageBase = 0x140000000`) + `mhw_rng.dll` SDK v3.4 (`kMhwRngApiVersion == 3`).
-> **Full C ABI Reference**: [`include/mhw_rng_api.h`](../include/mhw_rng_api.h) | **Microkernel Design**: [`docs/ARCHITECTURE.md`](ARCHITECTURE.md).
+> **Target Platform**: *Monster Hunter: World – Iceborne* Steam `15.23` (`Build 15539686`, `ImageBase = 0x140000000`) + `mhw_rng.dll` SDK v3.5 (`kMhwRngApiVersion == 3`).
+> **Full C ABI Reference**: [`include/mhw_rng_api.h`](../include/mhw_rng_api.h) | **Companion Headers**: [`mhw_rng_math.h`](../include/mhw_rng_math.h), [`mhw_1523_world.h`](../include/mhw_1523_world.h), [`mhw_world_api.h`](../include/mhw_world_api.h), [`mhw_catalog_api.h`](../include/mhw_catalog_api.h) | **Microkernel Design**: [`docs/ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ---
 
 ## 1. Standalone Project Layout & Tooling
+
+Choose between two clean patterns:
+- **Minimal Direct-Microkernel Showcase**: include **only** `mhw_rng_api.h` (see `plugins/steam/steam_plugin.cpp`) when your plugin needs pure RNG hooks without world context.
+- **World-Aware Plugin**: also sync the header-only Companion SDK headers to reuse verified 15.23 math/SEH helpers, consume `"mhw.world"` (`mhw_world.dll`), or subscribe to `"mhw.world.*"` events (with graceful degradation when `mhw_world.dll` is unloaded).
 
 Create a new directory alongside `mhw_rng` (e.g. `mods\<your_plugin_repo>\`):
 
@@ -17,14 +21,15 @@ Create a new directory alongside `mhw_rng` (e.g. `mods\<your_plugin_repo>\`):
 ├── README.md
 ├── .gitignore                (ignore build/, *.obj, *.lib, *.exp, *.pdb)
 ├── include/
-│   └── mhw_rng_api.h         (copied by sync_sdk.bat; single-header SDK, no .lib)
-├── sync_sdk.bat              (syncs ..\mhw_rng\include\mhw_rng_api.h)
+│   ├── mhw_rng_api.h         (copied by sync_sdk.bat; single-header core ABI)
+│   └── (optional) mhw_rng_math.h / mhw_1523_world.h / mhw_world_api.h / mhw_catalog_api.h
+├── sync_sdk.bat              (syncs headers from ..\mhw_rng\include\)
 ├── build.bat                 (MSVC x64 /LD build; supports --deploy)
 └── <plugin_name>_plugin.cpp  (one or more plugin DLL sources)
 ```
 
 ### `sync_sdk.bat` Pattern
-Resolve candidate header in order: explicit CLI arg `%~1` -> `%MHW_RNG_SDK_DIR%` -> `..\mhw_rng\include\mhw_rng_api.h`, copy to `include\mhw_rng_api.h`.
+Resolve candidate header directory in order: explicit CLI arg `%~1` -> `%MHW_RNG_SDK_DIR%` -> `..\mhw_rng\include\`, copying `mhw_rng_api.h` (and any needed companion headers) into `include\`.
 
 ### `build.bat [--deploy]` Compiler Flags
 Always match `mhw_rng`'s CRT/ABI compilation flags:
@@ -45,9 +50,9 @@ When `--deploy` is passed, copy the output DLL(s) into `<MHW_DIR>\nativePC\plugi
 
 ---
 
-## 2. SDK v3.4 Lifecycle & Registration APIs
+## 2. SDK v3.5 Lifecycle, World Context & Event/Service APIs
 
-Every plugin DLL exports exactly 3 C functions (`MHW_RNG_PLUGIN_EXPORT`):
+Every plugin DLL exports up to 3 C functions (`MHW_RNG_PLUGIN_EXPORT`):
 
 1. `const MhwRngPluginDescriptor* MhwRngPlugin_GetInfo()`:
    - `targetApiVersion = kMhwRngApiVersion` (`3`)
@@ -61,11 +66,19 @@ Every plugin DLL exports exactly 3 C functions (`MHW_RNG_PLUGIN_EXPORT`):
      - `host->RegisterTransparentWrapper(selfId, wrapperRetRva, frameQwords)` *(if needed; see Section 3)*
      - `host->RegisterSlotHookEx(selfId, &hookDesc)` *(save `MhwRngHookHandle`)*
      - `host->RegisterLifecycleHook(selfId, &OnKernelLifecycle, nullptr)` *(save `MhwRngHookHandle`)*
+     - `MhwRng_HostRegisterMainThreadTick(host, selfId, &OnTick, nullptr)` *(optional main-thread polling)*
+     - `MhwRng_HostSubscribeEvent(host, selfId, "mhw.world.*", &OnWorldEvent, nullptr)` *(subscribe to scene/quest/weather transitions)*
+     - `MhwRng_HostRegisterService(host, selfId, name, ver, &apiTable)` *(expose a versioned API to other plugins)*
      - `MhwRng_RegisterSubcommandBi(host, selfId, subcmd, usage, zhHelp, enHelp, &Cmd_Fn, nullptr)`
      - `MhwRng_RegisterSubcommandCompleter(host, selfId, subcmd, &Complete_Fn, nullptr)`
 3. `void MhwRngPlugin_Shutdown()`:
    - Set an atomic `g_shuttingDown = true`.
-   - Note: `plugin_host` automatically detaches hooks, drains in-flight hook calls (`g_inFlightHookCalls == 0`), removes subcommands/wrappers/rules before calling `MhwRngPlugin_Shutdown()`, **and** calling `UnregisterSlotHookHandle` / `UnregisterLifecycleHook` / `UnregisterTransparentWrapper` when `g_host != nullptr` is safe & idempotent. Reset state under `g_stateMx` and null `g_host`.
+   - Snapshot handles/host outside `g_stateMx` and call `MhwRng_HostUnsubscribeEvent` / `MhwRng_HostUnregisterService` (or rely on automatic `plugin_host` cleanup + lease draining), reset state under `g_stateMx`, and null `g_host`.
+
+### Consuming `"mhw.world"` & Companion Helpers Safely
+- **Always use `MhwRngServiceGuard<MhwWorldApi>`** (or `MhwWorld_TryGetState`, `MhwWorld_TryDisplayPopup`, `MhwWorld_TryFormatSummary` helpers in `mhw_world_api.h`) instead of caching raw service pointers. Guards acquire an atomic reference-counted lease that keeps the provider DLL mapped until the guard exits scope and cleanly return `false` if `mhw_world.dll` is unloaded.
+- **Never hold `g_stateMx`** when acquiring a service lease or calling `MhwRng_HostEmitEvent`.
+- **Companion Math & 15.23 Headers**: Use `mhw_rng_math.h` (`FractionToOpenSafeU32`, `PercentToOpenSafeU32`, `RandRangeToSafeU32`, `TryReadPodSEH`, `DeriveMhwXorshift128`) and `mhw_1523_world.h` (`kRvaSPlayer`, `kRvaSQuest`, `kOffEnemyMonsterId`, `TryGetLocalPlayerSEH`) instead of duplicating bit math and singleton offsets.
 
 ### Hook Decision Flow (`MhwRngHookDesc` + `MhwRngDrawContext`)
 - Set `hk.flags = kMhwRngHookPre | kMhwRngHookPost | kMhwRngHookObserveOnly`.

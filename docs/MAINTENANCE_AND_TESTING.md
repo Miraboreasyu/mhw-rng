@@ -11,17 +11,19 @@ Operational reference for AI harnesses and maintainers modifying the **MIRA micr
 
 | File | Responsibility & Key Symbols |
 | :--- | :--- |
-| [`include/mhw_rng_api.h`](../include/mhw_rng_api.h) | SDK v3.4 (`kMhwRngApiVersion = 3`), `MhwRngDrawContext`, `MhwRngCallerRegs` (`0x80` bytes incl. `xmm6/7`), `MhwRngHostApi`, `MhwRng_Host*` / `MhwRng_Tr*` / `MhwRng_Register*Bi` helpers. Must stay ABI backwards-compatible (`structSize` checks). |
+| [`include/mhw_rng_api.h`](../include/mhw_rng_api.h) | SDK v3.5 (`kMhwRngApiVersion = 3`), `MhwRngDrawContext`, `MhwRngCallerRegs` (`0x80` bytes incl. `xmm6/7`), `MhwRngHostApi` (plus main-thread ticks, event bus, and hot-reload-safe service registry / `MhwRngServiceGuard`). Must stay ABI backwards-compatible (`structSize` checks). |
+| [`include/mhw_rng_math.h`](../include/mhw_rng_math.h) / [`mhw_1523_world.h`](../include/mhw_1523_world.h) / [`mhw_world_api.h`](../include/mhw_world_api.h) / [`mhw_catalog_api.h`](../include/mhw_catalog_api.h) | Header-only Companion SDK providing shared SEH readers, IEEE-754 interval helpers, verified 15.23 offsets, and `"mhw.world"` / `"mhw.catalog"` service ABIs. |
+| [`world/world_plugin.cpp`](../world/world_plugin.cpp) | Built-in core service provider `mhw_world.dll`: polls 15.23 world state via `RegisterMainThreadTick`, serves `"mhw.world"` v1, emits `"mhw.world.*"` events, drains HUD popups via `DisplayPopup`, and exposes `$rng world`. |
 | [`src/mhw_addresses.h`](../src/mhw_addresses.h) | Verified MHW `15.23` RVAs (`ImageBase = 0x140000000`): 10 PRNG entry RVAs & exact expected prologue byte arrays (`kPrologueMtRandomNrand`, etc.), `MtRandom::sInstance` (`0x3FDEBD8`), `sChat::DispatchChatEntry` (`0x1A51A40`) / `sChat::move` (`0x1A511F0`), `cD3DRender::present`, `sKeyboard::move` (`0x22E74F0`), `Global::WndProc` (`0x047FD50`), `sAppExt` (`0x51C5320`), and 31 `IsSaveSeedProtectedRva` save-persisted seed RVAs. |
 | [`src/hook.h`](../src/hook.h) / [`src/hook.cpp`](../src/hook.cpp) | Strict W^X 64 KB (`16 x 4 KB`) trampoline arena within `+-2 GB` of `MonsterHunterWorld.exe`. `InitArena`, `PrepareDetour`, `SealAndActivateAll`, `InstallStandaloneDetour5`, `WasUnchainedOverwrite5`, `RemoveAllHooks`. Automatically relocates displaced `E8 rel32` instructions and chains onto existing `E9` hooks (`mhw_hfi.dll`, etc.). |
 | [`src/rng_trampolines.asm`](../src/rng_trampolines.asm) | MASM x64 thunks (`MhwRngAsm_*`) preserving caller non-volatile GPRs + `XMM6/7` + `_AddressOfReturnAddress()` before calling C++ `rng::*` handlers. **Do NOT reorder `MhwRngCallerRegs` without updating this file.** |
 | [`src/rng_engine.h`](../src/rng_engine.h) / [`src/rng_engine.cpp`](../src/rng_engine.cpp) | 16,384-slot open-addressing hash table (`Slot[(condId << 32) | rva]`), `SplitMix64` + `StepMhwXorshift128`, 8 built-in transparent wrappers + custom `RegisterTransparentWrapper`, immutable `RvaHookChain` (max 8 hooks/RVA) + `g_inFlightHookCalls` RCU drain, SEH `.pdata` `CaptureCallerRvas`, `'MRSS'` CRC32 binary state snapshots, 512-entry `PrivateInstanceEntry` table. |
-| [`src/plugin_host.h`](../src/plugin_host.h) / [`src/plugin_host.cpp`](../src/plugin_host.cpp) | Shadow-copy loader (`.hotload\<name>.<gen>.<pid>.dll`), 2-level lock hierarchy (`g_lifecycleMx` recursive -> `g_registryMx` leaf), command/completer/meta/i18n registries, async `sChat::move` delivery queue, quiet wait (`DetachAllHooksForPluginAndWait`) on unload/reload. |
+| [`src/plugin_host.h`](../src/plugin_host.h) / [`src/plugin_host.cpp`](../src/plugin_host.cpp) | Shadow-copy loader (`.hotload\<name>.<gen>.<pid>.dll`), 2-level lock hierarchy (`g_lifecycleMx` recursive -> `g_registryMx` leaf), command/completer/meta/i18n/tick/event/service registries, atomic service lease drain on unload, async `sChat::move` queue. |
 | [`src/command_router.h`](../src/command_router.h) / [`src/command_router.cpp`](../src/command_router.cpp) | `$rng` / `$rng_<subcmd>` parser, built-in commands (`status`, `help`, `selective`, `on`, `observe`, `off`, `seed`, `reset`, `save`/`restore`/`saves`, `plugins`/`load`/`unload`/`reload`, `lang`, `chat`, `exec`, `raw*`, `clearall`), script executor (`#`/`;`/`//` comments, recursion limit). |
 | [`src/console_core.h`](../src/console_core.h) / [`src/console_core.cpp`](../src/console_core.cpp) | Pure-logic UTF-8 terminal core: scrollback ring (`OutputLine`), readline editing (`Ctrl+A/E/B/F/W/U/K/Y/L/C/V/R`), command history, dynamic `Tab`/`Shift+Tab` completion across core + plugin completers, UTF-16 IME composition & candidate page state (`ConsoleSnapshot`). Independently unit-tested offline! |
 | [`src/console_overlay.h`](../src/console_overlay.h) / [`src/console_overlay.cpp`](../src/console_overlay.cpp) | DirectX 11 & DirectX 12 runtime overlay renderer (SDR / HDR10 ST.2084 PQ / scRGB), GDI/DirectWrite glyph atlas with full CJK & IME candidate strip rendering, mouse drag/double-click/triple-click selection & clipboard copy. Zero blocking calls during `OnPresent`. |
 | [`src/log_config.h`](../src/log_config.h) / [`src/log_config.cpp`](../src/log_config.cpp) | INI parser (`mhw_rng.ini`), `mhw_rng.log` thread-safe logger, `[SlotOverrides]` parser. |
-| [`src/dllmain.cpp`](../src/dllmain.cpp) | 3-phase `InitWorker`, `cD3DRender::present`, `sChat::DispatchChatEntry` / `sChat::move`, `sKeyboard::move`, and `ConsoleWndProc` (`GWLP_WNDPROC` subclassing + IME `WM_IME_*` + `ImmGetCompositionStringW` / `ImmGetCandidateListW` handling). |
+| [`src/dllmain.cpp`](../src/dllmain.cpp) | 3-phase `InitWorker`, `cD3DRender::present`, `sChat::DispatchChatEntry` / `sChat::move`, `sKeyboard::move` (including `DispatchMainThreadTicks()`), and `ConsoleWndProc` (`GWLP_WNDPROC` subclassing + IME `WM_IME_*` + `ImmGetCompositionStringW` / `ImmGetCandidateListW` handling). |
 
 ---
 
@@ -47,15 +49,15 @@ Each official plugin under `plugins/` is an independent Git submodule:
 | ShortName | Submodule Path | Upstream Repo | Notes |
 | :--- | :--- | :--- | :--- |
 | `size` | `plugins/size` | `Miraboreasyu/mhw-rng-size` | 71 large monsters, safe open float interval `[1, 0xFFFFFF00]`, live `cSizeTable` inverse solver (`exact`). |
-| `inspector` | `plugins/inspector` | `Miraboreasyu/mhw-rng-inspector` | Static dictionary (`rng_catalog_data.inl`), `$rng top`/`dump`/`find`/`fix`/`trace`. Safe to unload via `$rng unload inspector`. |
-| `endemic` | `plugins/endemic` | `Miraboreasyu/mhw-rng-endemic` | Size/crown control + rare endemic life, Great-size fish & GL rare Moly RNG + bilingual Capcom GMD species names (`endemic_names.inl`). |
-| `thk` | `plugins/thk` | `Miraboreasyu/mhw-rng-thk` | Generic THK node probe/counter/sequence/preset engine + bundled `thk_presets\fatalis_p1_nasty.txt`. |
-| `steam` | `plugins/steam` | `Miraboreasyu/mhw-rng-steam` | Steamworks 3-key/red/pity decoder & optional `lock`; SDK v3 reference plugin. |
-| `crit` | `plugins/crit` | `Miraboreasyu/mhw-rng-crit` | Pure RNG seed at `0x01F606D6` + crit evaluator detour at `0x1F51380` (`auto`/`rate`, `random`/`ratio`/`seq`/`mv_bank`/`mv_tier`/`bag`/`prd`). |
+| `inspector` | `plugins/inspector` | `Miraboreasyu/mhw-rng-inspector` | Static dictionary (`rng_catalog_data.inl`), `"mhw.catalog"` service, `$rng top`/`dump`/`find`/`fix`/`trace`. Safe to unload via `$rng unload inspector`. |
+| `endemic` | `plugins/endemic` | `Miraboreasyu/mhw-rng-endemic` | Size/crown control + rare endemic life, Great-size fish & GL rare Moly RNG + bilingual Capcom GMD species names + `"mhw.world"` live status & popup notices. |
+| `thk` | `plugins/thk` | `Miraboreasyu/mhw-rng-thk` | Generic THK node probe/counter/sequence/preset engine + bundled `thk_presets\fatalis_p1_nasty.txt` + quest/title auto tracker reset. |
+| `steam` | `plugins/steam` | `Miraboreasyu/mhw-rng-steam` | Steamworks 3-key/red/pity decoder & optional `lock`; pure direct-microkernel showcase (`mhw_rng_api.h` only). |
+| `crit` | `plugins/crit` | `Miraboreasyu/mhw-rng-crit` | Pure RNG seed at `0x01F606D6` + crit evaluator detour at `0x1F51380` (`auto`/`rate`, `random`/`ratio`/`seq`/`mv_bank`/`mv_tier`/`bag`/`prd`, `autoreset [on|off]`). |
 
 ### Editing an Official Plugin
-1. If you changed [`include/mhw_rng_api.h`](../include/mhw_rng_api.h), run `sync_plugin_sdks.bat` first.
-2. Edit code inside `plugins/<name>/`, run root `build.bat` (builds all 7 targets) and `run_tests.bat` (must pass Tests 1–23!).
+1. If you changed [`include/mhw_rng_api.h`](../include/mhw_rng_api.h) or Companion Headers, run `sync_plugin_sdks.bat` first.
+2. Edit code inside `plugins/<name>/`, run root `build.bat` (builds all 8 targets) and `run_tests.bat` (must pass Tests 1–25!).
 3. **Commit order**:
    ```bash
    git -C plugins/<name> status
@@ -69,7 +71,7 @@ Each official plugin under `plugins/` is an independent Git submodule:
 
 ## 4. Offline Regression Harness (`tests/test_rng_harness.cpp`)
 
-All **Test 1–23** run **offline** against the real MHW 15.23 `.text` bytes (`text_1523.bin`, 48,304,640 B):
+All **Test 1–25** run **offline** against the real MHW 15.23 `.text` bytes (`text_1523.bin`, 48,304,640 B):
 
 ```bat
 set MHW_TEXT_BIN=<path-to-text_1523.bin>
@@ -77,8 +79,9 @@ run_tests.bat
 ```
 
 ### Coverage Summary
-- **Kernel & Hook Mechanics (Tests 1–19)**: 10 W^X detours, 8-thread contention + `Epoch` rewind, W^X unchained-overwrite recovery, 64 KB trampoline pool (`InstallStandaloneDetour5`), multi-plugin `priority` chain, `FilterVanilla` / `FilterSlot`, `ObserveOnly`, `'MRSS'` binary snapshot restore, Tombstone condition slot reclamation, custom transparent wrapper unwrapping, `CaptureCallerRvas` `.pdata` unwind, private `MtRandom` instance policies, `Selective` + 31 `ProtectSaveSeeds` RVAs, shadow-copy unload/reload & drain.
-- **Official Plugin Real-Machine-Code Tests**:
+- **Kernel & Hook Mechanics (Tests 1–19 & 24)**: 10 W^X detours, 8-thread contention + `Epoch` rewind, W^X unchained-overwrite recovery, 64 KB trampoline pool (`InstallStandaloneDetour5`), multi-plugin `priority` chain, `FilterVanilla` / `FilterSlot`, `ObserveOnly`, `'MRSS'` binary snapshot restore, Tombstone condition slot reclamation, custom transparent wrapper unwrapping, `CaptureCallerRvas` `.pdata` unwind, private `MtRandom` instance policies, `Selective` + 31 `ProtectSaveSeeds` RVAs, shadow-copy unload/reload & drain, SDK v3.5 main-thread ticks, wildcard event bus + recursion cap, and 4-thread `MhwRngServiceGuard` hot-reload stress (**Test 24**).
+- **World Service & Official Plugin Real-Machine-Code Tests**:
+  - **Test 25 (`mhw_world.dll` + Companion SDK)**: synthetic 15.23 Title -> Hub -> Guiding Lands -> weather/hour -> quest restart -> Title state transitions, popup queue delivery, `"mhw.catalog"` service resolution, `crit` `autoreset on/off`, live status integration across `size`/`endemic`/`thk`/`crit`, graceful unload degradation, and `steam` minimal showcase isolation.
   - `rng_size`: Rajang / Furious Rajang (`cSizeTable` zero-weight row skip + crown control).
   - `rng_steam` (`V3-9`): real Steamworks machine code decoding & lock.
   - `rng_crit` (**Test 22**): real `0x141F51380` + `0x141F605F0` machine code (coop passthrough, `rate`, `random`, `ratio`, `seq`, `mv_bank`, `mv_tier`, `bag`, `prd`, hot reload).
@@ -95,7 +98,7 @@ run_tests.bat
 
 Before cutting a release zip or pushing changes:
 1. Run `sync_plugin_sdks.bat && build.bat` -> verify `ALL BUILDS SUCCEEDED`.
-2. Run `run_tests.bat` -> confirm `Shadow-copy loaded 6 official plugins` and `ALL MICROKERNEL v3.0 & OFFICIAL PLUGIN AUDIT TESTS PASSED`.
-3. Run `python tools/package_release.py --check` -> verify `10/10 release payload entries` AND `patches/spl/winmm.dll` SHA256 (`64DAAE7CC00EC2ADA0113EDEE1B95A551383968212E4C2E85EFFFFB8402CED34`).
+2. Run `run_tests.bat` -> confirm `Shadow-copy loaded 7 official modules` and `ALL MICROKERNEL v3.5 & OFFICIAL PLUGIN AUDIT TESTS PASSED`.
+3. Run `python tools/package_release.py --check` -> verify `11/11 release payload entries` AND `patches/spl/winmm.dll` SHA256 (`64DAAE7CC00EC2ADA0113EDEE1B95A551383968212E4C2E85EFFFFB8402CED34`).
 4. Scan tracked docs and scripts to ensure **0** local file-scheme URIs or drive-letter paths.
-5. Run `python tools/package_release.py --out dist\mhw_rng-15.23.zip` -> confirm the zip contains **only** `winmm.dll`, `nativePC/plugins/mhw_rng.dll`, `nativePC/plugins/mhw_rng.ini`, the 6 `nativePC/plugins/mhw_rng/rng_*.dll` binaries, and `thk_presets/fatalis_p1_nasty.txt`.
+5. Run `python tools/package_release.py --out dist\mhw_rng-15.23.zip` -> confirm the zip contains **only** `winmm.dll`, `nativePC/plugins/mhw_rng.dll`, `nativePC/plugins/mhw_rng.ini`, `nativePC/plugins/mhw_rng/mhw_world.dll`, the 6 `nativePC/plugins/mhw_rng/rng_*.dll` binaries, and `thk_presets/fatalis_p1_nasty.txt`.

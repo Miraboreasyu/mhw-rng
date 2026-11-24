@@ -21,6 +21,7 @@ RELEASE_FILES: tuple[tuple[str, str], ...] = (
     ("winmm.dll", "patches/spl/winmm.dll"),
     ("nativePC/plugins/mhw_rng.dll", "build/mhw_rng.dll"),
     ("nativePC/plugins/mhw_rng.ini", "mhw_rng.ini"),
+    ("nativePC/plugins/mhw_rng/mhw_world.dll", "build/mhw_rng/mhw_world.dll"),
     ("nativePC/plugins/mhw_rng/rng_crit.dll", "build/mhw_rng/rng_crit.dll"),
     ("nativePC/plugins/mhw_rng/rng_endemic.dll", "build/mhw_rng/rng_endemic.dll"),
     ("nativePC/plugins/mhw_rng/rng_inspector.dll", "build/mhw_rng/rng_inspector.dll"),

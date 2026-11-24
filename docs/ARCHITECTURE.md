@@ -1,6 +1,6 @@
-# `mhw_rng` 核心框架与插件 SDK（v3.4）技术文档
+# `mhw_rng` 核心框架与插件 SDK（v3.5）技术文档
 
-本文档说明 `mhw_rng` 随机数接管框架的职责划分、底层 Hook 点位、MASM 寄存器现场捕获层、复合条件槽数据结构、多插件 Hook 链与后置过滤机制、插件热重载流程以及插件 SDK（`kMhwRngApiVersion == 3`，向后兼容至 v3.4 扩展）接口规范。目标客户端版本为《怪物猎人：世界 冰原》Steam 15.23（Build 15539686，默认镜像基址 `0x140000000`）。
+本文档说明 `mhw_rng` 随机数接管框架的职责划分、底层 Hook 点位、MASM 寄存器现场捕获层、复合条件槽数据结构、多插件 Hook 链与后置过滤机制、内置世界服务层（`mhw_world.dll`）、插件热重载流程以及插件 SDK（`kMhwRngApiVersion == 3`，向后兼容至 v3.5 扩展）接口规范。目标客户端版本为《怪物猎人：世界 冰原》Steam 15.23（Build 15539686，默认镜像基址 `0x140000000`）。
 
 > [!NOTE]
 > **职责边界与延伸阅读**
@@ -28,21 +28,28 @@ flowchart TD
         Host["影拷贝插件宿主与生命周期广播 (plugin_host.cpp)"]
     end
 
+    subgraph Services["共享上下文与配套头文件 (SDK v3.5)"]
+        World["mhw_world.dll (mhw.world 服务 / mhw.world.* 事件 / 主线程弹窗)"]
+        SdkHeaders["配套头文件: mhw_rng_math.h / mhw_1523_world.h / mhw_world_api.h / mhw_catalog_api.h"]
+    end
+
     subgraph Plugins["业务子插件 nativePC/plugins/mhw_rng/*.dll"]
-        Insp["rng_inspector.dll (静态调用点词典 / 统计导出 / 通用注入)"]
+        Insp["rng_inspector.dll (静态词典 / mhw.catalog 服务 / 导出)"]
         Size["rng_size.dll (怪物体型换算 / 按MonsterID分流)"]
-        Endemic["rng_endemic.dll (环境生物大小金档位与档内尺寸控制)"]
+        Endemic["rng_endemic.dll (环境生物体型与稀有出现控制)"]
         Thk["rng_thk.dll (通用THK节点探测/计数/序列与预设引擎)"]
-        Steam["rng_steam.dll (蒸汽机实时按键提示与锁序示例)"]
+        Steam["rng_steam.dll (蒸汽机实时解析与锁序 / 纯微内核极简范例)"]
         Crit["rng_crit.dll (攻击会心率与多模式分配控制)"]
         Custom["第三方扩展插件"]
     end
 
     PRNG -->|"5字节 E9 相对跳转"| Hooks --> Asm --> Table
     Chat -->|"解析 $rng / 每帧排空异步队列"| Host
-    Host -->|"输出聊天框系统消息"| Chat
+    Host -->|"输出聊天框系统消息 / 主线程Tick"| Chat
     Table <-->|"Pre链 / Post / FilterVanilla / Observer / SaveState"| Plugins
+    Host <-->|"影拷贝加载 .hotload/*.dll & 事件总线/服务租约"| World
     Host <-->|"影拷贝加载 .hotload/*.dll & 分发子命令/事件"| Plugins
+    World <-->|"可选服务订阅与降级访问"| Plugins
     Plugins -.->|"只读访问寄存器与栈帧/结构体"| GameMem
 ```
 
@@ -50,10 +57,11 @@ flowchart TD
 
 | 组件 | 游戏目录部署路径 | 对应源码 | 说明 |
 | :--- | :--- | :--- | :--- |
-| 核心模块 | `nativePC\plugins\mhw_rng.dll` | [dllmain.cpp](../src/dllmain.cpp)、[console_core.cpp](../src/console_core.cpp)、[console_overlay.cpp](../src/console_overlay.cpp)、[rng_trampolines.asm](../src/rng_trampolines.asm)、[rng_engine.cpp](../src/rng_engine.cpp)、[plugin_host.cpp](../src/plugin_host.cpp)、[hook.cpp](../src/hook.cpp) | 底层 Hook、游戏内终端窗口 (DX11/DX12/HDR + Readline + Tab 补全)、MASM 寄存器捕获、复合槽表、插件宿主 |
+| 核心模块 | `nativePC\plugins\mhw_rng.dll` | [dllmain.cpp](../src/dllmain.cpp)、[console_core.cpp](../src/console_core.cpp)、[console_overlay.cpp](../src/console_overlay.cpp)、[rng_trampolines.asm](../src/rng_trampolines.asm)、[rng_engine.cpp](../src/rng_engine.cpp)、[plugin_host.cpp](../src/plugin_host.cpp)、[hook.cpp](../src/hook.cpp) | 底层 Hook、游戏内终端窗口 (DX11/DX12/HDR + Readline + Tab 补全)、MASM 寄存器捕获、复合槽表、事件总线与服务宿主 |
+| 世界服务提供者 | `nativePC\plugins\mhw_rng\mhw_world.dll` | [world_plugin.cpp](../world/world_plugin.cpp) | 暴露 `"mhw.world"` v1 服务、轮询 15.23 世界单例触发 `"mhw.world.*"` 事件、主线程排空 HUD 弹窗、`$rng world` 指令 |
 | 配置文件 | `nativePC\plugins\mhw_rng.ini` | [mhw_rng.ini](../mhw_rng.ini)、[log_config.cpp](../src/log_config.cpp) | 启动模式 `BootMode`、存档种子保护 `ProtectSaveSeeds`、初始 `MasterSeed`、自动加载插件开关、按地址配置的 `[SlotOverrides]` |
 | 热加载缓存目录 | `nativePC\plugins\mhw_rng\.hotload\` | [plugin_host.cpp](../src/plugin_host.cpp#L278-L295) | 运行时自动创建的隐藏目录，存放影拷贝后的临时 DLL |
-| 插件 SDK 头文件 | *(仅编译期依赖，无需链接 `.lib`)* | [mhw_rng_api.h](../include/mhw_rng_api.h) | C ABI 数据结构、`MhwRngHostApi` 函数指针表与导出约定 |
+| 插件 SDK 与配套头文件 | *(纯头文件，无需链接 `.lib`)* | [mhw_rng_api.h](../include/mhw_rng_api.h)、[mhw_rng_math.h](../include/mhw_rng_math.h)、[mhw_1523_world.h](../include/mhw_1523_world.h)、[mhw_world_api.h](../include/mhw_world_api.h)、[mhw_catalog_api.h](../include/mhw_catalog_api.h) | 核心 C ABI、纯头文件数学/SEH 读取器、15.23 偏移常量与 `"mhw.world"` / `"mhw.catalog"` 服务 ABI |
 | 官方插件：`inspector` | `nativePC\plugins\mhw_rng\rng_inspector.dll` | [inspector_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-inspector/blob/main/inspector_plugin.cpp) | 详见《`rng_inspector` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-inspector/blob/main/README.md)) |
 | 官方插件：`size` | `nativePC\plugins\mhw_rng\rng_size.dll` | [size_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-size/blob/main/size_plugin.cpp) | 详见《`rng_size` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-size/blob/main/README.md)) |
 | 官方插件：`endemic` | `nativePC\plugins\mhw_rng\rng_endemic.dll` | [endemic_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-endemic/blob/main/endemic_plugin.cpp) | 详见《`rng_endemic` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-endemic/blob/main/README.md)) |
@@ -201,9 +209,9 @@ Windows 的 `LoadLibrary` 会锁定磁盘上的目标 DLL 文件，导致游戏�
 
 ---
 
-## 六、插件开发接口规范（Plugin SDK v3.4）
+## 六、插件开发接口规范（Plugin SDK v3.5）
 
-子插件只需包含单一头文件 [mhw_rng_api.h](../include/mhw_rng_api.h)，无需链接任何导入库。
+核心微内核只需包含单一头文件 [mhw_rng_api.h](../include/mhw_rng_api.h)，无需链接任何导入库；需要数学/15.23 结构辅助或跨插件服务时，可按需额外包含 Companion SDK 头文件（[mhw_rng_math.h](../include/mhw_rng_math.h)、[mhw_1523_world.h](../include/mhw_1523_world.h)、[mhw_world_api.h](../include/mhw_world_api.h)、[mhw_catalog_api.h](../include/mhw_catalog_api.h)）。`rng_steam.dll` 有意保持仅依赖 `mhw_rng_api.h`，作为纯粹的微内核开发范例。
 
 ### 1. 必选与可选导出函数
 每个子插件 DLL 需以 C 链接约定导出以下函数：
@@ -229,6 +237,8 @@ Windows 的 `LoadLibrary` 会锁定磁盘上的目标 DLL 文件，导致游戏�
 | 快照与实例 | `GetCondSlotInfo` / `GetActiveSlotCount` / `SnapshotActiveSlots` / `RestoreSlotState` / `CaptureStateBlob` / `RestoreStateBlob` | 读写单槽游标状态、导出/恢复带 CRC32 的全表二进制快照 |
 | 实例策略 | `SetInstancePolicy` / `GetInstancePolicy` | 控制私有 `MtRandom` 实例沿用自身状态或强制由调用点槽接管 |
 | 命令与元数据 | `RegisterSubcommand` / `RegisterSubcommandCompleter` / `RegisterSiteMeta` / `SetFallbackMetaResolver` / `QuerySiteMeta` / `FormatSlotCustom` | 注册 `$rng <subcmd>` 子命令、多级 Tab 补全回调、站点别名、描述及词典解析器（也可用 `MhwRng_Register*Bi` 与 `MhwRng_Tr` 头文件内联辅助） |
+| 主线程与事件总线 | `RegisterMainThreadTick` / `UnregisterMainThreadTick` / `SubscribeEvent` / `UnsubscribeEvent` / `EmitEvent` | 挂载每帧主线程轮询回调（通过 `sKeyboard::move` 驱动及 `MhwRng_PumpMainThreadTicks()` 触发）、按精确名/`prefix.*`/`*` 订阅主题消息（递归上限 8 层） |
+| 跨插件服务注册表 | `RegisterService` / `UnregisterService` / `AcquireService` / `ReleaseService` + `MhwRngServiceGuard<T>` | 64 槽位命名版本化服务表，使用原子 `generation` 与 `inFlightRefs` 在热卸载/热重载前排空所有活跃租约，防止悬空函数指针 |
 
 ### 3. 插件线程安全与编写约束
 1. **锁顺序要求**：插件内部若使用互斥锁保护自有状态，应将其视为纯叶子锁，**不要在持有插件内部互斥锁的同时调用 `host->...` 接口**。原因在于宿主执行 `FormatSlotCustom` 等查询时可能从外部调用插件回调，若插件持锁反向调用宿主或槽位接口，容易引入锁顺序反转。
@@ -308,6 +318,6 @@ cl.exe /nologo /std:c++17 /O2 /EHsc /MT /utf-8 /I "include" rng_meal.cpp /LD /Fe
 - `$rng rawfix` / `rawseed` / `rawseq` / `rawbypass` / `rawclear`：在不加载任何插件的情况下直接按数值 RVA 操作固定值、自定义种子、序列、直通与清理。
 
 ### 2. 构建、脱机回归测试与发布打包
-- 运行 [build.bat](../build.bat)：依次执行 `sync_plugin_sdks.bat` 与 `ml64` 汇编 [rng_trampolines.asm](../src/rng_trampolines.asm)，再使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll`、`build\mhw_rng\rng_steam.dll`、`build\mhw_rng\rng_crit.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
-- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证 **Test 1–23** 全量回归场景（8 线程隔离、`rng_size`、`rng_endemic` 体型与稀有环境生物/大鱼/毛吉、`rng_thk`、影拷贝热重载与 `sChat` 链自愈）及 SDK v3.0–v3.4 全部能力（非易失寄存器与 `XMM6/7` / 原入参捕获、多插件 Hook 优先级链、`ObserveOnly` 与通配观测器、`FilterVanilla` / `FilterSlot` 过滤、二进制快照恢复、生命周期事件、并发异步聊天投递、堆序列与 Tombstone 槽回收、动态透明包装、私有实例策略、`rng_steam` 真实代码测试 `V3-9`、64 KB 预留独立 W^X 跳板池、`Selective` 与 `ProtectSaveSeeds` 回归、标准化 i18n 零 CJK 扫描、终端 Readline/IME 状态与多级 Tab 补全，以及 `rng_crit` 在真实 `0x141f51380` / `0x141f605f0` 上的全部模式与热重载验证）。
-- 发布打包：执行 `python tools/package_release.py --check`（或 `--out <zip路径>`），将 [patches/spl/winmm.dll](../patches/spl/winmm.dll) 与游戏实际加载的 9 个运行时文件打包为纯净发布包，具体维护与发版检查流程详见 [MAINTENANCE_AND_TESTING.md](MAINTENANCE_AND_TESTING.md)。
+- 运行 [build.bat](../build.bat)：依次执行 `sync_plugin_sdks.bat` 与 `ml64` 汇编 [rng_trampolines.asm](../src/rng_trampolines.asm)，再使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\mhw_world.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll`、`build\mhw_rng\rng_steam.dll`、`build\mhw_rng\rng_crit.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
+- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证 **Test 1–25** 全量回归场景（8 线程隔离、`rng_size`、`rng_endemic`、`rng_thk`、`rng_crit`、`rng_steam`、`rng_inspector` 与 `mhw_world.dll`），覆盖 SDK v3.0–v3.5 全部能力（主线程 Tick、事件总线精确/通配与递归防重入、4 线程 `ServiceGuard` 并发热重载 `mhw_world.dll`、模拟 15.23 进图/聚魔/天气/回标题状态机与无 `mhw_world` 时优雅降级）。
+- 发布打包：执行 `python tools/package_release.py --check`（或 `--out <zip路径>`），将 [patches/spl/winmm.dll](../patches/spl/winmm.dll) 与游戏实际加载的 10 个运行时文件（共 11 项）打包为纯净发布包，具体维护与发版检查流程详见 [MAINTENANCE_AND_TESTING.md](MAINTENANCE_AND_TESTING.md)。

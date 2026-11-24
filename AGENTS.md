@@ -30,10 +30,12 @@ This file is the cold-start manual for any AI harness or contributor maintaining
 
 | Path | Purpose |
 | :--- | :--- |
-| [`include/mhw_rng_api.h`](include/mhw_rng_api.h) | Single-header C ABI SDK (`kMhwRngApiVersion == 3`, v3.4 extensions). Authoritative source; propagated via [`sync_plugin_sdks.bat`](sync_plugin_sdks.bat). |
-| [`src/`](src) | Microkernel C++/MASM source: entry/3-phase startup (`dllmain.cpp`), W^X pool (`hook.cpp`/`hook.h`), GPR+XMM capture (`rng_trampolines.asm`), 16K slot table & hook chains (`rng_engine.cpp`/`rng_engine.h`), shadow-copy plugin host (`plugin_host.cpp`/`plugin_host.h`), command router (`command_router.cpp`/`command_router.h`), DX11/DX12 overlay terminal & IME (`console_core.*`, `console_overlay.*`), INI/log (`log_config.*`), static 15.23 RVAs (`mhw_addresses.h`). |
+| [`include/mhw_rng_api.h`](include/mhw_rng_api.h) | Single-header C ABI SDK (`kMhwRngApiVersion == 3`, v3.5 extensions: main-thread tick, topic event bus, service registry). Authoritative source; propagated via [`sync_plugin_sdks.bat`](sync_plugin_sdks.bat). |
+| [`include/mhw_rng_math.h`](include/mhw_rng_math.h), [`include/mhw_1523_world.h`](include/mhw_1523_world.h), [`include/mhw_world_api.h`](include/mhw_world_api.h), [`include/mhw_catalog_api.h`](include/mhw_catalog_api.h) | Header-only Companion SDK (pure math/SEH readers, verified 15.23 world singletons/offsets, `"mhw.world"` & `"mhw.catalog"` service ABIs). Synced to world-aware submodules (intentionally omitted from `plugins/steam/` as minimal direct-SDK showcase). |
+| [`world/`](world/world_plugin.cpp) | Built-in core service provider `mhw_world.dll`: polls 15.23 world singletons via `RegisterMainThreadTick`, registers `"mhw.world"` v1 (`MhwWorldApi`), emits `"mhw.world.*"` transition events, drains main-thread `DisplayPopup` calls, and provides `$rng world`. |
+| [`src/`](src) | Microkernel C++/MASM source: entry/3-phase startup (`dllmain.cpp`), W^X pool (`hook.cpp`/`hook.h`), GPR+XMM capture (`rng_trampolines.asm`), 16K slot table & hook chains (`rng_engine.cpp`/`rng_engine.h`), shadow-copy plugin & service host (`plugin_host.cpp`/`plugin_host.h`), command router (`command_router.cpp`/`command_router.h`), DX11/DX12 overlay terminal & IME (`console_core.*`, `console_overlay.*`), INI/log (`log_config.*`), static 15.23 RVAs (`mhw_addresses.h`). |
 | [`plugins/`](plugins) | 6 official submodule plugins (`size`, `inspector`, `endemic`, `thk`, `steam`, `crit`). |
-| [`tests/test_rng_harness.cpp`](tests/test_rng_harness.cpp) | Real-machine-code offline regression suite (**Test 1–23**) mapping unpacked `text_1523.bin` via `VirtualAlloc` (`kImageSize = 0x06000000`). |
+| [`tests/test_rng_harness.cpp`](tests/test_rng_harness.cpp) | Real-machine-code offline regression suite (**Test 1–25**) mapping unpacked `text_1523.bin` via `VirtualAlloc` (`kImageSize = 0x06000000`). |
 | [`patches/spl/`](patches/spl/README.md) | Minimal patched `winmm.dll` preventing post-return-to-title DXGI `ResizeBuffers` WndProc re-subclass loop. |
 | [`tools/`](tools) | [`package_release.py`](tools/package_release.py) (`--check` / `--out`), [`gen_rng_catalog.py`](tools/gen_rng_catalog.py), [`annotate_rng_dump.py`](tools/annotate_rng_dump.py). |
 | [`mhw_rng.ini`](mhw_rng.ini) | Default runtime INI shipped inside `nativePC\plugins\mhw_rng.ini`. |
@@ -45,14 +47,14 @@ This file is the cold-start manual for any AI harness or contributor maintaining
 Run from an MSVC x64 developer environment (or `build.bat` / `run_tests.bat` auto-locates VS via `vswhere.exe`):
 
 ```bat
-:: 1. Sync SDK header to the 6 official plugins & build all 7 binaries + preset
+:: 1. Sync SDK header(s) to official submodules & build all 8 binaries + preset
 sync_plugin_sdks.bat && build.bat
 
-:: 2. Run all offline machine-code tests (Test 1..23; requires MHW 15.23 .text dump)
+:: 2. Run all offline machine-code tests (Test 1..25; requires MHW 15.23 .text dump)
 set MHW_TEXT_BIN=<path-to-text_1523.bin>
 run_tests.bat
 
-:: 3. Validate release payload (10/10 files + patched winmm.dll SHA256 guard)
+:: 3. Validate release payload (11/11 files + patched winmm.dll SHA256 guard)
 python tools/package_release.py --check
 
 :: 4. Build clean release zip (only game-loaded binaries/INI/preset)
@@ -64,7 +66,7 @@ python tools/package_release.py --out dist\mhw_rng-15.23.zip
 ## 4. Non-Negotiable Engineering Invariants
 
 1. **Pure-RNG Discipline**: Prefer `RegisterSlotHookEx` (`Pre` / `Post` / `FilterVanilla` / `FilterSlot`) over business-function detours. Core detours live strictly in the 64 KB `PAGE_EXECUTE_READ` W^X pool ([`hook.cpp`](src/hook.cpp)).
-2. **Leaf Mutex Discipline**: Neither the microkernel nor any plugin may hold an internal mutex while calling across the plugin/host boundary (`g_host->...` or plugin hooks/formatters). Snapshot state under `std::lock_guard`, unlock, then call out.
+2. **Leaf Mutex Discipline**: Neither the microkernel nor any plugin may hold an internal mutex while calling across the plugin/host boundary (`g_host->...`, `MhwRngServiceGuard`, `EmitEvent`, or plugin hooks/formatters). Snapshot state under `std::lock_guard`, unlock, then call out. Always degrade gracefully when optional services like `"mhw.world"` are unloaded.
 3. **SEH Safety**: Accesses to game memory pointers in callbacks or host unwinding (`CaptureCallerRvas`) must validate user-mode address bounds and run inside `__try / __except` helpers with **zero C++ objects requiring stack unwinding** in the SEH frame.
 4. **4 Engine Modes (`Selective` default)**: Never alter untouched game calls or the 31 save-persisted seed steppers in `Selective` or `ObserveOnly` (`Pre` is skipped in `ObserveOnly`; only hooks with `kMhwRngHookObserveOnly` receive read-only `Post`).
 5. **Bilingual Zero-CJK Sweep (Test 20)**: Switching `$rng lang en` triggers Test 20's CJK scan over all core & official plugin chat responses and `$rng dump`. Both English and Simplified Chinese strings must be complete and cleanly separated (`MhwRng_HostIsEnglish`).

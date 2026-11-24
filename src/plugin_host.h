@@ -53,6 +53,9 @@ bool CompletePluginSubcommand(const std::string& subcmdLower,
                               const std::string& currentPrefix,
                               std::vector<std::string>& outCandidates);
 
+// Dispatches registered main-thread tick callbacks (invoked once per main update frame)
+void DispatchMainThreadTicks() noexcept;
+
 // Metadata & formatting queries (used by Kernel `$rng` status and by plugins like `inspector`)
 bool        QuerySiteMeta(std::uint32_t rva, MhwRngSiteMeta* outMeta);
 bool        FormatSlotCustom(const MhwRngSlotSnapshot* snap, char* outBuf, std::size_t bufCap);

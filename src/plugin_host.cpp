@@ -59,6 +59,37 @@ struct RegisteredLifecycleHook {
     void*             userData = nullptr;
 };
 
+struct RegisteredMainThreadTick {
+    MhwRngPluginId         ownerId  = 0;
+    MhwRngHookHandle       handle   = 0;
+    MhwRngMainThreadTickFn fn       = nullptr;
+    void*                  userData = nullptr;
+};
+
+struct RegisteredEventSub {
+    MhwRngPluginId      ownerId        = 0;
+    MhwRngHookHandle    handle         = 0;
+    bool                wildcardAll    = false;
+    bool                prefixWildcard = false;
+    std::string         patternLower;
+    std::string         prefixLower;
+    MhwRngCustomEventFn fn             = nullptr;
+    void*               userData       = nullptr;
+};
+
+constexpr std::size_t kMaxServices = 64U;
+
+struct ServiceSlot {
+    bool                       occupied = false;
+    bool                       draining = false;
+    std::atomic<std::uint32_t> generation{1U};
+    std::uint32_t              version  = 0U;
+    MhwRngPluginId             ownerId  = 0U;
+    char                       name[64]{};
+    const void*                apiTable = nullptr;
+    std::atomic<std::uint32_t> inFlightRefs{0U};
+};
+
 struct LoadedPlugin {
     MhwRngPluginId               id = 0;
     std::string                  shortName;
@@ -106,17 +137,24 @@ AsyncChatSinkFn                  g_asyncChatSink = nullptr;
 MhwRngHostApi                    g_hostApi{};
 MhwRngPluginId                   g_nextPluginId     = 1U;
 std::uint32_t                    g_nextLifecycleHdl = 1U;
+std::uint32_t                    g_nextTickHdl      = 1U;
+std::uint32_t                    g_nextEventSubHdl  = 1U;
 std::uint32_t                    g_shadowGen        = 1U;
+std::atomic<std::uint64_t>       g_mainTickSeq{0ULL};
+std::atomic<std::uint64_t>       g_customEventSeq{0ULL};
 
 // Static lock-free ring of plugin shortNames so `GetPluginShortName()` never returns dangling heap pointers:
 constexpr std::size_t            kShortNameSlotCount = 512U;
 char                             g_shortNameCache[kShortNameSlotCount][32]{};
 
-std::vector<LoadedPlugin>            g_plugins;
-std::vector<RegisteredSubcmd>        g_subcmds;
-std::vector<RegisteredSiteMeta>      g_siteMetas;
-std::vector<FallbackResolver>        g_fallbackResolvers;
-std::vector<RegisteredLifecycleHook> g_lifecycleHooks;
+std::vector<LoadedPlugin>             g_plugins;
+std::vector<RegisteredSubcmd>         g_subcmds;
+std::vector<RegisteredSiteMeta>       g_siteMetas;
+std::vector<FallbackResolver>         g_fallbackResolvers;
+std::vector<RegisteredLifecycleHook>  g_lifecycleHooks;
+std::vector<RegisteredMainThreadTick> g_mainTicks;
+std::vector<RegisteredEventSub>       g_eventSubs;
+ServiceSlot                           g_services[kMaxServices]{};
 
 std::string LowerAscii(std::string s) {
     for (char& c : s) {
@@ -195,6 +233,8 @@ std::string DeriveShortNameFromFilename(const std::string& fileName) {
     if (s.rfind("mhw_rng_", 0) == 0 && s.size() > 8U) {
         s = s.substr(8U);
     } else if (s.rfind("rng_", 0) == 0 && s.size() > 4U) {
+        s = s.substr(4U);
+    } else if (s.rfind("mhw_", 0) == 0 && s.size() > 4U) {
         s = s.substr(4U);
     }
     return s;
@@ -300,6 +340,131 @@ void InvokeLifecycleSEH(MhwRngLifecycleFn fn,
     }
 }
 
+void InvokeMainTickSEH(MhwRngMainThreadTickFn fn,
+                       std::uint64_t tickSeq,
+                       void* userData) noexcept {
+    __try {
+        fn(tickSeq, userData);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+void InvokeCustomEventSEH(MhwRngCustomEventFn fn,
+                          const MhwRngCustomEvent* ev,
+                          void* userData) noexcept {
+    __try {
+        fn(ev, userData);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+std::uint32_t EmitEventInternal(MhwRngPluginId selfId,
+                                const char* topic,
+                                const void* payload,
+                                std::uint32_t payloadSize) noexcept {
+    if (!topic || topic[0] == '\0') return 0U;
+    thread_local int tls_emitDepth = 0;
+    if (tls_emitDepth >= 8) return 0U;
+    struct DepthGuard {
+        int& d;
+        explicit DepthGuard(int& v) noexcept : d(v) { ++d; }
+        ~DepthGuard() noexcept { --d; }
+    } depthGuard(tls_emitDepth);
+
+    const std::string topicLow = LowerAscii(topic);
+    InFlightHostGuard guard;
+    std::vector<RegisteredEventSub> matched;
+    {
+        std::lock_guard<std::mutex> rlk(g_registryMx);
+        for (const auto& s : g_eventSubs) {
+            bool hit = false;
+            if (s.wildcardAll) {
+                hit = true;
+            } else if (s.prefixWildcard) {
+                hit = (topicLow.rfind(s.prefixLower, 0) == 0);
+            } else {
+                hit = (topicLow == s.patternLower);
+            }
+            if (hit && s.fn) {
+                matched.push_back(s);
+            }
+        }
+        if (!matched.empty()) {
+            guard.Arm();
+        }
+    }
+    if (matched.empty()) return 0U;
+
+    MhwRngCustomEvent ev{};
+    ev.structSize  = sizeof(MhwRngCustomEvent);
+    ev.payloadSize = payloadSize;
+    ev.topic       = topicLow.c_str();
+    ev.senderId    = selfId;
+    ev.reserved    = 0U;
+    ev.seq         = g_customEventSeq.fetch_add(1U, std::memory_order_relaxed) + 1ULL;
+    ev.payload     = payload;
+
+    std::uint32_t delivered = 0U;
+    for (const auto& s : matched) {
+        InvokeCustomEventSEH(s.fn, &ev, s.userData);
+        ++delivered;
+    }
+    return delivered;
+}
+
+void DrainAndClearServicesForPlugin(MhwRngPluginId targetId, const char* singleNameLowerOrNull) {
+    struct DrainedEntry {
+        std::size_t               idx = 0U;
+        MhwRngServiceEventPayload evPayload{};
+    };
+    std::vector<DrainedEntry> toDrain;
+    {
+        std::lock_guard<std::mutex> rlk(g_registryMx);
+        for (std::size_t i = 0U; i < kMaxServices; ++i) {
+            ServiceSlot& s = g_services[i];
+            if (!s.occupied || s.draining) continue;
+            if (s.ownerId != targetId) continue;
+            if (singleNameLowerOrNull && std::strcmp(s.name, singleNameLowerOrNull) != 0) continue;
+            s.draining = true;
+            DrainedEntry de{};
+            de.idx                   = i;
+            de.evPayload.structSize  = sizeof(MhwRngServiceEventPayload);
+            de.evPayload.version     = s.version;
+            de.evPayload.ownerId     = s.ownerId;
+            CopyTrunc(de.evPayload.name, sizeof(de.evPayload.name), s.name);
+            toDrain.push_back(de);
+        }
+    }
+    if (toDrain.empty()) return;
+
+    // Spin-wait outside `g_registryMx` until all active `MhwRngServiceGuard` / `AcquireService` leases finish!
+    for (const auto& de : toDrain) {
+        while (g_services[de.idx].inFlightRefs.load(std::memory_order_seq_cst) != 0U) {
+            _mm_pause();
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> rlk(g_registryMx);
+        for (const auto& de : toDrain) {
+            ServiceSlot& s = g_services[de.idx];
+            s.occupied = false;
+            s.draining = false;
+            s.version  = 0U;
+            s.ownerId  = 0U;
+            s.apiTable = nullptr;
+            s.name[0]  = '\0';
+        }
+    }
+
+    for (const auto& de : toDrain) {
+        (void)EmitEventInternal(targetId,
+                                "kernel.service.unregistered",
+                                &de.evPayload,
+                                static_cast<std::uint32_t>(sizeof(de.evPayload)));
+    }
+}
+
 void BroadcastLifecycleEvent(const MhwRngEventInfo* info) noexcept {
     if (!info) return;
     InFlightHostGuard guard;
@@ -347,7 +512,10 @@ void UnloadByIdLifecycleLocked(MhwRngPluginId targetId) {
     // 1. Detach all synchronous RNG slot callbacks and wait for in-flight calls to drain (WITHOUT `g_registryMx`!)
     rng::DetachAllHooksForPluginAndWait(p.id);
 
-    // 2. Remove registered subcommands, metadata, fallback resolvers, lifecycle hooks, and slot overrides
+    // 2. Drain any active service leases (`AcquireService` / `MhwRngServiceGuard`) before removing the DLL
+    DrainAndClearServicesForPlugin(p.id, nullptr);
+
+    // 3. Remove registered subcommands, metadata, fallback resolvers, lifecycle hooks, main-thread ticks, and event subs
     {
         std::lock_guard<std::mutex> rlk(g_registryMx);
         g_subcmds.erase(
@@ -366,8 +534,16 @@ void UnloadByIdLifecycleLocked(MhwRngPluginId targetId) {
             std::remove_if(g_lifecycleHooks.begin(), g_lifecycleHooks.end(),
                            [&](const RegisteredLifecycleHook& l) { return l.ownerId == p.id; }),
             g_lifecycleHooks.end());
+        g_mainTicks.erase(
+            std::remove_if(g_mainTicks.begin(), g_mainTicks.end(),
+                           [&](const RegisteredMainThreadTick& t) { return t.ownerId == p.id; }),
+            g_mainTicks.end());
+        g_eventSubs.erase(
+            std::remove_if(g_eventSubs.begin(), g_eventSubs.end(),
+                           [&](const RegisteredEventSub& s) { return s.ownerId == p.id; }),
+            g_eventSubs.end());
     }
-    // Wait for any in-flight non-hot-path callbacks (Lifecycle / QuerySiteMeta / FormatSlotCustom)
+    // Wait for any in-flight non-hot-path callbacks (Lifecycle / MainThreadTick / CustomEvent / QuerySiteMeta / FormatSlotCustom)
     // before invoking Shutdown or FreeLibrary on the shadow DLL.
     while (g_inFlightHostCallbacks.load(std::memory_order_seq_cst) != 0U) {
         _mm_pause();
@@ -783,6 +959,175 @@ bool __fastcall Host_SetFallbackMetaResolver(MhwRngPluginId selfId,
     return true;
 }
 
+MhwRngHookHandle __fastcall Host_RegisterMainThreadTick(MhwRngPluginId selfId,
+                                                        MhwRngMainThreadTickFn fn,
+                                                        void* userData) {
+    if (!fn) return kMhwRngInvalidHandle;
+    std::lock_guard<std::mutex> rlk(g_registryMx);
+    const MhwRngHookHandle h = g_nextTickHdl++;
+    if (g_nextTickHdl == 0U) g_nextTickHdl = 1U;
+    g_mainTicks.push_back(RegisteredMainThreadTick{selfId, h, fn, userData});
+    return h;
+}
+
+void __fastcall Host_UnregisterMainThreadTick(MhwRngPluginId selfId, MhwRngHookHandle handle) {
+    if (handle == kMhwRngInvalidHandle) return;
+    std::lock_guard<std::mutex> rlk(g_registryMx);
+    g_mainTicks.erase(
+        std::remove_if(g_mainTicks.begin(), g_mainTicks.end(),
+                       [&](const RegisteredMainThreadTick& t) {
+                           return t.handle == handle && (selfId == 0U || t.ownerId == selfId);
+                       }),
+        g_mainTicks.end());
+}
+
+MhwRngHookHandle __fastcall Host_SubscribeEvent(MhwRngPluginId selfId,
+                                                const char* topicPattern,
+                                                MhwRngCustomEventFn fn,
+                                                void* userData) {
+    if (!topicPattern || topicPattern[0] == '\0' || !fn) return kMhwRngInvalidHandle;
+    std::string pat = LowerAscii(topicPattern);
+    RegisteredEventSub sub{};
+    sub.ownerId      = selfId;
+    sub.patternLower = pat;
+    sub.fn           = fn;
+    sub.userData     = userData;
+    if (pat == "*") {
+        sub.wildcardAll = true;
+    } else if (pat.size() >= 2U && pat[pat.size() - 1U] == '*' && pat[pat.size() - 2U] == '.') {
+        sub.prefixWildcard = true;
+        sub.prefixLower    = pat.substr(0U, pat.size() - 1U);
+    }
+
+    std::lock_guard<std::mutex> rlk(g_registryMx);
+    const MhwRngHookHandle h = g_nextEventSubHdl++;
+    if (g_nextEventSubHdl == 0U) g_nextEventSubHdl = 1U;
+    sub.handle = h;
+    g_eventSubs.push_back(std::move(sub));
+    return h;
+}
+
+void __fastcall Host_UnsubscribeEvent(MhwRngPluginId selfId, MhwRngHookHandle handle) {
+    if (handle == kMhwRngInvalidHandle) return;
+    std::lock_guard<std::mutex> rlk(g_registryMx);
+    g_eventSubs.erase(
+        std::remove_if(g_eventSubs.begin(), g_eventSubs.end(),
+                       [&](const RegisteredEventSub& s) {
+                           return s.handle == handle && (selfId == 0U || s.ownerId == selfId);
+                       }),
+        g_eventSubs.end());
+}
+
+std::uint32_t __fastcall Host_EmitEvent(MhwRngPluginId selfId,
+                                        const char* topic,
+                                        const void* payload,
+                                        std::uint32_t payloadSize) {
+    return EmitEventInternal(selfId, topic, payload, payloadSize);
+}
+
+bool __fastcall Host_RegisterService(MhwRngPluginId selfId,
+                                     const char* serviceName,
+                                     std::uint32_t version,
+                                     const void* apiTable) {
+    if (!serviceName || serviceName[0] == '\0' || version == 0U || !apiTable) return false;
+    const std::string low = LowerAscii(serviceName);
+    if (low.size() >= sizeof(ServiceSlot::name)) return false;
+
+    MhwRngServiceEventPayload evPayload{};
+    evPayload.structSize = sizeof(MhwRngServiceEventPayload);
+    evPayload.version    = version;
+    evPayload.ownerId    = selfId;
+    CopyTrunc(evPayload.name, sizeof(evPayload.name), low.c_str());
+
+    {
+        std::lock_guard<std::mutex> rlk(g_registryMx);
+        std::size_t freeIdx = kMaxServices;
+        for (std::size_t i = 0U; i < kMaxServices; ++i) {
+            ServiceSlot& s = g_services[i];
+            if (!s.occupied) {
+                if (freeIdx == kMaxServices) freeIdx = i;
+                continue;
+            }
+            if (std::strcmp(s.name, low.c_str()) == 0) {
+                if (s.draining || s.ownerId != selfId) {
+                    return false;
+                }
+                s.version  = version;
+                s.apiTable = apiTable;
+                goto registered_ok;
+            }
+        }
+        if (freeIdx >= kMaxServices) return false;
+        {
+            ServiceSlot& s = g_services[freeIdx];
+            std::uint32_t nextGen = s.generation.load(std::memory_order_relaxed) + 1U;
+            if (nextGen == 0U) nextGen = 1U;
+            s.generation.store(nextGen, std::memory_order_relaxed);
+            s.occupied = true;
+            s.draining = false;
+            s.version  = version;
+            s.ownerId  = selfId;
+            CopyTrunc(s.name, sizeof(s.name), low.c_str());
+            s.apiTable = apiTable;
+            s.inFlightRefs.store(0U, std::memory_order_release);
+        }
+    }
+
+registered_ok:
+    (void)EmitEventInternal(selfId,
+                            "kernel.service.registered",
+                            &evPayload,
+                            static_cast<std::uint32_t>(sizeof(evPayload)));
+    return true;
+}
+
+void __fastcall Host_UnregisterService(MhwRngPluginId selfId, const char* serviceName) {
+    if (!serviceName || serviceName[0] == '\0') return;
+    const std::string low = LowerAscii(serviceName);
+    DrainAndClearServicesForPlugin(selfId, low.c_str());
+}
+
+MhwRngServiceLease __fastcall Host_AcquireService(const char* serviceName,
+                                                  std::uint32_t minVersion,
+                                                  MhwRngServiceInfo* outInfo) {
+    if (!serviceName || serviceName[0] == '\0' || !outInfo) return kMhwRngInvalidLease;
+    if (outInfo->structSize != 0U && outInfo->structSize < sizeof(MhwRngServiceInfo)) return kMhwRngInvalidLease;
+    const std::string low = LowerAscii(serviceName);
+
+    std::lock_guard<std::mutex> rlk(g_registryMx);
+    for (std::size_t i = 0U; i < kMaxServices; ++i) {
+        ServiceSlot& s = g_services[i];
+        if (!s.occupied || s.draining) continue;
+        if (std::strcmp(s.name, low.c_str()) != 0) continue;
+        if (s.version < minVersion || !s.apiTable) return kMhwRngInvalidLease;
+
+        s.inFlightRefs.fetch_add(1U, std::memory_order_seq_cst);
+        outInfo->structSize = sizeof(MhwRngServiceInfo);
+        outInfo->version    = s.version;
+        outInfo->ownerId    = s.ownerId;
+        outInfo->reserved   = 0U;
+        outInfo->name       = s.name;
+        outInfo->apiTable   = s.apiTable;
+        const std::uint32_t gen = s.generation.load(std::memory_order_acquire);
+        return (static_cast<std::uint64_t>(gen) << 32) | static_cast<std::uint64_t>(i + 1U);
+    }
+    return kMhwRngInvalidLease;
+}
+
+void __fastcall Host_ReleaseService(MhwRngServiceLease lease) {
+    if (lease == kMhwRngInvalidLease) return;
+    const std::uint32_t idxPlus1 = static_cast<std::uint32_t>(lease & 0xFFFFFFFFULL);
+    const std::uint32_t gen      = static_cast<std::uint32_t>(lease >> 32);
+    if (idxPlus1 == 0U || idxPlus1 > kMaxServices) return;
+
+    ServiceSlot& s = g_services[idxPlus1 - 1U];
+    if (s.generation.load(std::memory_order_acquire) != gen) return;
+    std::uint32_t cur = s.inFlightRefs.load(std::memory_order_acquire);
+    while (cur > 0U && !s.inFlightRefs.compare_exchange_weak(
+                           cur, cur - 1U, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    }
+}
+
 } // namespace
 
 // ============================================================================
@@ -882,6 +1227,17 @@ void Init(std::uintptr_t exeBase,
 
     // v3.4 subcommand Tab-completion extension
     g_hostApi.RegisterSubcommandCompleter  = &Host_RegisterSubcommandCompleter;
+
+    // v3.5 main-thread tick, event bus & hot-reload-safe service registry
+    g_hostApi.RegisterMainThreadTick       = &Host_RegisterMainThreadTick;
+    g_hostApi.UnregisterMainThreadTick     = &Host_UnregisterMainThreadTick;
+    g_hostApi.SubscribeEvent               = &Host_SubscribeEvent;
+    g_hostApi.UnsubscribeEvent             = &Host_UnsubscribeEvent;
+    g_hostApi.EmitEvent                    = &Host_EmitEvent;
+    g_hostApi.RegisterService              = &Host_RegisterService;
+    g_hostApi.UnregisterService            = &Host_UnregisterService;
+    g_hostApi.AcquireService               = &Host_AcquireService;
+    g_hostApi.ReleaseService               = &Host_ReleaseService;
 }
 
 void ShutdownAll() {
@@ -952,7 +1308,8 @@ bool LoadOrReloadSingle(const std::string& nameOrFile, std::string& outMsg) {
         nameOrFile,
         nameOrFile + ".dll",
         "rng_" + nameOrFile + ".dll",
-        "mhw_rng_" + nameOrFile + ".dll"
+        "mhw_rng_" + nameOrFile + ".dll",
+        "mhw_" + nameOrFile + ".dll"
     };
     for (const std::string& fn : cands) {
         const std::string full = g_subPluginDir + "\\" + fn;
@@ -1009,6 +1366,23 @@ std::size_t ReloadAll(std::string& outMsg) {
     }
     outMsg = buf;
     return n;
+}
+
+void DispatchMainThreadTicks() noexcept {
+    InFlightHostGuard guard;
+    std::vector<RegisteredMainThreadTick> snapshot;
+    {
+        std::lock_guard<std::mutex> rlk(g_registryMx);
+        if (g_mainTicks.empty()) return;
+        snapshot = g_mainTicks;
+        guard.Arm();
+    }
+    const std::uint64_t seq = g_mainTickSeq.fetch_add(1U, std::memory_order_relaxed) + 1ULL;
+    for (const auto& t : snapshot) {
+        if (t.fn) {
+            InvokeMainTickSEH(t.fn, seq, t.userData);
+        }
+    }
 }
 
 bool DispatchPluginSubcommand(const std::string& subcmdLower,
@@ -1221,4 +1595,8 @@ const MhwRngHostApi* GetHostApiTable() noexcept {
 
 MHW_RNG_API const MhwRngHostApi* MhwRng_GetHostApi() {
     return plugin_host::GetHostApiTable();
+}
+
+MHW_RNG_API void MhwRng_PumpMainThreadTicks() {
+    plugin_host::DispatchMainThreadTicks();
 }

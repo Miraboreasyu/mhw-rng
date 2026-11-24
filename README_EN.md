@@ -26,23 +26,29 @@ MIRA separates low-level hook installation, slot state management, and plugin ho
 ```mermaid
 flowchart LR
     Game["MonsterHunterWorld.exe 15.23 (10 PRNG Entries)"]
-    Kernel["MIRA Microkernel (mhw_rng.dll: W^X Pool + MASM Regs + 16K Slots + Hook Chains)"]
+    Kernel["MIRA Microkernel (mhw_rng.dll: W^X Pool + MASM Regs + 16K Slots + Event/Service Host)"]
+    World["mhw_world.dll (Optional mhw.world Context & Events)"]
     PlugSize["rng_size.dll"]
     PlugEnd["rng_endemic.dll"]
     PlugThk["rng_thk.dll"]
-    PlugSteam["rng_steam.dll"]
+    PlugSteam["rng_steam.dll (Pure-SDK Showcase)"]
     PlugCrit["rng_crit.dll"]
-    PlugInsp["rng_inspector.dll"]
+    PlugInsp["rng_inspector.dll (mhw.catalog)"]
     PlugCustom["Custom Plugins"]
 
     Game -->|"5-byte E9 Detour + Chaining"| Kernel
-    Kernel <-->|"SDK v3.0 C ABI (Pre / Post / FilterVanilla / Observer)"| PlugSize
-    Kernel <-->|"SDK v3.0 C ABI"| PlugEnd
-    Kernel <-->|"SDK v3.0 C ABI"| PlugThk
-    Kernel <-->|"SDK v3.0 C ABI"| PlugSteam
-    Kernel <-->|"SDK v3.4 + 0x1F51380 Crit Hook"| PlugCrit
+    Kernel <-->|"SDK v3.5 C ABI (Tick / Events / Service Leases)"| World
+    Kernel <-->|"SDK v3.5 C ABI"| PlugSize
+    Kernel <-->|"SDK v3.5 C ABI"| PlugEnd
+    Kernel <-->|"SDK v3.5 C ABI"| PlugThk
+    Kernel <-->|"SDK v3.0 Direct C ABI"| PlugSteam
+    Kernel <-->|"SDK v3.5 + 0x1F51380 Crit Hook"| PlugCrit
     Kernel <-->|"Fallback Meta + Stats"| PlugInsp
-    Kernel <-->|"Single Header mhw_rng_api.h"| PlugCustom
+    Kernel <-->|"mhw_rng_api.h + Companion Headers"| PlugCustom
+    World -.->|"mhw.world / mhw.world.*"| PlugSize
+    World -.->|"mhw.world / Popups"| PlugEnd
+    World -.->|"quest / title events"| PlugThk
+    World -.->|"autoreset events"| PlugCrit
 ```
 
 ### RNG Manipulation Capabilities Provided by the Microkernel
@@ -81,9 +87,10 @@ Plugins placed in `nativePC\plugins\mhw_rng\*.dll` are loaded through shadow cop
 | **`size`** | `rng_size.dll` | `0x169BA15` | Per-`MonsterID` crown and size control for all 71 large monsters; safe open interval `[0x00000001U, 0xFFFFFF00U]` skips zero-weight disabled rows; live `cSizeTable` inverse solving (`exact`). Examples: `$rng size furious_rajang min`, `$rng size rajang* exact 116` | [mhw-rng-size](https://github.com/Miraboreasyu/mhw-rng-size) \| [README](plugins/size/README.md) |
 | **`endemic`** | `rng_endemic.dll` | `0x166CFE1` / `0x0672FBC` / `0x1669CB6` / `0x1A4ACED` / `0x0271F25` / `0x166D12E` / `0x1A44FCC` | Covers both map spawn and capture size rolls, filters shared float helpers by caller return address, supports crown tiers, per-`ecXXX_YY` rules, and live `rAnimalSize` scale/cm solving. Also forces or blocks rare endemic life, extra Great-size fish and regional rare Moly spawns via pure RNG (vanilla weather/time/Guiding Lands level gates still apply), with in-game Simplified Chinese / English name selectors. Examples: `$rng endemic max`, `$rng endemic ec059_02 exact 25.5cm`, `$rng endemic rare wintermoon_nettle on` | [mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic) \| [README](plugins/endemic/README.md) |
 | **`thk`** | `rng_thk.dll` + `thk_presets\*.txt` | `0x1339C8C` | Pure-RNG THK AI node probing, per-monster move/decision counters, count-gated rules, weighted branch splits, move sequences, and hot-reloadable `.txt` presets; includes Fatalis Phase 1 bipedal + quadruped preset (`f=0,4`). Examples: `$rng fatalis on`, `$rng thk probe on 91` | [mhw-rng-thk](https://github.com/Miraboreasyu/mhw-rng-thk) \| [README](plugins/thk/README.md) \| [PRESET_GUIDE](plugins/thk/PRESET_GUIDE.md) |
-| **`steam`** | `rng_steam.dll` (`1.3.0`) | `0x066679A` / `0x06667BB` / `0x05CA0A2` | Real-time Steamworks 3-key order, red round, and hidden-pity decoding in both `ObserveOnly` and `Takeover`; optional sequence lock (bare `$rng steam lock` defaults to `awd`); default `verbose off` keeps locked rounds and pity triggers quiet (`$rng steam verbose on` enables them). Also serves as the SDK v3 showcase | [mhw-rng-steam](https://github.com/Miraboreasyu/mhw-rng-steam) \| [README](plugins/steam/README.md) |
-| **`crit`** | `rng_crit.dll` (`1.0.0`) | `0x01F606D6` (+ plugin `0x1F51380`) | Override affinity `-100..100%` or follow live panel+WEX (`auto`); supports Pure Random (`CondID 1`), exact hit-counted `m:n` ratio / custom `seq`, high-MV credit bank (`mv_bank`), MV-tier `CondID` streams (`mv_tier`), shuffle bag (`bag`), and progressive PRD (`prd`). Examples: `$rng crit rate 50`, `$rng crit mv_bank 50`, `$rng crit ratio 3:2 spread` | [mhw-rng-crit](https://github.com/Miraboreasyu/mhw-rng-crit) \| [README](plugins/crit/README.md) |
-| **`inspector`** | `rng_inspector.dll` | None (zero hot-path overhead) | Bilingual static fallback dictionary of 1,697 call sites and 793 outer function ranges, live activity ranking/export, `.pdata` multi-hop stack & `XMM6/7` tracer (`$rng trace`), and scale-aware value injection; unloadable via `$rng unload inspector`. Examples: `$rng top`, `$rng dump`, `$rng find <kw>`, `$rng fix meal 0`, `$rng trace <t\|*>` | [mhw-rng-inspector](https://github.com/Miraboreasyu/mhw-rng-inspector) \| [README](plugins/inspector/README.md) |
+| **`steam`** | `rng_steam.dll` (`1.3.0`) | `0x066679A` / `0x06667BB` / `0x05CA0A2` | Real-time Steamworks 3-key order, red round, and hidden-pity decoding in both `ObserveOnly` and `Takeover`; optional sequence lock (`awd`); intentionally uses **only** `mhw_rng_api.h` as the pure direct-microkernel showcase | [mhw-rng-steam](https://github.com/Miraboreasyu/mhw-rng-steam) \| [README](plugins/steam/README.md) |
+| **`crit`** | `rng_crit.dll` (`1.0.0`) | `0x01F606D6` (+ plugin `0x1F51380`) | Override affinity `-100..100%` or follow live panel+WEX (`auto`); Pure Random (`CondID 1`), exact `m:n` / custom `seq`, `mv_bank`, `mv_tier`, `bag`, and `prd`, with quest/title telemetry auto-reset (`$rng crit autoreset on\|off`) | [mhw-rng-crit](https://github.com/Miraboreasyu/mhw-rng-crit) \| [README](plugins/crit/README.md) |
+| **`inspector`** | `rng_inspector.dll` | None (zero hot-path overhead) | Bilingual static fallback dictionary of 1,697 sites / 793 functions + `"mhw.catalog"` lookup service, live dump/rank, `.pdata` multi-hop stack & `XMM6/7` tracer (`$rng trace`), and scale-aware value injection (`$rng top`, `$rng dump`, `$rng find <kw>`, `$rng fix meal 0`) | [mhw-rng-inspector](https://github.com/Miraboreasyu/mhw-rng-inspector) \| [README](plugins/inspector/README.md) |
+| **`world`** *(built-in)* | `mhw_world.dll` | Main-thread tick poll | Shared 15.23 world state service `"mhw.world"`, scene/quest/stage/hour/weather event bus (`"mhw.world.*"`), and main-thread HUD popup queue (`$rng world [status\|events on\|off\|popup]`); gameplay plugins degrade gracefully if unloaded | [world_plugin.cpp](world/world_plugin.cpp) |
 
 ### Installation & Core Commands
 
@@ -92,7 +99,7 @@ Plugins placed in `nativePC\plugins\mhw_rng\*.dll` are loaded through shadow cop
    - **(If using SharpPluginLoader)** Game root `winmm.dll` from [patches/spl/winmm.dll](patches/spl/winmm.dll) (minimal WndProc re-subclass fix preventing post-return-to-title input/IME lockups when SPL coexists with overlay mods; see [SPL patch notes](patches/spl/README.md))
    - `nativePC\plugins\mhw_rng.dll`
    - `nativePC\plugins\mhw_rng.ini`
-   - `nativePC\plugins\mhw_rng\rng_size.dll`, `rng_endemic.dll`, `rng_thk.dll`, `rng_steam.dll`, `rng_crit.dll`, `rng_inspector.dll`
+   - `nativePC\plugins\mhw_rng\mhw_world.dll`, `rng_size.dll`, `rng_endemic.dll`, `rng_thk.dll`, `rng_steam.dll`, `rng_crit.dll`, `rng_inspector.dll`
    - `nativePC\plugins\mhw_rng\thk_presets\fatalis_p1_nasty.txt`
 3. **Verify**: Press `` ` `` / `~` in-game to open the overlay terminal (no `$rng` prefix needed inside it), or check the startup notice in chat.
 
@@ -113,9 +120,9 @@ Core built-in commands (prefix configurable via `ChatPrefix` in [mhw_rng.ini](mh
 
 ---
 
-## 3. Plugin SDK v3 (with v3.1–v3.4 Extensions) & Build Guide
+## 3. Plugin SDK v3.5 & Companion SDK Build Guide
 
-MIRA exposes a single-header C ABI via [include/mhw_rng_api.h](include/mhw_rng_api.h) (`kMhwRngApiVersion == 3`), requiring **no `.lib` import library** to compile plugins.
+MIRA exposes a single-header C ABI via [include/mhw_rng_api.h](include/mhw_rng_api.h) (`kMhwRngApiVersion == 3`, backwards-compatible through v3.5) alongside optional header-only Companion SDK headers (`mhw_rng_math.h`, `mhw_1523_world.h`, `mhw_world_api.h`, `mhw_catalog_api.h`), requiring **no `.lib` import library** to compile plugins.
 
 ### 1. Exports & `MhwRngHostApi` Overview
 
@@ -134,6 +141,7 @@ Key `MhwRngHostApi` capabilities:
 | Context, Unwind & Wrappers | `MhwRngDrawContext` (`callerRegs`, `xmm6/7`, `origArg*`, `origReturnRva`) / `CaptureCallerRvas` / `RegisterTransparentWrapper` / `SetInstancePolicy` | Read preserved entry GPRs & `XMM6/7`, SEH `.pdata` caller stack unwinding, custom wrapper unwrapping, and private `MtRandom` policy |
 | Snapshots | `GetCondSlotInfo` / `SnapshotActiveSlots` / `RestoreSlotState` / `CaptureStateBlob` / `RestoreStateBlob` | Inspect slot state or capture/restore CRC32-checked binary blobs |
 | Chat, i18n & Completion | `RegisterSubcommand` / `RegisterSubcommandCompleter` / `SelectText` / `Register*I18n` / `GetLanguage` / `ExecuteCommand` / `RegisterSiteMeta` / `SetFallbackMetaResolver` / `ChatPrintAsync` | Register `$rng <subcmd>` handlers, multi-level Tab completion, `active->en->zh` localization, command routing, and thread-safe async chat notices |
+| Ticks, Events & Services | `RegisterMainThreadTick` / `SubscribeEvent` / `EmitEvent` / `RegisterService` / `MhwRngServiceGuard<T>` | Frame-safe main-thread polling, exact/`prefix.*`/`*` event bus, and hot-reload-safe service leases with atomic drain |
 
 ### 2. Minimal Plugin Example
 
@@ -191,9 +199,9 @@ Load in-game via `$rng load meal`, then rebuild and run `$rng reload meal` for i
 git clone --recursive https://github.com/Miraboreasyu/mhw-rng.git
 ```
 
-- **Build all modules**: run [`build.bat`](build.bat) to sync plugin SDK headers and build `build\mhw_rng.dll`, `build\mhw_rng\rng_*.dll`, and `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`.
-- **Run offline tests**: run [`run_tests.bat`](run_tests.bat) (requires an unpacked 15.23 `.text` dump `text_1523.bin` via CLI argument or `MHW_TEXT_BIN`) to exercise all 10 W^X hooks, 8-thread isolation, all 6 official plugins, and SDK v3 behavior against real machine code.
-- **Package release zip**: run `python tools/package_release.py --out <zip_path>` (or `--check` to validate) to build a clean release archive bundling the patched `winmm.dll` ([patches/spl/winmm.dll](patches/spl/winmm.dll)) with the runtime `nativePC\plugins\...` files.
+- **Build all modules**: run [`build.bat`](build.bat) to sync plugin SDK headers and build `build\mhw_rng.dll`, `build\mhw_rng\mhw_world.dll`, `build\mhw_rng\rng_*.dll`, and `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`.
+- **Run offline tests**: run [`run_tests.bat`](run_tests.bat) (requires an unpacked 15.23 `.text` dump `text_1523.bin` via CLI argument or `MHW_TEXT_BIN`) to exercise all 10 W^X hooks, 8-thread isolation, `mhw_world.dll`, all 6 official plugins, and **Tests 1–25** (SDK v3.5) against real machine code.
+- **Package release zip**: run `python tools/package_release.py --out <zip_path>` (or `--check` to validate) to build a clean release archive bundling the patched `winmm.dll` ([patches/spl/winmm.dll](patches/spl/winmm.dll)) with the 10 runtime `nativePC\plugins\...` files (11 total).
 
 ### 4. Documentation Index
 
