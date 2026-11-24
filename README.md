@@ -8,7 +8,7 @@
 
 ---
 
-MIRA（运行时模块 `nativePC\plugins\mhw_rng.dll`）是一个基于 **微内核与热重载插件架构** 的游戏内随机数观测、固定与按条件分流框架。玩家与研究者只需安装核心 DLL 与对应业务插件（通过 Stracker's Loader 加载），即可直接在游戏聊天栏使用 `$rng`（兼容 `$rng_<subcmd>`）指令实时控制怪物体型、环境生物尺寸、怪物 AI 行为决策与蒸汽机抽签，无需打开 Cheat Engine、重启游戏或修改 `.thk` 等游戏本体资源文件。
+MIRA（运行时模块 `nativePC\plugins\mhw_rng.dll`）是一个基于 **微内核与热重载插件架构** 的游戏内随机数观测、固定与按条件分流框架。玩家与研究者只需安装核心 DLL 与对应业务插件（通过 Stracker's Loader 加载），即可直接在游戏聊天栏使用 `$rng`（兼容 `$rng_<subcmd>`）指令实时控制怪物体型、环境生物尺寸、怪物 AI 行为决策、蒸汽机抽签与攻击会心，无需打开 Cheat Engine、重启游戏或修改 `.thk` 等游戏本体资源文件。
 
 > [!NOTE]
 > 本框架与配套官方插件面向单机练习、机制验证与逆向研究使用，请勿在公开多人集会或影响他人联机体验的环境中使用。
@@ -31,6 +31,7 @@ flowchart LR
     PlugEnd["rng_endemic.dll"]
     PlugThk["rng_thk.dll"]
     PlugSteam["rng_steam.dll"]
+    PlugCrit["rng_crit.dll"]
     PlugInsp["rng_inspector.dll"]
     PlugCustom["Custom Plugins"]
 
@@ -39,6 +40,7 @@ flowchart LR
     Kernel <-->|"SDK v3.0 C ABI"| PlugEnd
     Kernel <-->|"SDK v3.0 C ABI"| PlugThk
     Kernel <-->|"SDK v3.0 C ABI"| PlugSteam
+    Kernel <-->|"SDK v3.4 + 0x1F51380 Crit Hook"| PlugCrit
     Kernel <-->|"Fallback Meta + Stats"| PlugInsp
     Kernel <-->|"Single Header mhw_rng_api.h"| PlugCustom
 ```
@@ -80,6 +82,7 @@ flowchart LR
 | **`endemic`** | `rng_endemic.dll` | `0x166CFE1` / `0x0672FBC` / `0x1669CB6` | 覆盖环境生物地图刷新与捕获抽签，通过调用栈过滤共享随机函数，支持小金/普通/大金档位、按 `ecXXX_YY` 物种分流以及实时查 `rAnimalSize` 反算倍率或厘米数（如 `$rng endemic max`、`$rng endemic ec059_02 exact 25.5cm`） | [mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic) \| [技术文档](plugins/endemic/README.md) |
 | **`thk`** | `rng_thk.dll` + `thk_presets\*.txt` | `0x1339C8C` | 通用 THK 随机节点探测、按怪物实例的决策与出招计数、计数门控、概率组合分枝、有序序列与热重读 `.txt` 预设；内置黑龙一阶段二足+四足全距离预设（怒前 `f=0` 与怒后 `f=4`，`$rng fatalis on` / `$rng thk probe on 91`） | [mhw-rng-thk](https://github.com/Miraboreasyu/mhw-rng-thk) \| [技术文档](plugins/thk/README.md) \| [预设语法指南](plugins/thk/PRESET_GUIDE.md) |
 | **`steam`** | `rng_steam.dll`（`1.3.0`） | `0x066679A` / `0x06667BB` / `0x05CA0A2` | 在 `ObserveOnly` 与 `Takeover` 下实时解码蒸汽机三键顺序、红槽倍率与隐藏保底，支持可选固定按键顺序（`$rng steam lock` 默认锁 `awd`）；`verbose` 默认关闭，仅在未锁序时提示键位，`$rng steam verbose on` 后播报锁序与保底详情；同时作为 SDK v3 官方参考示例 | [mhw-rng-steam](https://github.com/Miraboreasyu/mhw-rng-steam) \| [技术文档](plugins/steam/README.md) |
+| **`crit`** | `rng_crit.dll`（`1.0.0`） | `0x01F606D6`（+插件 `0x1F51380`） | 支持无视面板强制设定 `-100..100%` 会心率或跟随实时面板+弱特（`auto`）；内置纯随机无保底（`CondID 1`）、严格真命中 `m:n` 比例/自定义序列、高动作值优先预算池 `mv_bank`、动作值分档独立流 `mv_tier`、洗牌袋 `bag` 与 `prd` 渐进保底（例：`$rng crit rate 50`、`$rng crit mv_bank 50`、`$rng crit ratio 3:2 spread`） | [mhw-rng-crit](https://github.com/Miraboreasyu/mhw-rng-crit) \| [技术文档](plugins/crit/README.md) |
 | **`inspector`** | `rng_inspector.dll` | 无热路径 Hook | 提供 1,697 处静态调用点与 793 个外层函数区间的双语词典、排行监控、`.pdata` 多跳调用栈与 `XMM6/7` 追踪（`$rng trace`）及多尺度换算锁定，可按需 `$rng unload inspector` 卸载以释放内存（常用：`$rng top`、`$rng dump`、`$rng find <kw>`、`$rng fix meal 0`、`$rng trace <t\|*>`） | [mhw-rng-inspector](https://github.com/Miraboreasyu/mhw-rng-inspector) \| [技术文档](plugins/inspector/README.md) |
 
 ### 安装与内核基础指令
@@ -88,7 +91,7 @@ flowchart LR
 2. **部署**：将构建产物或发布文件按如下结构放入游戏目录的 `nativePC\plugins\` 下：
    - `nativePC\plugins\mhw_rng.dll`
    - `nativePC\plugins\mhw_rng.ini`
-   - `nativePC\plugins\mhw_rng\rng_size.dll`、`rng_endemic.dll`、`rng_thk.dll`、`rng_steam.dll`、`rng_inspector.dll`
+   - `nativePC\plugins\mhw_rng\rng_size.dll`、`rng_endemic.dll`、`rng_thk.dll`、`rng_steam.dll`、`rng_crit.dll`、`rng_inspector.dll`
    - `nativePC\plugins\mhw_rng\thk_presets\fatalis_p1_nasty.txt`
 3. **验证就绪**：进入游戏后按 `` ` `` / `~` 打开内置终端窗口（或查看游戏聊天框提示）即可输入指令，终端内可省略 `$rng` 前缀。
 
@@ -188,10 +191,10 @@ git clone --recursive https://github.com/Miraboreasyu/mhw-rng.git
 ```
 
 - **全量构建**：执行 [`build.bat`](build.bat)，同步全部子模块 SDK 头文件并编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_*.dll` 与 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
-- **脱机回归测试**：执行 [`run_tests.bat`](run_tests.bat)（需通过参数或环境变量 `MHW_TEXT_BIN` 指定解壳后的 15.23 `.text` 段文件 `text_1523.bin`），在真实游戏机器码上验证 10 处 W^X Hook、8 线程隔离、全部官方插件与 SDK v3.0 接口。
+- **脱机回归测试**：执行 [`run_tests.bat`](run_tests.bat)（需通过参数或环境变量 `MHW_TEXT_BIN` 指定解壳后的 15.23 `.text` 段文件 `text_1523.bin`），在真实游戏机器码上验证 10 处 W^X Hook、8 线程隔离、全部 6 个官方插件与 SDK v3.0 接口。
 
 ### 4. 技术文档导航
 
 - 核心框架原理与 SDK 详细规范：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- SDK 头文件与配置文件：[include/mhw_rng_api.h](include/mhw_rng_api.h) | [mhw_rng.ini](mhw_rng.ini)
-- 官方插件技术文档：[size](plugins/size/README.md) | [endemic](plugins/endemic/README.md) | [thk](plugins/thk/README.md)（[预设编写指南](plugins/thk/PRESET_GUIDE.md)）| [steam](plugins/steam/README.md) | [inspector](plugins/inspector/README.md)
+- 公共头文件与默认配置：[include/mhw_rng_api.h](include/mhw_rng_api.h) | [mhw_rng.ini](mhw_rng.ini)
+- 官方插件文档：[size](plugins/size/README.md) | [endemic](plugins/endemic/README.md) | [thk](plugins/thk/README.md)（[预设指南](plugins/thk/PRESET_GUIDE.md)）| [steam](plugins/steam/README.md) | [crit](plugins/crit/README.md) | [inspector](plugins/inspector/README.md)

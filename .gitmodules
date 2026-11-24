@@ -13,3 +13,6 @@
 [submodule "plugins/steam"]
 	path = plugins/steam
 	url = https://github.com/Miraboreasyu/mhw-rng-steam.git
+[submodule "plugins/crit"]
+	path = plugins/crit
+	url = https://github.com/Miraboreasyu/mhw-rng-crit.git

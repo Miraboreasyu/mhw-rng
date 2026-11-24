@@ -1,6 +1,6 @@
-# `mhw_rng` 核心框架与插件 SDK（v3.2）技术文档
+# `mhw_rng` 核心框架与插件 SDK（v3.4）技术文档
 
-本文档说明 `mhw_rng` 随机数接管框架的职责划分、底层 Hook 点位、MASM 寄存器现场捕获层、复合条件槽数据结构、多插件 Hook 链与后置过滤机制、插件热重载流程以及插件 SDK（`kMhwRngApiVersion == 3`，向后兼容至 v3.2 扩展）接口规范。目标客户端版本为《怪物猎人：世界 冰原》Steam 15.23（Build 15539686，默认镜像基址 `0x140000000`）。
+本文档说明 `mhw_rng` 随机数接管框架的职责划分、底层 Hook 点位、MASM 寄存器现场捕获层、复合条件槽数据结构、多插件 Hook 链与后置过滤机制、插件热重载流程以及插件 SDK（`kMhwRngApiVersion == 3`，向后兼容至 v3.4 扩展）接口规范。目标客户端版本为《怪物猎人：世界 冰原》Steam 15.23（Build 15539686，默认镜像基址 `0x140000000`）。
 
 > [!NOTE]
 > **职责边界**
@@ -31,6 +31,7 @@ flowchart TD
         Endemic["rng_endemic.dll (环境生物大小金档位与档内尺寸控制)"]
         Thk["rng_thk.dll (通用THK节点探测/计数/序列与预设引擎)"]
         Steam["rng_steam.dll (蒸汽机实时按键提示与锁序示例)"]
+        Crit["rng_crit.dll (攻击会心率与多模式分配控制)"]
         Custom["第三方扩展插件"]
     end
 
@@ -55,6 +56,7 @@ flowchart TD
 | 官方插件：`endemic` | `nativePC\plugins\mhw_rng\rng_endemic.dll` | [endemic_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-endemic/blob/main/endemic_plugin.cpp) | 详见《`rng_endemic` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-endemic/blob/main/README.md)) |
 | 官方插件：`thk` | `nativePC\plugins\mhw_rng\rng_thk.dll` + `thk_presets\*.txt` | [thk_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-thk/blob/main/thk_plugin.cpp) | 详见《`rng_thk` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-thk/blob/main/README.md)) |
 | 官方插件：`steam` | `nativePC\plugins\mhw_rng\rng_steam.dll` | [steam_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-steam/blob/main/steam_plugin.cpp) | 详见《`rng_steam` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-steam/blob/main/README.md)) |
+| 官方插件：`crit` | `nativePC\plugins\mhw_rng\rng_crit.dll` | [crit_plugin.cpp](https://github.com/Miraboreasyu/mhw-rng-crit/blob/main/crit_plugin.cpp) | 详见《`rng_crit` 插件技术文档》([README.md](https://github.com/Miraboreasyu/mhw-rng-crit/blob/main/README.md)) |
 
 ---
 
@@ -89,7 +91,7 @@ flowchart TD
 2. **第 1..15 页（15 × 4 KB 预留独立跳板池）**：供第二阶段的 `InstallStandaloneDetour5`（挂钩 `sChat::DispatchChatEntry`、`sChat::move`、可选 `D3DPresent` 及后续重新串联）按页按需提交。单页先以 `PAGE_READWRITE` 提交并写入中继与原字节，密封为 `PAGE_EXECUTE_READ` 后再修改目标入口，避免后期加载 Mod 造成 `±2 GB` 地址空间碎片化后分配失败。
 3. **三阶段启动与自愈检查（[dllmain.cpp](../src/dllmain.cpp) `InitWorker`）**：
    - **Phase 1**：轮询等待 5 处核心 `MtRandom` 入口与 `sChat::DispatchChatEntry` 完成解壳后，初始化 64 KB 跳板池、激活 10 处底层随机数钩子并自动加载子插件。
-   - **Phase 2**：等待并发启动插件完成初始化（不少于 `800 ms`，待 `sChat` 实例就绪或最多 `3000 ms`），安装 `sChat::DispatchChatEntry`、`sChat::move` 与可选 `D3DPresent` 钩子，并投递启动就绪通知（`[RNG] mhw_rng v3.0 已就绪...`），由 `sChat::move` 在主线程刷新（若 `sChat::move` 未挂钩则回退至场景轮询投递）。
+   - **Phase 2**：等待并发启动插件完成初始化（不少于 `800 ms`，待 `sChat` 实例就绪或最多 `3000 ms`），安装 `sChat::DispatchChatEntry`、`sChat::move` 与可选 `D3DPresent` 钩子，并投递启动就绪通知（`[RNG] mhw_rng v3.3 已就绪...`），由 `sChat::move` 在主线程刷新（若 `sChat::move` 未挂钩则回退至场景轮询投递）。
    - **Phase 3**：在安装后 `+1.5 s` 与 `+4.0 s` 调用 `WasUnchainedOverwrite5` 复检 `sChat::DispatchChatEntry` 与 `sChat::move`；若发现被后加载模组覆盖且未串联，自动重新挂载并串联原跳转链。
 
 ---
@@ -196,7 +198,7 @@ Windows 的 `LoadLibrary` 会锁定磁盘上的目标 DLL 文件，导致游戏�
 
 ---
 
-## 六、插件开发接口规范（Plugin SDK v3.2）
+## 六、插件开发接口规范（Plugin SDK v3.4）
 
 子插件只需包含单一头文件 [mhw_rng_api.h](../include/mhw_rng_api.h)，无需链接任何导入库。
 
@@ -303,5 +305,5 @@ cl.exe /nologo /std:c++17 /O2 /EHsc /MT /utf-8 /I "include" rng_meal.cpp /LD /Fe
 - `$rng rawfix` / `rawseed` / `rawseq` / `rawbypass` / `rawclear`：在不加载任何插件的情况下直接按数值 RVA 操作固定值、自定义种子、序列、直通与清理。
 
 ### 2. 构建与脱机回归测试
-- 运行 [build.bat](../build.bat)：依次执行 `sync_plugin_sdks.bat` 与 `ml64` 汇编 [rng_trampolines.asm](../src/rng_trampolines.asm)，再使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll`、`build\mhw_rng\rng_steam.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
-- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证全部既有回归场景（8 线程隔离、`rng_size`、`rng_endemic`、`rng_thk`、影拷贝热重载与 `sChat` 链自愈）及 SDK v3.0 全部新增能力（非易失寄存器与原入参捕获、多插件 Hook 优先级链、`ObserveOnly` 与通配观测器、`FilterVanilla` 保底过滤、二进制快照恢复、生命周期事件、并发异步聊天投递、堆序列与 Tombstone 槽回收、动态透明包装、私有实例策略、`rng_steam` 真实代码测试 `V3-9`，以及 64 KB 预留独立 W^X 跳板池对 `sChat::DispatchChatEntry` / `sChat::move` 的验证，以及 `Selective` 按需接管与 `ProtectSaveSeeds` 存档种子保护回归测试）。
+- 运行 [build.bat](../build.bat)：依次执行 `sync_plugin_sdks.bat` 与 `ml64` 汇编 [rng_trampolines.asm](../src/rng_trampolines.asm)，再使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll`、`build\mhw_rng\rng_steam.dll`、`build\mhw_rng\rng_crit.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
+- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证全部既有回归场景（8 线程隔离、`rng_size`、`rng_endemic`、`rng_thk`、影拷贝热重载与 `sChat` 链自愈）及 SDK v3.0–v3.4 全部能力（非易失寄存器与原入参捕获、多插件 Hook 优先级链、`ObserveOnly` 与通配观测器、`FilterVanilla` / `FilterSlot` 过滤、二进制快照恢复、生命周期事件、并发异步聊天投递、堆序列与 Tombstone 槽回收、动态透明包装、私有实例策略、`rng_steam` 真实代码测试 `V3-9`、64 KB 预留独立 W^X 跳板池、`Selective` 与 `ProtectSaveSeeds` 回归、标准化 i18n 零 CJK 扫描与终端多级 Tab 补全，以及 `rng_crit` 在真实 `0x141f51380` / `0x141f605f0` 上的全部模式与热重载验证）。

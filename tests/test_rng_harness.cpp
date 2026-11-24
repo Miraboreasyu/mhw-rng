@@ -274,16 +274,16 @@ int main(int argc, char** argv) {
     }
     std::printf("[OK] 8-thread stream isolation & O(1) Epoch rewind verified!\n");
 
-    // 2. Load Official Plugins (`rng_inspector.dll` + `rng_size.dll` + `rng_endemic.dll` + `rng_thk.dll` + `rng_steam.dll`) via Shadow-Copy Host
+    // 2. Load Official Plugins (`rng_inspector.dll` + `rng_size.dll` + `rng_endemic.dll` + `rng_thk.dll` + `rng_steam.dll` + `rng_crit.dll`) via Shadow-Copy Host
     const std::string plugDir = buildDir + "\\mhw_rng";
 
     plugin_host::Init(base, end, plugDir, &CaptureChatSink, &CaptureAsyncChatSink);
     const std::size_t loadedCnt = plugin_host::LoadAllFromDirectory();
-    if (loadedCnt < 5U) {
-        std::printf("FAIL: Expected >= 5 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
+    if (loadedCnt < 6U) {
+        std::printf("FAIL: Expected >= 6 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
         return 1;
     }
-    std::printf("[OK] Shadow-copy loaded %zu official plugins (`inspector` + `size` + `endemic` + `thk` + `steam`)!\n", loadedCnt);
+    std::printf("[OK] Shadow-copy loaded %zu official plugins (`inspector` + `size` + `endemic` + `thk` + `steam` + `crit`)!\n", loadedCnt);
 
     // 3. Build TWO real-world 38-row `cSizeTable`s:
     //    - Table 0 (`fullCrownTbl`): Standard Crown table (`88% .. 125%`, all 38 rows have `weight > 0`)
@@ -3197,6 +3197,15 @@ int main(int argc, char** argv) {
             "$rng endemic status",
             "$rng steam status",
             "$rng steam help",
+            "$rng crit status",
+            "$rng crit help",
+            "$rng crit rate 100",
+            "$rng crit random",
+            "$rng crit mv_bank 50",
+            "$rng crit mv_tier 50 125 200",
+            "$rng crit mv_tier 25 60 delta=-10,0,+25",
+            "$rng crit rate auto",
+            "$rng crit off",
             "$rng fatalis on",
             "$rng fatalis status",
             "$rng fatalis history",
@@ -3243,11 +3252,12 @@ int main(int argc, char** argv) {
         }
 
         // Verify dynamic QuerySiteMeta in `en` and immediate restoration in `zh` WITHOUT reloading plugins
-        const std::uint32_t probeRvas[5] = {
+        const std::uint32_t probeRvas[6] = {
             0x0169BA15U, // size: em.size
             0x005CA0A2U, // steam: steam.autowin
             0x01D2A3CCU, // endemic: endemic.special_size
             0x01339C8CU, // thk: ai.thk_rand
+            0x01F606D6U, // crit: pl.crit_seed
             0x00F99246U  // inspector fallback: meal.trigger
         };
         for (std::uint32_t rva : probeRvas) {
@@ -3370,6 +3380,11 @@ int main(int argc, char** argv) {
         if (!checkTabComplete("steam style x", "steam style xbox ", "steam-style") ||
             !checkTabComplete("steam lock wd", "steam lock wda ", "steam-lock") ||
             !checkTabComplete("steam status x", "steam status x", "steam-status-noop") ||
+            !checkTabComplete("crit rate a", "crit rate auto ", "crit-rate-auto") ||
+            !checkTabComplete("crit ratio 3:2 s", "crit ratio 3:2 spread ", "crit-ratio-spread") ||
+            !checkTabComplete("crit mode mv_b", "crit mode mv_bank ", "crit-mode-mvbank") ||
+            !checkTabComplete("crit mv_bank 50 1", "crit mv_bank 50 1.0 ", "crit-mvbank-res") ||
+            !checkTabComplete("crit verbose o", "crit verbose off", "crit-verbose-cycle1") ||
             !checkTabComplete("fatalis far m", "fatalis far multi ", "fatalis-far") ||
             !checkTabComplete("thk probe l", "thk probe log ", "thk-probe") ||
             !checkTabComplete("thk rule a", "thk rule add ", "thk-rule") ||
@@ -3513,6 +3528,399 @@ int main(int argc, char** argv) {
         }
         cmd_router::Init(&cfg, &CaptureChatSink);
         std::printf("[OK] Terminal core (UTF-8 readline, history, Ctrl+R, dynamic plugin Tab completion, chat echo toggle) verified!\n");
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 22: Verify Official Plugin #6 (`rng_crit.dll`) on Real MHW 15.23 `0x141f51380` & `0x141f605f0`
+    // ------------------------------------------------------------------------
+    {
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        static constexpr std::uint8_t kCritOrig5[5] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
+        if (img[0x01F51380U] != 0xE9U) {
+            std::printf("FAIL [crit-hook]: Expected 0xE9 detour at 0x01F51380, got 0x%02X\n", img[0x01F51380U]);
+            return 1;
+        }
+
+        // Preserve & populate synthetic global pointers referenced by `0x1411c0940` / `0x1411c0620`
+        const std::uint32_t savedDefFloatBits = *reinterpret_cast<const std::uint32_t*>(base + 0x2E4FE58U);
+        void* const savedCritMultTblPtr       = *reinterpret_cast<void* const*>(base + 0x5011F58U);
+        const std::uint32_t savedSInst[4]     = { sInst[0], sInst[1], sInst[2], sInst[3] };
+
+        alignas(16) static std::uint8_t fakeCritTbl[0x800]{};
+        std::memset(fakeCritTbl, 0, sizeof(fakeCritTbl));
+        *reinterpret_cast<float*>(fakeCritTbl + 0x7A8U) = 1.25f; // Positive crit base mult
+        *reinterpret_cast<float*>(fakeCritTbl + 0x7ACU) = 0.75f; // Negative crit base mult
+        *reinterpret_cast<float*>(base + 0x2E4FE58U)    = 1.0f;  // Default float arg for getSkillParam<float>
+        *reinterpret_cast<void**>(base + 0x5011F58U)    = fakeCritTbl;
+        sInst[0] = 0x12345678U;
+        sInst[1] = 0x9ABCDEF0U;
+        sInst[2] = 0x13579BDFU;
+        sInst[3] = 0x2468ACE1U;
+
+        alignas(16) static std::uint8_t fakeLocalPlayer[0xE200]{};
+        alignas(16) static std::uint8_t fakeRemotePlayer[0xE200]{};
+        alignas(16) static std::uint8_t fakeStatusMgr[0xA00]{};
+        std::memset(fakeLocalPlayer,  0, sizeof(fakeLocalPlayer));
+        std::memset(fakeRemotePlayer, 0, sizeof(fakeRemotePlayer));
+        std::memset(fakeStatusMgr,    0, sizeof(fakeStatusMgr));
+
+        *reinterpret_cast<void**>(fakeLocalPlayer + 0x7D20U)        = fakeStatusMgr;
+        *reinterpret_cast<std::uint8_t*>(fakeLocalPlayer + 0x8938U) = 1U; // Local player bit
+        *reinterpret_cast<void**>(fakeRemotePlayer + 0x7D20U)       = fakeStatusMgr;
+        *reinterpret_cast<std::uint8_t*>(fakeRemotePlayer + 0x8938U)= 0U; // Remote coop replica
+        *reinterpret_cast<void**>(fakeStatusMgr + 0x08U)            = fakeLocalPlayer;
+        *reinterpret_cast<std::uint8_t*>(fakeStatusMgr + 0x9BAU)    = 1U; // Fast-path live affinity calc
+
+        alignas(16) std::uint8_t fakeOrigAtkParam[0x280]{};
+        alignas(16) std::uint8_t fakeAtkNode[0x100]{};
+        alignas(16) std::uint8_t fakeHitInfo[0x100]{};
+        std::memset(fakeOrigAtkParam, 0, sizeof(fakeOrigAtkParam));
+        std::memset(fakeAtkNode,      0, sizeof(fakeAtkNode));
+        std::memset(fakeHitInfo,      0, sizeof(fakeHitInfo));
+        *reinterpret_cast<void**>(fakeAtkNode + 0xA8U) = fakeOrigAtkParam;
+        *reinterpret_cast<void**>(fakeHitInfo + 0x38U) = fakeAtkNode;
+
+        void* nullHitInfo = nullptr;
+        void* localHitInfo = fakeHitInfo;
+        struct { void** hitInfoPtr; void* player; } ctxLocal{ &localHitInfo, fakeLocalPlayer };
+        struct { void** hitInfoPtr; void* player; } ctxRemote{ &nullHitInfo, fakeRemotePlayer };
+        alignas(16) std::uint8_t fakeAtkParam[0x200]{};
+
+        using ApplyCritFn = void(__fastcall*)(void* critCtx, void* atkParam,
+                                              std::uint8_t isWeakPoint, std::uint8_t force100Crit,
+                                              std::uint8_t isTenderized, std::uint8_t extraFlag);
+        const auto fnApplyCrit = reinterpret_cast<ApplyCritFn>(base + 0x01F51380U);
+
+        // Realistic separation: `origAtkParam+0x20` holds true MV (e.g. 22 / 264), while mutable
+        // `atkParam+0x20` holds pre-crit scaled raw damage (e.g. 4.0x larger = 88 / 1056)!
+        auto runHit = [&](void* critCtx, float trueMv, std::uint8_t force100, std::int8_t& outRes, float& outScaledDmg) {
+            std::memset(fakeAtkParam, 0, sizeof(fakeAtkParam));
+            *reinterpret_cast<float*>(fakeOrigAtkParam + 0x20U) = trueMv;
+            *reinterpret_cast<float*>(fakeAtkParam + 0x20U)     = trueMv * 4.0f;
+            fnApplyCrit(critCtx, fakeAtkParam, 0U, force100, 0U, 0U);
+            outRes       = *reinterpret_cast<const std::int8_t*>(fakeAtkParam + 0x160U);
+            outScaledDmg = *reinterpret_cast<const float*>(fakeAtkParam + 0x20U);
+        };
+
+        auto restoreCritTestMem = [&]() {
+            *reinterpret_cast<std::uint32_t*>(base + 0x2E4FE58U) = savedDefFloatBits;
+            *reinterpret_cast<void**>(base + 0x5011F58U)         = savedCritMultTblPtr;
+            std::memcpy(sInst, savedSInst, sizeof(savedSInst));
+        };
+
+        host->SetEngineMode(kMhwRngModeSelective);
+        host->SetMasterSeed(777ULL, true);
+        plugin_host::DispatchPluginSubcommand("crit", {"reset"}, "reset");
+        plugin_host::DispatchPluginSubcommand("crit", {"random"}, "random");
+        plugin_host::DispatchPluginSubcommand("crit", {"rate", "0"}, "rate 0");
+
+        // (a) Remote coop replica MUST bypass `rng_crit` and run pure vanilla (`force100=1` -> +1 crit, MV x1.25)
+        std::int8_t remRes = 0;
+        float       remMv  = 0.0f;
+        runHit(&ctxRemote, 100.0f, 1U, remRes, remMv);
+        g_capturedChatLines.clear();
+        plugin_host::DispatchPluginSubcommand("crit", {"status"}, "status");
+        const bool remoteIgnored = (!g_capturedChatLines.empty() &&
+                                    g_capturedChatLines.back().find("MV=") == std::string::npos); // Only verify via stats line:
+        bool statsZeroHits = false;
+        for (const auto& l : g_capturedChatLines) {
+            if (l.find(u8"总命中=0") != std::string::npos || l.find("hits=0") != std::string::npos) {
+                statsZeroHits = true;
+            }
+        }
+        (void)remoteIgnored;
+        if (remRes != 1 || std::fabs(remMv - 500.0f) > 0.01f || !statsZeroHits) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-remote]: res=%d mv=%.2f statsZero=%d\n", remRes, remMv, statsZeroHits ? 1 : 0);
+            return 1;
+        }
+
+        // (b) Action-start seed hook (`RVA 0x01F606D6`): captures `DrawDeterministic` and packs (S<<27)|S
+        {
+            static constexpr std::uint8_t kCritSeedThunk[] = {
+                0x53,                   // push rbx
+                0x48, 0x83, 0xEC, 0x28, // sub rsp, 28h
+                0x48, 0x8B, 0xD9,       // mov rbx, rcx
+                0xFF, 0xD2,             // call rdx
+                0x48, 0x83, 0xC4, 0x28, // add rsp, 28h
+                0x5B,                   // pop rbx
+                0xC3                    // ret
+            };
+            std::memcpy(thunkMem + 0x240U, kCritSeedThunk, sizeof(kCritSeedThunk));
+            ::FlushInstructionCache(::GetCurrentProcess(), thunkMem + 0x240U, sizeof(kCritSeedThunk));
+            using SeedCallFn = void(__fastcall*)(void* player, void* addr);
+            const auto fnSeedCall = reinterpret_cast<SeedCallFn>(thunkMem + 0x240U);
+
+            const std::uint8_t origSeedEnd = img[0x01F606EFU];
+            img[0x01F606EFU] = 0xC3;
+            ::FlushInstructionCache(::GetCurrentProcess(), img + 0x01F606EFU, 1);
+            fnSeedCall(fakeLocalPlayer, img + 0x01F606C1U);
+            img[0x01F606EFU] = origSeedEnd;
+            ::FlushInstructionCache(::GetCurrentProcess(), img + 0x01F606EFU, 1);
+
+            const std::uint32_t s27 = *reinterpret_cast<const std::uint32_t*>(fakeLocalPlayer + 0x8818U);
+            const std::uint32_t s32 = *reinterpret_cast<const std::uint32_t*>(fakeLocalPlayer + 0x881CU);
+            if (((s27 << 27) | (s27 & 0x07FFFFFFU)) != s32) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-seed27]: s27=0x%X s32=0x%X\n", s27, s32);
+                return 1;
+            }
+        }
+
+        // (c) `rate +100 / 0 / -100` overrides + `rate auto` (`force100Crit=1`)
+        //     `trueMv=100 -> preCritDmg=400`: verifies mutable dmg gets multiplied (`500/400/300`) while `origAtkParam+0x20` stays `100`!
+        std::int8_t res = 0;
+        float       mv  = 0.0f;
+        plugin_host::DispatchPluginSubcommand("crit", {"rate", "100"}, "rate 100");
+        runHit(&ctxLocal, 100.0f, 0U, res, mv);
+        if (res != 1 || std::fabs(mv - 500.0f) > 0.01f ||
+            std::fabs(*reinterpret_cast<const float*>(fakeOrigAtkParam + 0x20U) - 100.0f) > 0.01f) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-rate100]: res=%d mv=%.2f\n", res, mv);
+            return 1;
+        }
+        plugin_host::DispatchPluginSubcommand("crit", {"rate", "0"}, "rate 0");
+        runHit(&ctxLocal, 100.0f, 1U, res, mv); // Override beats force100!
+        if (res != 0 || std::fabs(mv - 400.0f) > 0.01f) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-rate0]: res=%d mv=%.2f\n", res, mv);
+            return 1;
+        }
+        plugin_host::DispatchPluginSubcommand("crit", {"rate", "-100"}, "rate -100");
+        runHit(&ctxLocal, 100.0f, 0U, res, mv);
+        if (res != -1 || std::fabs(mv - 300.0f) > 0.01f) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-rate-100]: res=%d mv=%.2f\n", res, mv);
+            return 1;
+        }
+        plugin_host::DispatchPluginSubcommand("crit", {"rate", "auto"}, "rate auto");
+        runHit(&ctxLocal, 100.0f, 1U, res, mv);
+        if (res != 1 || std::fabs(mv - 500.0f) > 0.01f) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-auto]: res=%d mv=%.2f\n", res, mv);
+            return 1;
+        }
+
+        // (d) `random` determinism across `ResetEpoch()` + active override reminder check
+        g_capturedChatLines.clear();
+        plugin_host::DispatchPluginSubcommand("crit", {"rate", "100"}, "rate 100 reminder");
+        plugin_host::DispatchPluginSubcommand("crit", {"random"}, "random reminder");
+        bool sawRateReminder = false;
+        for (const auto& l : g_capturedChatLines) {
+            if (l.find("rate auto") != std::string::npos) sawRateReminder = true;
+        }
+        if (!sawRateReminder) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-rate-reminder]: expected rate auto reminder on mode switch while rate override active\n");
+            return 1;
+        }
+        plugin_host::DispatchPluginSubcommand("crit", {"rate", "50"}, "rate 50");
+        host->ResetEpoch();
+        std::int8_t randSeq1[64]{}, randSeq2[64]{};
+        int randCrits = 0;
+        for (int i = 0; i < 64; ++i) {
+            runHit(&ctxLocal, 40.0f, 0U, randSeq1[i], mv);
+            if (randSeq1[i] > 0) ++randCrits;
+        }
+        host->ResetEpoch();
+        for (int i = 0; i < 64; ++i) {
+            runHit(&ctxLocal, 40.0f, 0U, randSeq2[i], mv);
+        }
+        if (std::memcmp(randSeq1, randSeq2, sizeof(randSeq1)) != 0 || randCrits < 15 || randCrits > 49) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-random]: match=%d crits=%d/64\n",
+                        std::memcmp(randSeq1, randSeq2, sizeof(randSeq1)) == 0 ? 1 : 0, randCrits);
+            return 1;
+        }
+
+        // (e) `ratio 3:2 block`, `ratio 3:2 spread`, and custom `seq 10-1` (plus step-format verbose check)
+        plugin_host::DispatchPluginSubcommand("crit", {"ratio", "3:2", "block"}, "ratio 3:2 block");
+        static constexpr std::int8_t kExpBlock[10]  = { 1, 1, 1, 0, 0, 1, 1, 1, 0, 0 };
+        static constexpr std::int8_t kExpSpread[10] = { 0, 1, 0, 1, 1, 0, 1, 0, 1, 1 };
+        static constexpr std::int8_t kExpCustom[8]  = { 1, 0, -1, 1, 1, 0, -1, 1 };
+        for (int i = 0; i < 10; ++i) {
+            runHit(&ctxLocal, 50.0f, 0U, res, mv);
+            if (res != kExpBlock[i]) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-ratio-block]: idx=%d exp=%d got=%d\n", i, kExpBlock[i], res);
+                return 1;
+            }
+        }
+        plugin_host::DispatchPluginSubcommand("crit", {"ratio", "3:2", "spread"}, "ratio 3:2 spread");
+        for (int i = 0; i < 10; ++i) {
+            runHit(&ctxLocal, 50.0f, 0U, res, mv);
+            if (res != kExpSpread[i]) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-ratio-spread]: idx=%d exp=%d got=%d\n", i, kExpSpread[i], res);
+                return 1;
+            }
+        }
+        plugin_host::DispatchPluginSubcommand("crit", {"verbose", "on"}, "verbose on seq");
+        g_capturedAsyncChatLines.clear();
+        plugin_host::DispatchPluginSubcommand("crit", {"seq", "10-1"}, "seq 10-1");
+        for (int i = 0; i < 8; ++i) {
+            runHit(&ctxLocal, 50.0f, 0U, res, mv);
+            if (res != kExpCustom[i]) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-seq]: idx=%d exp=%d got=%d\n", i, kExpCustom[i], res);
+                return 1;
+            }
+        }
+        plugin_host::DispatchPluginSubcommand("crit", {"verbose", "off"}, "verbose off seq");
+        {
+            const bool seqCntOk = (g_capturedAsyncChatLines.size() == 8U);
+            const bool seqTagOk = !g_capturedAsyncChatLines.empty() &&
+                                  (g_capturedAsyncChatLines[0].find(u8"[序列 1/4]") != std::string::npos ||
+                                   g_capturedAsyncChatLines[0].find("[Seq 1/4]") != std::string::npos);
+            bool noAffInSeq = true;
+            for (const auto& l : g_capturedAsyncChatLines) {
+                if (l.find(u8"会心=") != std::string::npos || l.find("Aff=") != std::string::npos) {
+                    noAffInSeq = false;
+                }
+            }
+            if (!seqCntOk || !seqTagOk || !noAffInSeq) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-seq-verbose]: cnt=%zu tagOk=%d noAff=%d first='%s'\n",
+                            g_capturedAsyncChatLines.size(), seqTagOk ? 1 : 0, noAffInSeq ? 1 : 0,
+                            g_capturedAsyncChatLines.empty() ? "" : g_capturedAsyncChatLines[0].c_str());
+                return 1;
+            }
+        }
+
+        // (f) `mv_bank 50 1.0` at 50%: TCS pairs `(22.0, 264.0)` -> 100% high-MV crit & 50% overall conservation
+        g_capturedChatLines.clear();
+        plugin_host::DispatchPluginSubcommand("crit", {"mv_bank", "50", "1.0"}, "mv_bank 50 1.0");
+        {
+            bool sawOverflowThresh = false;
+            for (const auto& l : g_capturedChatLines) {
+                if (l.find("2.00") != std::string::npos) sawOverflowThresh = true;
+            }
+            if (!sawOverflowThresh) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-mvbank-copy]: expected 2.00 overflow threshold in mv_bank confirmation\n");
+                return 1;
+            }
+        }
+        plugin_host::DispatchPluginSubcommand("crit", {"rate", "50"}, "rate 50");
+        int highCrits = 0, lowCrits = 0;
+        for (int pair = 0; pair < 40; ++pair) {
+            runHit(&ctxLocal, 22.0f, 0U, res, mv);
+            if (res > 0) ++lowCrits;
+            runHit(&ctxLocal, 264.0f, 0U, res, mv);
+            if (res > 0) ++highCrits;
+        }
+        if (highCrits != 40 || lowCrits != 0) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-mvbank-tcs]: high=%d/40 low=%d/40\n", highCrits, lowCrits);
+            return 1;
+        }
+        plugin_host::DispatchPluginSubcommand("crit", {"reset"}, "reset bank");
+        int lowOnlyCrits = 0;
+        for (int i = 0; i < 100; ++i) {
+            runHit(&ctxLocal, 15.0f, 0U, res, mv);
+            if (res > 0) ++lowOnlyCrits;
+        }
+        if (lowOnlyCrits < 48 || lowOnlyCrits > 51) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-mvbank-low]: crits=%d/100\n", lowOnlyCrits);
+            return 1;
+        }
+
+        // (g) `mv_tier` multi-cutoff (zero hidden delta), strict validation (no silent clamp!), `delta=`, and `rate=`
+        plugin_host::DispatchPluginSubcommand("crit", {"rate", "50"}, "rate 50 tier");
+        plugin_host::DispatchPluginSubcommand("crit", {"mv_tier", "50", "125", "200"}, "mv_tier 50 125 200");
+        // Verify invalid `delta=0,0,0,200` and count mismatch fail cleanly WITHOUT mutating active tier streams
+        plugin_host::DispatchPluginSubcommand("crit", {"mv_tier", "50", "125", "200", "delta=0,0,0,200"}, "mv_tier bad range");
+        plugin_host::DispatchPluginSubcommand("crit", {"mv_tier", "50", "125", "200", "delta=-10,10"}, "mv_tier bad count");
+        int t4Low = 0, t4High = 0;
+        for (int i = 0; i < 30; ++i) {
+            runHit(&ctxLocal, 22.0f,  0U, res, mv); if (res > 0) ++t4Low;
+            runHit(&ctxLocal, 264.0f, 0U, res, mv); if (res > 0) ++t4High;
+        }
+        if (t4Low == 0 || t4Low == 30 || t4High == 0 || t4High == 30) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-mvtier-4cuts]: unexpected forced crit/miss (lo=%d/30 hi=%d/30)\n", t4Low, t4High);
+            return 1;
+        }
+
+        plugin_host::DispatchPluginSubcommand("crit", {"mv_tier", "25", "60", "delta=-50,0,50"}, "mv_tier delta");
+        int tierLow = 0, tierMid = 0, tierHigh = 0;
+        for (int i = 0; i < 20; ++i) {
+            runHit(&ctxLocal, 15.0f, 0U, res, mv); if (res > 0) ++tierLow;
+            runHit(&ctxLocal, 80.0f, 0U, res, mv); if (res > 0) ++tierHigh;
+            runHit(&ctxLocal, 40.0f, 0U, res, mv); if (res > 0) ++tierMid;
+        }
+        if (tierLow != 0 || tierHigh != 20 || tierMid < 4 || tierMid > 16) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-mvtier]: lo=%d mid=%d hi=%d\n", tierLow, tierMid, tierHigh);
+            return 1;
+        }
+
+        plugin_host::DispatchPluginSubcommand("crit", {"mv_tier", "50", "125", "200", "rate=0,100,0,100"}, "mv_tier rate");
+        int r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+        for (int i = 0; i < 10; ++i) {
+            runHit(&ctxLocal, 22.0f,  0U, res, mv); if (res > 0) ++r0;
+            runHit(&ctxLocal, 82.0f,  0U, res, mv); if (res > 0) ++r1;
+            runHit(&ctxLocal, 150.0f, 0U, res, mv); if (res > 0) ++r2;
+            runHit(&ctxLocal, 264.0f, 0U, res, mv); if (res > 0) ++r3;
+        }
+        if (r0 != 0 || r1 != 10 || r2 != 0 || r3 != 10) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-mvtier-rate]: r=%d,%d,%d,%d\n", r0, r1, r2, r3);
+            return 1;
+        }
+
+        // (h) `bag 10` at 35% over 100 hits -> exact 35 crits (fractional carry conservation)
+        plugin_host::DispatchPluginSubcommand("crit", {"bag", "10"}, "bag 10");
+        plugin_host::DispatchPluginSubcommand("crit", {"rate", "35"}, "rate 35");
+        int bagCrits = 0;
+        for (int i = 0; i < 100; ++i) {
+            runHit(&ctxLocal, 40.0f, 0U, res, mv);
+            if (res > 0) ++bagCrits;
+        }
+        if (bagCrits != 35) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-bag]: crits=%d/100 (expected exact 35)\n", bagCrits);
+            return 1;
+        }
+
+        // (i) `prd` at 25% over 1000 hits -> ~25% mean AND bounded max miss streak (<= 12)
+        plugin_host::DispatchPluginSubcommand("crit", {"prd"}, "prd");
+        plugin_host::DispatchPluginSubcommand("crit", {"rate", "25"}, "rate 25");
+        int prdCrits = 0, curMiss = 0, maxMiss = 0;
+        for (int i = 0; i < 1000; ++i) {
+            runHit(&ctxLocal, 40.0f, 0U, res, mv);
+            if (res > 0) {
+                ++prdCrits;
+                curMiss = 0;
+            } else {
+                ++curMiss;
+                if (curMiss > maxMiss) maxMiss = curMiss;
+            }
+        }
+        if (prdCrits < 210 || prdCrits > 290 || maxMiss > 12) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-prd]: crits=%d/1000 maxMiss=%d\n", prdCrits, maxMiss);
+            return 1;
+        }
+
+        // (j) Hot-unload restores exact 5-byte prologue & hot-reload re-hooks cleanly
+        std::string critMsg;
+        if (!plugin_host::UnloadSingle("crit", critMsg) ||
+            std::memcmp(img + 0x01F51380U, kCritOrig5, 5) != 0) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-unload]: prologue at 0x01F51380 not restored (%s)\n", critMsg.c_str());
+            return 1;
+        }
+        if (!plugin_host::LoadOrReloadSingle("crit", critMsg) || img[0x01F51380U] != 0xE9U) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-reload]: failed to re-hook 0x01F51380 (%s)\n", critMsg.c_str());
+            return 1;
+        }
+
+        restoreCritTestMem();
+        host->ClearAllRules();
+        std::printf("[OK] Test 22: `rng_crit.dll` (remote passthrough, rate override, random/ratio/seq/mv_bank/mv_tier/bag/prd & hot unload/reload) verified!\n");
     }
 
     plugin_host::ShutdownAll();
