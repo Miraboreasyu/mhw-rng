@@ -70,8 +70,30 @@ bool                       g_reverseHasMatch    = false;
 TabSession                 g_tab;
 std::deque<std::string>    g_pendingCmds;
 
+std::atomic<bool>          g_hasImeComp{false};
+std::string                g_imeComp;
+std::size_t                g_imeCompCursor    = 0U;
+std::vector<std::string>   g_imeCandidates;
+std::size_t                g_imeCandSelected  = 0U;
+std::size_t                g_imeCandPageStart = 0U;
+std::size_t                g_imeCandTotal     = 0U;
+
 inline void BumpGenLocked() noexcept {
     g_gen.fetch_add(1ULL, std::memory_order_release);
+}
+
+void ClearImeStateLocked(bool& outChanged) noexcept {
+    outChanged = !g_imeComp.empty() || !g_imeCandidates.empty() ||
+                 g_imeCompCursor != 0U || g_imeCandSelected != 0U ||
+                 g_imeCandPageStart != 0U || g_imeCandTotal != 0U ||
+                 g_hasImeComp.load(std::memory_order_relaxed);
+    g_imeComp.clear();
+    g_imeCompCursor = 0U;
+    g_imeCandidates.clear();
+    g_imeCandSelected  = 0U;
+    g_imeCandPageStart = 0U;
+    g_imeCandTotal     = 0U;
+    g_hasImeComp.store(false, std::memory_order_release);
 }
 
 std::string LowerAscii(std::string s) {
@@ -239,9 +261,20 @@ void InsertUtf8Locked(const std::string& utf8) {
     if (utf8.empty()) return;
     ResetTabLocked();
     if (g_reverseSearch) {
-        for (unsigned char c : utf8) {
-            if (c == '\r' || c == '\n' || c == '\t' || c < 0x20U) continue;
-            if (g_reverseQuery.size() < 128U) g_reverseQuery.push_back(static_cast<char>(c));
+        for (std::size_t i = 0U; i < utf8.size();) {
+            const unsigned char c = static_cast<unsigned char>(utf8[i]);
+            if (c == '\r' || c == '\n' || c == '\t' || c < 0x20U || c == 0x7FU) {
+                ++i;
+                continue;
+            }
+            std::size_t seqLen = 1U;
+            if ((c & 0xE0U) == 0xC0U) seqLen = 2U;
+            else if ((c & 0xF0U) == 0xE0U) seqLen = 3U;
+            else if ((c & 0xF8U) == 0xF0U) seqLen = 4U;
+            if (i + seqLen > utf8.size()) seqLen = utf8.size() - i;
+            if (g_reverseQuery.size() + seqLen > 128U) break;
+            g_reverseQuery.append(utf8, i, seqLen);
+            i += seqLen;
         }
         UpdateReverseSearchLocked(false);
         BumpGenLocked();
@@ -651,6 +684,10 @@ void PasteClipboardLocked() {
 
 void SubmitCurrentInputLocked() {
     ResetTabLocked();
+    {
+        bool unused = false;
+        ClearImeStateLocked(unused);
+    }
     if (g_reverseSearch) {
         g_reverseSearch = false;
         g_reverseQuery.clear();
@@ -716,6 +753,10 @@ void Reset() noexcept {
     g_reverseMatchIdx    = 0U;
     g_reverseHasMatch    = false;
     ResetTabLocked();
+    {
+        bool unused = false;
+        ClearImeStateLocked(unused);
+    }
     g_pendingCmds.clear();
     BumpGenLocked();
 }
@@ -730,6 +771,8 @@ void SetOpen(bool open) noexcept {
         std::lock_guard<std::mutex> lk(g_mx);
         if (!open) {
             ResetTabLocked();
+            bool unused = false;
+            ClearImeStateLocked(unused);
             if (g_reverseSearch) {
                 g_reverseSearch = false;
                 g_reverseQuery.clear();
@@ -745,6 +788,8 @@ bool ToggleOpen() noexcept {
     g_open.store(next, std::memory_order_release);
     if (!next) {
         ResetTabLocked();
+        bool unused = false;
+        ClearImeStateLocked(unused);
         if (g_reverseSearch) {
             g_reverseSearch = false;
             g_reverseQuery.clear();
@@ -859,6 +904,8 @@ bool OnKeyDown(int vk, bool ctrl, bool shift, bool alt) noexcept {
         }
         if (vk == VK_ESCAPE) {
             g_open.store(false, std::memory_order_release);
+            bool unused = false;
+            ClearImeStateLocked(unused);
             BumpGenLocked();
         }
         return true;
@@ -997,6 +1044,8 @@ bool OnKeyDown(int vk, bool ctrl, bool shift, bool alt) noexcept {
     if ((vk == VK_DELETE && !ctrl && !alt) || (ctrl && !alt && vk == 'D')) {
         if (ctrl && vk == 'D' && g_input.empty() && !g_reverseSearch) {
             g_open.store(false, std::memory_order_release);
+            bool unused = false;
+            ClearImeStateLocked(unused);
             BumpGenLocked();
             return true;
         }
@@ -1086,6 +1135,79 @@ void InsertUtf16(const wchar_t* wstr, int len) noexcept {
     InsertUtf8Locked(u8);
 }
 
+bool HasImeComposition() noexcept {
+    return g_hasImeComp.load(std::memory_order_acquire);
+}
+
+void SetImeCompositionUtf16(const wchar_t* compStr, int compLen, int cursorUtf16Idx) noexcept {
+    std::string fullU8;
+    std::size_t cursorU8 = 0U;
+    if (compStr && compLen > 0) {
+        const int curIdx = std::max(0, std::min(cursorUtf16Idx, compLen));
+        const std::string headU8 = (curIdx > 0) ? Utf16ToUtf8(compStr, curIdx) : std::string{};
+        const std::string tailU8 = (curIdx < compLen) ? Utf16ToUtf8(compStr + curIdx, compLen - curIdx) : std::string{};
+        cursorU8 = headU8.size();
+        fullU8   = headU8 + tailU8;
+    }
+
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (fullU8.empty()) {
+        const bool changed = !g_imeComp.empty() || g_imeCompCursor != 0U;
+        g_imeComp.clear();
+        g_imeCompCursor = 0U;
+        g_hasImeComp.store(!g_imeCandidates.empty(), std::memory_order_release);
+        if (changed) BumpGenLocked();
+        return;
+    }
+    ResetTabLocked();
+    g_imeComp       = std::move(fullU8);
+    g_imeCompCursor = cursorU8;
+    g_hasImeComp.store(true, std::memory_order_release);
+    BumpGenLocked();
+}
+
+void SetImeCandidatesUtf16(const std::vector<std::wstring>& pageItems,
+                           std::size_t selectedInPage,
+                           std::size_t pageStart,
+                           std::size_t totalCount) noexcept {
+    std::vector<std::string> itemsU8;
+    itemsU8.reserve(pageItems.size());
+    for (const auto& ws : pageItems) {
+        if (ws.empty()) {
+            itemsU8.emplace_back();
+        } else {
+            itemsU8.push_back(Utf16ToUtf8(ws.c_str(), static_cast<int>(ws.size())));
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(g_mx);
+    g_imeCandidates    = std::move(itemsU8);
+    g_imeCandSelected  = g_imeCandidates.empty() ? 0U : std::min(selectedInPage, g_imeCandidates.size() - 1U);
+    g_imeCandPageStart = g_imeCandidates.empty() ? 0U : pageStart;
+    g_imeCandTotal     = g_imeCandidates.empty() ? 0U : std::max(totalCount, g_imeCandidates.size());
+    g_hasImeComp.store(!g_imeComp.empty() || !g_imeCandidates.empty(), std::memory_order_release);
+    BumpGenLocked();
+}
+
+void ClearImeCandidates() noexcept {
+    std::lock_guard<std::mutex> lk(g_mx);
+    const bool changed = !g_imeCandidates.empty() || g_imeCandSelected != 0U ||
+                         g_imeCandPageStart != 0U || g_imeCandTotal != 0U;
+    g_imeCandidates.clear();
+    g_imeCandSelected  = 0U;
+    g_imeCandPageStart = 0U;
+    g_imeCandTotal     = 0U;
+    g_hasImeComp.store(!g_imeComp.empty(), std::memory_order_release);
+    if (changed) BumpGenLocked();
+}
+
+void ClearImeComposition() noexcept {
+    std::lock_guard<std::mutex> lk(g_mx);
+    bool changed = false;
+    ClearImeStateLocked(changed);
+    if (changed) BumpGenLocked();
+}
+
 bool PopPendingCommand(std::string& outCmd) noexcept {
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_pendingCmds.empty()) return false;
@@ -1097,10 +1219,16 @@ bool PopPendingCommand(std::string& outCmd) noexcept {
 void CaptureSnapshot(std::size_t maxLines, ConsoleSnapshot& out) {
     out.lines.clear();
     std::lock_guard<std::mutex> lk(g_mx);
-    out.totalLines   = g_lines.size();
-    out.scrollOffset = g_scrollOffset;
-    out.inputLine    = g_input;
-    out.cursorByte   = g_cursor;
+    out.totalLines        = g_lines.size();
+    out.scrollOffset      = g_scrollOffset;
+    out.inputLine         = g_input;
+    out.cursorByte        = g_cursor;
+    out.imeCompText       = g_imeComp;
+    out.imeCompCursorByte = g_imeCompCursor;
+    out.imeCandidates     = g_imeCandidates;
+    out.imeCandSelected   = g_imeCandSelected;
+    out.imeCandPageStart  = g_imeCandPageStart;
+    out.imeCandTotal      = g_imeCandTotal;
 
     if (g_reverseSearch) {
         out.searchPrompt = std::string(g_reverseHasMatch ? "(reverse-i-search)`" : "(failed reverse-i-search)`") +

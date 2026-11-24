@@ -14,6 +14,9 @@ bool HasSelection() noexcept;
 void ClearSelection() noexcept;
 bool CopySelectionToClipboard(bool clearAfterCopy) noexcept;
 
+// Returns the current input caret position in game window client coordinates (for ImmSetCompositionWindow).
+bool GetInputCaretClientPos(void* hwnd, int& outClientX, int& outClientY, int& outLineHeight) noexcept;
+
 // Releases all GDI / D3D11 / D3D12 / shader resources cleanly.
 void Shutdown() noexcept;
 

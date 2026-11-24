@@ -13,14 +13,18 @@
 #include "rng_engine.h"
 
 #include <windows.h>
+#include <imm.h>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -29,6 +33,60 @@ using SChatMoveFn        = void(__fastcall*)(std::uintptr_t);
 using SChatShowMessageFn = void(__fastcall*)(std::uintptr_t, const char*, float, std::uint32_t, std::uint8_t);
 using D3DPresentFn       = std::uint64_t(__fastcall*)(std::uintptr_t, std::uint64_t, std::uint64_t, std::uint64_t);
 using SKeyboardMoveFn    = void(__fastcall*)(std::uintptr_t);
+
+struct ImmApi {
+    using FnGetContext            = HIMC(WINAPI*)(HWND);
+    using FnReleaseContext        = BOOL(WINAPI*)(HWND, HIMC);
+    using FnAssociateContext      = HIMC(WINAPI*)(HWND, HIMC);
+    using FnAssociateContextEx    = BOOL(WINAPI*)(HWND, HIMC, DWORD);
+    using FnGetCompositionStringW = LONG(WINAPI*)(HIMC, DWORD, LPVOID, DWORD);
+    using FnGetCandidateListW     = DWORD(WINAPI*)(HIMC, DWORD, LPCANDIDATELIST, DWORD);
+    using FnNotifyIME             = BOOL(WINAPI*)(HIMC, DWORD, DWORD, DWORD);
+    using FnSetCompositionWindow  = BOOL(WINAPI*)(HIMC, LPCOMPOSITIONFORM);
+    using FnSetCandidateWindow    = BOOL(WINAPI*)(HIMC, LPCANDIDATEFORM);
+    using FnGetOpenStatus         = BOOL(WINAPI*)(HIMC);
+    using FnSetOpenStatus         = BOOL(WINAPI*)(HIMC, BOOL);
+    using FnIsIME                 = BOOL(WINAPI*)(HKL);
+
+    FnGetContext            getContext            = nullptr;
+    FnReleaseContext        releaseContext        = nullptr;
+    FnAssociateContext      associateContext      = nullptr;
+    FnAssociateContextEx    associateContextEx    = nullptr;
+    FnGetCompositionStringW getCompositionStringW = nullptr;
+    FnGetCandidateListW     getCandidateListW     = nullptr;
+    FnNotifyIME             notifyIME             = nullptr;
+    FnSetCompositionWindow  setCompositionWindow  = nullptr;
+    FnSetCandidateWindow    setCandidateWindow    = nullptr;
+    FnGetOpenStatus         getOpenStatus         = nullptr;
+    FnSetOpenStatus         setOpenStatus         = nullptr;
+    FnIsIME                 isIME                 = nullptr;
+    std::once_flag          once{};
+    bool                    ready                 = false;
+
+    bool ensure() noexcept {
+        std::call_once(once, [this]() {
+            HMODULE mod = ::GetModuleHandleW(L"imm32.dll");
+            if (!mod) mod = ::LoadLibraryW(L"imm32.dll");
+            if (!mod) return;
+            getContext            = reinterpret_cast<FnGetContext>(::GetProcAddress(mod, "ImmGetContext"));
+            releaseContext        = reinterpret_cast<FnReleaseContext>(::GetProcAddress(mod, "ImmReleaseContext"));
+            associateContext      = reinterpret_cast<FnAssociateContext>(::GetProcAddress(mod, "ImmAssociateContext"));
+            associateContextEx    = reinterpret_cast<FnAssociateContextEx>(::GetProcAddress(mod, "ImmAssociateContextEx"));
+            getCompositionStringW = reinterpret_cast<FnGetCompositionStringW>(::GetProcAddress(mod, "ImmGetCompositionStringW"));
+            getCandidateListW     = reinterpret_cast<FnGetCandidateListW>(::GetProcAddress(mod, "ImmGetCandidateListW"));
+            notifyIME             = reinterpret_cast<FnNotifyIME>(::GetProcAddress(mod, "ImmNotifyIME"));
+            setCompositionWindow  = reinterpret_cast<FnSetCompositionWindow>(::GetProcAddress(mod, "ImmSetCompositionWindow"));
+            setCandidateWindow    = reinterpret_cast<FnSetCandidateWindow>(::GetProcAddress(mod, "ImmSetCandidateWindow"));
+            getOpenStatus         = reinterpret_cast<FnGetOpenStatus>(::GetProcAddress(mod, "ImmGetOpenStatus"));
+            setOpenStatus         = reinterpret_cast<FnSetOpenStatus>(::GetProcAddress(mod, "ImmSetOpenStatus"));
+            isIME                 = reinterpret_cast<FnIsIME>(::GetProcAddress(mod, "ImmIsIME"));
+            ready = (getContext && releaseContext && associateContext && getCompositionStringW && getCandidateListW);
+        });
+        return ready;
+    }
+} g_imm;
+
+constexpr UINT kMsgConsoleImeSync = WM_APP + 0x4D52U;
 
 HMODULE                    g_selfModule       = nullptr;
 std::uintptr_t             g_exeBase          = 0;
@@ -47,13 +105,29 @@ HHOOK                       g_kbHook           = nullptr;
 HHOOK                       g_getMsgHook       = nullptr;
 std::atomic<bool>           g_kbHookInstalled{false};
 std::atomic<DWORD>          g_wndTid{0U};
+std::atomic<HWND>           g_gameHwnd{nullptr};
 std::atomic<std::uint32_t>  g_presentHookFrames{0U};
 std::atomic<bool>           g_reassertKbHookPending{false};
+std::atomic<bool>           g_imeSyncPending{false};
+std::atomic<bool>           g_imeSyncPosted{false};
+std::atomic<bool>           g_wndProcCheckPending{false};
+std::atomic<std::uint32_t>  g_kbOpenDownCount{0U};
+std::atomic<std::uint32_t>  g_wpOpenDownCount{0U};
 std::atomic<std::uint8_t>   g_swallowVkMask{0U};
 std::atomic<bool>           g_detaching{false};
 bool                        g_mouseOverrideApplied = false;
 std::uint8_t                g_savedForceCursor     = 0U;
 std::uint8_t                g_savedOverlayActive   = 0U;
+WNDPROC                     g_origWndProc          = nullptr;
+HWND                        g_subclassedHwnd       = nullptr;
+bool                        g_wndProcInstalled     = false;
+bool                        g_consoleImeSyncedOpen = false;
+bool                        g_consoleWeAttachedIme = false;
+bool                        g_inImeSync            = false;
+bool                        g_changedImeOpen       = false;
+BOOL                        g_prevImeOpen          = FALSE;
+bool                        g_loggedNoWpDelivery   = false;
+wchar_t                     g_pendingHighSurrogate = 0;
 thread_local std::uintptr_t tls_activeSChat    = 0;
 thread_local bool           tls_inChatCmd      = false;
 
@@ -447,9 +521,565 @@ void __fastcall Hook_SKeyboardMove(std::uintptr_t sKb) {
     }
 }
 
+void UpdateImeWindowPos(HWND hwnd, HIMC himc) noexcept {
+    if (!hwnd || !himc || !g_imm.ensure()) return;
+    int cx = 24, cy = 400, lh = 24;
+    if (!console_overlay::GetInputCaretClientPos(hwnd, cx, cy, lh)) {
+        RECT cr{};
+        if (::GetClientRect(hwnd, &cr)) {
+            cx = 24;
+            cy = std::max(24, static_cast<int>((cr.bottom - cr.top) / 2));
+        }
+    }
+    if (g_imm.setCompositionWindow) {
+        COMPOSITIONFORM cf{};
+        cf.dwStyle        = CFS_POINT;
+        cf.ptCurrentPos.x = cx;
+        cf.ptCurrentPos.y = cy;
+        g_imm.setCompositionWindow(himc, &cf);
+    }
+    if (g_imm.setCandidateWindow) {
+        CANDIDATEFORM candForm{};
+        candForm.dwIndex        = 0U;
+        candForm.dwStyle        = CFS_CANDIDATEPOS;
+        candForm.ptCurrentPos.x = cx;
+        candForm.ptCurrentPos.y = cy + lh;
+        g_imm.setCandidateWindow(himc, &candForm);
+    }
+}
+
+void RefreshImeCandidates(HWND hwnd) noexcept {
+    if (!hwnd || !g_imm.ensure()) return;
+    HIMC himc = g_imm.getContext(hwnd);
+    if (!himc) {
+        console::ClearImeCandidates();
+        return;
+    }
+
+    const DWORD bytes = g_imm.getCandidateListW(himc, 0U, nullptr, 0U);
+    if (bytes < sizeof(CANDIDATELIST) || bytes > 65536U) {
+        g_imm.releaseContext(hwnd, himc);
+        if (bytes == 0U) console::ClearImeCandidates();
+        return;
+    }
+
+    std::vector<std::uint8_t> buf(bytes, 0U);
+    auto* cl = reinterpret_cast<CANDIDATELIST*>(buf.data());
+    const DWORD got = g_imm.getCandidateListW(himc, 0U, cl, bytes);
+    if (got < sizeof(CANDIDATELIST) || cl->dwCount == 0U ||
+        offsetof(CANDIDATELIST, dwOffset) + static_cast<std::size_t>(cl->dwCount) * sizeof(DWORD) > got) {
+        g_imm.releaseContext(hwnd, himc);
+        console::ClearImeCandidates();
+        return;
+    }
+
+    const DWORD pageSize = (cl->dwPageSize > 0U && cl->dwPageSize <= 10U)
+                               ? cl->dwPageSize
+                               : std::min<DWORD>(9U, cl->dwCount);
+    const DWORD sel = std::min<DWORD>(cl->dwSelection, cl->dwCount - 1U);
+    DWORD pageStart = cl->dwPageStart;
+    if (sel < pageStart || sel >= pageStart + pageSize) {
+        pageStart = (sel / pageSize) * pageSize;
+    }
+    const DWORD pageEnd = std::min<DWORD>(cl->dwCount, pageStart + pageSize);
+
+    std::vector<std::wstring> pageItems;
+    pageItems.reserve(pageEnd - pageStart);
+    for (DWORD i = pageStart; i < pageEnd; ++i) {
+        const DWORD off = cl->dwOffset[i];
+        if (off >= got) {
+            pageItems.emplace_back();
+            continue;
+        }
+        const std::size_t maxWchars = (got - off) / sizeof(wchar_t);
+        const auto* ws = reinterpret_cast<const wchar_t*>(buf.data() + off);
+        const std::size_t wlen = ::wcsnlen(ws, maxWchars);
+        pageItems.emplace_back(ws, wlen);
+    }
+
+    console::SetImeCandidatesUtf16(pageItems, static_cast<std::size_t>(sel - pageStart),
+                                   static_cast<std::size_t>(pageStart), static_cast<std::size_t>(cl->dwCount));
+    UpdateImeWindowPos(hwnd, himc);
+    g_imm.releaseContext(hwnd, himc);
+}
+
+void FormatModuleOffset(const void* addr, char* out, std::size_t cap) noexcept {
+    if (!out || cap == 0U) return;
+    out[0] = '\0';
+    if (!addr) {
+        std::snprintf(out, cap, "0x0");
+        return;
+    }
+    HMODULE mod = nullptr;
+    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCWSTR>(addr), &mod) ||
+        !mod) {
+        std::snprintf(out, cap, "%p", addr);
+        return;
+    }
+    wchar_t path[MAX_PATH]{};
+    ::GetModuleFileNameW(mod, path, MAX_PATH);
+    const wchar_t* baseName = ::wcsrchr(path, L'\\');
+    baseName = baseName ? (baseName + 1) : path;
+    char modUtf8[MAX_PATH * 2]{};
+    const int n = ::WideCharToMultiByte(CP_UTF8, 0, baseName, -1, modUtf8,
+                                        static_cast<int>(sizeof(modUtf8)), nullptr, nullptr);
+    if (n <= 0) {
+        std::snprintf(out, cap, "%p", addr);
+        return;
+    }
+    const auto off = static_cast<unsigned long long>(
+        reinterpret_cast<const std::uint8_t*>(addr) -
+        reinterpret_cast<const std::uint8_t*>(mod));
+    std::snprintf(out, cap, "%s+0x%llX (%p)", modUtf8, off, addr);
+}
+
+void RequestConsoleImeSync(HWND hw) noexcept {
+    g_imeSyncPending.store(true, std::memory_order_release);
+    if (hw && !g_imeSyncPosted.exchange(true, std::memory_order_acq_rel)) {
+        if (!::PostMessageW(hw, kMsgConsoleImeSync, 0, 0)) {
+            g_imeSyncPosted.store(false, std::memory_order_release);
+        }
+    }
+}
+
+void SyncConsoleImeStateOnWindowThread(bool forceDetach = false) noexcept {
+    if (g_inImeSync) return;
+    g_inImeSync = true;
+    struct SyncGuard {
+        bool& flag;
+        ~SyncGuard() { flag = false; }
+    } syncGuard{g_inImeSync};
+
+    HWND hwnd = g_gameHwnd.load(std::memory_order_acquire);
+    if (!hwnd || !::IsWindow(hwnd)) return;
+    const DWORD tid = g_wndTid.load(std::memory_order_acquire);
+    if (!forceDetach && (tid == 0U || ::GetCurrentThreadId() != tid)) return;
+    g_imeSyncPending.store(false, std::memory_order_release);
+    g_imeSyncPosted.store(false, std::memory_order_release);
+    if (!g_imm.ensure()) return;
+
+    const bool wantIme = !forceDetach && console::IsOpen() && !IsGameTextInputActive(g_exeBase);
+    if (wantIme) {
+        if (!g_consoleImeSyncedOpen) {
+            const HWND fg  = ::GetForegroundWindow();
+            const HWND foc = ::GetFocus();
+            if (fg == hwnd && foc != hwnd) {
+                ::SetFocus(hwnd);
+            }
+
+            HIMC preHimc = g_imm.getContext(hwnd);
+            g_consoleImeSyncedOpen = true;
+            const bool needAttach = (preHimc == nullptr);
+            g_consoleWeAttachedIme = needAttach;
+
+            HIMC workHimc = preHimc;
+            if (needAttach) {
+                if (g_imm.associateContextEx) {
+                    g_imm.associateContextEx(hwnd, nullptr, IACE_DEFAULT);
+                }
+                workHimc = g_imm.getContext(hwnd);
+                if (!workHimc) {
+                    app::Log("console-ime: failed to attach IME context on hwnd=%p", hwnd);
+                }
+            }
+
+            const HKL hkl = ::GetKeyboardLayout(0U);
+            const BOOL isIme = (g_imm.isIME != nullptr) ? g_imm.isIME(hkl) : FALSE;
+            if (workHimc) {
+                if (isIme && g_imm.getOpenStatus && g_imm.setOpenStatus) {
+                    const BOOL wasOpen = g_imm.getOpenStatus(workHimc);
+                    if (!wasOpen) {
+                        g_prevImeOpen    = FALSE;
+                        g_changedImeOpen = true;
+                        g_imm.setOpenStatus(workHimc, TRUE);
+                    }
+                }
+                UpdateImeWindowPos(hwnd, workHimc);
+                g_imm.releaseContext(hwnd, workHimc);
+            }
+        }
+    } else {
+        g_pendingHighSurrogate = 0;
+        if (console::HasImeComposition()) {
+            console::ClearImeComposition();
+        }
+        const bool wasSynced   = g_consoleImeSyncedOpen;
+        const bool weAttached  = g_consoleWeAttachedIme;
+        const bool restoreOpen = g_changedImeOpen;
+        const BOOL prevOpen    = g_prevImeOpen;
+        g_consoleImeSyncedOpen = false;
+        g_consoleWeAttachedIme = false;
+        g_changedImeOpen       = false;
+
+        if (wasSynced || weAttached || forceDetach) {
+            HIMC himc = g_imm.getContext(hwnd);
+            if (himc) {
+                if (g_imm.notifyIME) {
+                    g_imm.notifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0U);
+                }
+                if (restoreOpen && g_imm.setOpenStatus) {
+                    g_imm.setOpenStatus(himc, prevOpen);
+                }
+                g_imm.releaseContext(hwnd, himc);
+            }
+            if (weAttached && (forceDetach || !IsGameTextInputActive(g_exeBase))) {
+                g_imm.associateContext(hwnd, nullptr);
+            }
+        }
+    }
+}
+
+struct ConsoleMsgNest;
+thread_local ConsoleMsgNest* tls_consoleMsgNest = nullptr;
+thread_local int             tls_wndProcDepth   = 0;
+
+struct ConsoleMsgNest {
+    HWND            hwnd;
+    UINT            msg;
+    WPARAM          wParam;
+    LPARAM          lParam;
+    ConsoleMsgNest* prev;
+
+    ConsoleMsgNest(HWND h, UINT m, WPARAM w, LPARAM l) noexcept
+        : hwnd(h), msg(m), wParam(w), lParam(l), prev(tls_consoleMsgNest) {
+        tls_consoleMsgNest = this;
+        ++tls_wndProcDepth;
+    }
+    ~ConsoleMsgNest() noexcept {
+        tls_consoleMsgNest = prev;
+        --tls_wndProcDepth;
+    }
+    ConsoleMsgNest(const ConsoleMsgNest&)            = delete;
+    ConsoleMsgNest& operator=(const ConsoleMsgNest&) = delete;
+};
+
+int CountConsoleMsgNest(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) noexcept {
+    int count = 0;
+    for (const ConsoleMsgNest* cur = tls_consoleMsgNest; cur; cur = cur->prev) {
+        if (cur->hwnd == hwnd && cur->msg == msg && cur->wParam == wParam && cur->lParam == lParam) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+LRESULT CALLBACK ConsoleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+LRESULT ForwardToOrigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, WNDPROC orig, int nest) noexcept {
+    if (nest > 3 || tls_wndProcDepth > 12) {
+        return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+    if (nest > 1 || tls_wndProcDepth > 10) {
+        static thread_local ULONGLONG nextWarnTick = 0ULL;
+        const ULONGLONG now = ::GetTickCount64();
+        if (now >= nextWarnTick) {
+            nextWarnTick = now + 5000ULL;
+            char origDesc[160]{};
+            FormatModuleOffset(reinterpret_cast<const void*>(orig), origDesc, sizeof(origDesc));
+            app::Log("console-ime: warning - WndProc cycle/reentrancy detected (msg=0x%04X nest=%d depth=%d orig=%s), falling back to Global::WndProc",
+                     static_cast<unsigned>(msg), nest, tls_wndProcDepth, origDesc);
+        }
+        if (g_exeBase != 0) {
+            const auto globalWp = reinterpret_cast<WNDPROC>(g_exeBase + mhw::kRvaGlobalWndProc);
+            if (globalWp != &ConsoleWndProc && globalWp != orig) {
+                return ::CallWindowProcW(globalWp, hwnd, msg, wParam, lParam);
+            }
+        }
+        return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+    if (orig && orig != &ConsoleWndProc) {
+        return ::CallWindowProcW(orig, hwnd, msg, wParam, lParam);
+    }
+    return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+LRESULT CALLBACK ConsoleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    WNDPROC orig = g_origWndProc;
+    ConsoleMsgNest nestGuard(hwnd, msg, wParam, lParam);
+    const int nest = CountConsoleMsgNest(hwnd, msg, wParam, lParam);
+
+    if (msg == WM_NCDESTROY) {
+        app::Log("console-ime: WM_NCDESTROY on hwnd=%p", hwnd);
+        SyncConsoleImeStateOnWindowThread(true);
+        if (g_wndProcInstalled && orig &&
+            reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(hwnd, GWLP_WNDPROC)) == &ConsoleWndProc) {
+            ::SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+        }
+        g_wndProcInstalled = false;
+        g_subclassedHwnd   = nullptr;
+        return ForwardToOrigWndProc(hwnd, msg, wParam, lParam, orig, nest);
+    }
+
+    if (msg == kMsgConsoleImeSync) {
+        SyncConsoleImeStateOnWindowThread();
+        return 0;
+    }
+
+    if (g_imeSyncPending.load(std::memory_order_acquire) && !g_inImeSync) {
+        SyncConsoleImeStateOnWindowThread();
+    }
+
+    if (msg == WM_SETFOCUS || msg == WM_ACTIVATEAPP) {
+        const LRESULT res = ForwardToOrigWndProc(hwnd, msg, wParam, lParam, orig, nest);
+        if (console::IsOpen() && !g_inImeSync && (msg == WM_SETFOCUS || wParam != 0) && g_imm.ensure()) {
+            HIMC cur = g_imm.getContext(hwnd);
+            if (!cur) {
+                g_consoleImeSyncedOpen = false;
+                g_consoleWeAttachedIme = false;
+                SyncConsoleImeStateOnWindowThread();
+            } else {
+                UpdateImeWindowPos(hwnd, cur);
+                g_imm.releaseContext(hwnd, cur);
+            }
+        }
+        return res;
+    }
+
+    if (msg == WM_KILLFOCUS) {
+        if (console::IsOpen()) {
+            g_pendingHighSurrogate = 0;
+            if (g_imm.ensure()) {
+                if (HIMC himc = g_imm.getContext(hwnd)) {
+                    if (g_imm.notifyIME) g_imm.notifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0U);
+                    g_imm.releaseContext(hwnd, himc);
+                }
+            }
+            console::ClearImeComposition();
+        }
+        return ForwardToOrigWndProc(hwnd, msg, wParam, lParam, orig, nest);
+    }
+
+    if (!console::IsOpen()) {
+        if (!g_inImeSync && (g_consoleImeSyncedOpen || g_consoleWeAttachedIme)) {
+            SyncConsoleImeStateOnWindowThread();
+        }
+        return ForwardToOrigWndProc(hwnd, msg, wParam, lParam, orig, nest);
+    }
+
+    switch (msg) {
+        case WM_IME_SETCONTEXT:
+            lParam &= ~static_cast<LPARAM>(ISC_SHOWUICOMPOSITIONWINDOW | ISC_SHOWUIALLCANDIDATEWINDOW);
+            return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+
+        case WM_IME_STARTCOMPOSITION:
+            if (g_imm.ensure()) {
+                if (HIMC himc = g_imm.getContext(hwnd)) {
+                    UpdateImeWindowPos(hwnd, himc);
+                    g_imm.releaseContext(hwnd, himc);
+                }
+            }
+            return 0;
+
+        case WM_IME_COMPOSITION: {
+            if (g_imm.ensure()) {
+                HIMC himc = g_imm.getContext(hwnd);
+                if (himc) {
+                    if (lParam == 0) {
+                        console::ClearImeComposition();
+                    }
+                    if ((lParam & GCS_RESULTSTR) != 0) {
+                        const LONG bytes = g_imm.getCompositionStringW(himc, GCS_RESULTSTR, nullptr, 0U);
+                        if (bytes > 0 && bytes <= 4096) {
+                            const int wchars = static_cast<int>(bytes / static_cast<LONG>(sizeof(wchar_t)));
+                            std::vector<wchar_t> wbuf(static_cast<std::size_t>(wchars) + 1U, L'\0');
+                            const LONG got = g_imm.getCompositionStringW(himc, GCS_RESULTSTR, wbuf.data(),
+                                                                         static_cast<DWORD>(bytes));
+                            if (got > 0) {
+                                const int gotChars = static_cast<int>(got / static_cast<LONG>(sizeof(wchar_t)));
+                                console::InsertUtf16(wbuf.data(), gotChars);
+                            }
+                        }
+                        if ((lParam & GCS_COMPSTR) == 0) {
+                            console::ClearImeComposition();
+                        }
+                    }
+                    if ((lParam & GCS_COMPSTR) != 0) {
+                        const LONG bytes = g_imm.getCompositionStringW(himc, GCS_COMPSTR, nullptr, 0U);
+                        if (bytes <= 0 || bytes > 4096) {
+                            console::ClearImeComposition();
+                        } else {
+                            const int wchars = static_cast<int>(bytes / static_cast<LONG>(sizeof(wchar_t)));
+                            std::vector<wchar_t> wbuf(static_cast<std::size_t>(wchars) + 1U, L'\0');
+                            const LONG got = g_imm.getCompositionStringW(himc, GCS_COMPSTR, wbuf.data(),
+                                                                         static_cast<DWORD>(bytes));
+                            if (got > 0) {
+                                const int gotChars = static_cast<int>(got / static_cast<LONG>(sizeof(wchar_t)));
+                                int cursorIdx = gotChars;
+                                if ((lParam & GCS_CURSORPOS) != 0) {
+                                    const LONG cp = g_imm.getCompositionStringW(himc, GCS_CURSORPOS, nullptr, 0U);
+                                    if (cp >= 0) {
+                                        cursorIdx = std::min(gotChars, static_cast<int>(cp & 0xFFFF));
+                                    }
+                                }
+                                console::SetImeCompositionUtf16(wbuf.data(), gotChars, cursorIdx);
+                            } else {
+                                console::ClearImeComposition();
+                            }
+                        }
+                        UpdateImeWindowPos(hwnd, himc);
+                    }
+                    g_imm.releaseContext(hwnd, himc);
+                }
+            }
+            return 0;
+        }
+
+        case WM_IME_ENDCOMPOSITION:
+            console::ClearImeComposition();
+            return 0;
+
+        case WM_IME_NOTIFY:
+            if (wParam == IMN_OPENCANDIDATE || wParam == IMN_CHANGECANDIDATE) {
+                RefreshImeCandidates(hwnd);
+                return 0;
+            }
+            if (wParam == IMN_CLOSECANDIDATE) {
+                console::ClearImeCandidates();
+                return 0;
+            }
+            return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+
+        case WM_IME_CHAR:
+            return 0;
+
+        case WM_IME_REQUEST:
+            return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+
+        case WM_CHAR: {
+            const wchar_t ch = static_cast<wchar_t>(wParam);
+            if (IS_HIGH_SURROGATE(ch)) {
+                g_pendingHighSurrogate = ch;
+                return 0;
+            }
+            if (IS_LOW_SURROGATE(ch)) {
+                if (g_pendingHighSurrogate != 0) {
+                    const wchar_t pair[2] = {g_pendingHighSurrogate, ch};
+                    g_pendingHighSurrogate = 0;
+                    console::InsertUtf16(pair, 2);
+                }
+                return 0;
+            }
+            g_pendingHighSurrogate = 0;
+            if (ch >= 0x20 && ch != 0x7F) {
+                console::InsertUtf16(&ch, 1);
+            }
+            return 0;
+        }
+
+        case WM_DEADCHAR:
+        case WM_SYSCHAR:
+            return 0;
+
+        case WM_KEYDOWN: {
+            const int vk = static_cast<int>(wParam);
+            g_wpOpenDownCount.fetch_add(1U, std::memory_order_relaxed);
+            if (vk == VK_PROCESSKEY) return 0;
+            if (console::HasImeComposition()) {
+                if (vk == VK_ESCAPE) {
+                    if (g_imm.ensure()) {
+                        if (HIMC himc = g_imm.getContext(hwnd)) {
+                            if (g_imm.notifyIME) g_imm.notifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0U);
+                            g_imm.releaseContext(hwnd, himc);
+                        }
+                    }
+                    console::ClearImeComposition();
+                }
+                return 0;
+            }
+            const bool ctrl  = ((::GetKeyState(VK_CONTROL) & 0x8000) != 0);
+            const bool shift = ((::GetKeyState(VK_SHIFT) & 0x8000) != 0);
+            const bool alt   = ((::GetKeyState(VK_MENU) & 0x8000) != 0);
+            if (ctrl && !alt && !shift && (vk == 'C' || vk == VK_INSERT)) {
+                if (console_overlay::CopySelectionToClipboard(false)) {
+                    return 0;
+                }
+            }
+            if (vk == VK_ESCAPE && !ctrl && !alt && console_overlay::HasSelection()) {
+                console_overlay::ClearSelection();
+                return 0;
+            }
+            (void)console::OnKeyDown(vk, ctrl, shift, alt);
+            if (!console::IsOpen()) {
+                console_overlay::ClearSelection();
+                g_swallowVkMask.fetch_or(0x01U, std::memory_order_relaxed);
+                SyncConsoleImeStateOnWindowThread();
+            }
+            return 0;
+        }
+
+        case WM_KEYUP:
+            return 0;
+
+        case WM_SYSKEYDOWN: {
+            const int vk = static_cast<int>(wParam);
+            if (vk == 'B' || vk == 'F') {
+                if (!console::HasImeComposition() && ((::GetKeyState(VK_CONTROL) & 0x8000) == 0)) {
+                    const bool shift = ((::GetKeyState(VK_SHIFT) & 0x8000) != 0);
+                    (void)console::OnKeyDown(vk, false, shift, true);
+                }
+                return 0;
+            }
+            if (vk == VK_F4) {
+                return ForwardToOrigWndProc(hwnd, msg, wParam, lParam, orig, nest);
+            }
+            if (vk == VK_MENU || vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+                vk == VK_LMENU || vk == VK_RMENU) {
+                return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+            }
+            return 0;
+        }
+
+        case WM_SYSKEYUP:
+            return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+
+        default:
+            return ForwardToOrigWndProc(hwnd, msg, wParam, lParam, orig, nest);
+    }
+}
+
+void EnsureWndProcSubclassOnWindowThread() noexcept {
+    if (!g_cfg.consoleEnabled || g_detaching.load(std::memory_order_acquire)) return;
+    const DWORD tid = g_wndTid.load(std::memory_order_acquire);
+    if (tid == 0U || ::GetCurrentThreadId() != tid) return;
+    const bool checkPending = g_wndProcCheckPending.exchange(false, std::memory_order_acq_rel);
+    if (g_wndProcInstalled && !checkPending) return;
+
+    HWND hwnd = g_gameHwnd.load(std::memory_order_acquire);
+    if (!hwnd || !::IsWindow(hwnd)) return;
+
+    if (g_wndProcInstalled && g_subclassedHwnd == hwnd) {
+        const auto curWp = reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
+        if (curWp != &ConsoleWndProc) {
+            char wpDesc[160]{};
+            FormatModuleOffset(reinterpret_cast<const void*>(curWp), wpDesc, sizeof(wpDesc));
+            app::Log("console-ime: WndProc head changed to %s on hwnd=%p", wpDesc, hwnd);
+        }
+        return;
+    }
+
+    ::SetLastError(0U);
+    auto* prev = reinterpret_cast<WNDPROC>(::SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                                                              reinterpret_cast<LONG_PTR>(&ConsoleWndProc)));
+    if (prev && prev != &ConsoleWndProc) {
+        g_origWndProc      = prev;
+        g_subclassedHwnd   = hwnd;
+        g_wndProcInstalled = true;
+        char origDesc[160]{};
+        FormatModuleOffset(reinterpret_cast<const void*>(prev), origDesc, sizeof(origDesc));
+        app::Log("init: installed console WndProc subclass on hwnd=%p (orig=%s)", hwnd, origDesc);
+    }
+}
+
 LRESULT CALLBACK RngGetMsgProc(int code, WPARAM wParam, LPARAM lParam) {
-    if (code == HC_ACTION) {
+    if (code == HC_ACTION && wParam == PM_REMOVE) {
         ReassertKbHookOnWindowThread();
+        EnsureWndProcSubclassOnWindowThread();
+        if (g_imeSyncPending.load(std::memory_order_acquire) ||
+            (g_cfg.consoleEnabled && g_wndProcInstalled && (console::IsOpen() != g_consoleImeSyncedOpen))) {
+            RequestConsoleImeSync(g_gameHwnd.load(std::memory_order_acquire));
+        }
     }
     if (code == HC_ACTION && wParam == PM_REMOVE && console::IsOpen() && lParam != 0) {
         auto* msg = reinterpret_cast<MSG*>(lParam);
@@ -472,8 +1102,7 @@ LRESULT CALLBACK RngGetMsgProc(int code, WPARAM wParam, LPARAM lParam) {
         } else if (msg->message == WM_RBUTTONUP) {
             console_overlay::CopySelectionToClipboard(true);
             msg->message = WM_NULL;
-        } else if (msg->message == WM_CHAR || msg->message == WM_SYSCHAR || msg->message == WM_DEADCHAR ||
-                   msg->message == WM_RBUTTONDOWN || msg->message == WM_RBUTTONDBLCLK ||
+        } else if (msg->message == WM_RBUTTONDOWN || msg->message == WM_RBUTTONDBLCLK ||
                    msg->message == WM_MBUTTONDOWN || msg->message == WM_MBUTTONUP ||
                    msg->message == WM_XBUTTONDOWN || msg->message == WM_XBUTTONUP) {
             msg->message = WM_NULL;
@@ -493,49 +1122,43 @@ LRESULT CALLBACK RngKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
                 if (isKeyDown && !wasDownPrev) {
                     const bool opened = console::ToggleOpen();
                     if (opened) {
+                        g_loggedNoWpDelivery = false;
+                        g_kbOpenDownCount.store(0U, std::memory_order_relaxed);
+                        g_wpOpenDownCount.store(0U, std::memory_order_relaxed);
                         g_reassertKbHookPending.store(true, std::memory_order_release);
                     } else {
                         console_overlay::ClearSelection();
                         g_swallowVkMask.fetch_or(0x04U, std::memory_order_relaxed);
                     }
+                    RequestConsoleImeSync(g_gameHwnd.load(std::memory_order_acquire));
                 }
                 return 1;
             }
         }
 
         if (console::IsOpen()) {
-            if (isKeyDown) {
-                const bool ctrl  = ((::GetKeyState(VK_CONTROL) & 0x8000) != 0);
-                const bool shift = ((::GetKeyState(VK_SHIFT) & 0x8000) != 0);
-                const bool alt   = ((::GetKeyState(VK_MENU) & 0x8000) != 0);
-                if (ctrl && !alt && !shift && (vk == 'C' || vk == VK_INSERT)) {
-                    if (console_overlay::CopySelectionToClipboard(false)) {
-                        return 1;
-                    }
-                }
-                if (vk == VK_ESCAPE && !ctrl && !alt && console_overlay::HasSelection()) {
-                    console_overlay::ClearSelection();
+            if (g_wndProcInstalled) {
+                if (!console::HasImeComposition() &&
+                    (vk == g_cfg.vkToggleTakeover || vk == g_cfg.vkResetEpoch ||
+                     (vk >= VK_F1 && vk <= VK_F24))) {
                     return 1;
                 }
-                if (!console::OnKeyDown(vk, ctrl, shift, alt)) {
-                    if ((!ctrl && !alt) || (ctrl && alt)) {
-                        BYTE ks[256]{};
-                        if (::GetKeyboardState(ks)) {
-                            ks[VK_SHIFT]    = static_cast<BYTE>(::GetKeyState(VK_SHIFT) & 0xFF);
-                            ks[VK_LSHIFT]   = static_cast<BYTE>(::GetKeyState(VK_LSHIFT) & 0xFF);
-                            ks[VK_RSHIFT]   = static_cast<BYTE>(::GetKeyState(VK_RSHIFT) & 0xFF);
-                            ks[VK_CONTROL]  = static_cast<BYTE>(::GetKeyState(VK_CONTROL) & 0xFF);
-                            ks[VK_MENU]     = static_cast<BYTE>(::GetKeyState(VK_MENU) & 0xFF);
-                            ks[VK_CAPITAL]  = static_cast<BYTE>(::GetKeyState(VK_CAPITAL) & 0xFF);
-                            wchar_t wbuf[8]{};
-                            const UINT scan = static_cast<UINT>((lParam >> 16) & 0xFFLL);
-                            const int rc = ::ToUnicode(static_cast<UINT>(vk), scan, ks, wbuf, 8, 0x4U);
-                            if (rc > 0) {
-                                console::InsertUtf16(wbuf, rc);
-                            }
-                        }
+                if (isKeyDown && !wasDownPrev && !(vk >= VK_F1 && vk <= VK_F24)) {
+                    const std::uint32_t kd = g_kbOpenDownCount.fetch_add(1U, std::memory_order_relaxed) + 1U;
+                    if (kd == 3U && g_wpOpenDownCount.load(std::memory_order_relaxed) == 0U && !g_loggedNoWpDelivery) {
+                        g_loggedNoWpDelivery = true;
+                        HWND hw = g_gameHwnd.load(std::memory_order_acquire);
+                        const void* wp = hw ? reinterpret_cast<const void*>(::GetWindowLongPtrW(hw, GWLP_WNDPROC))
+                                            : nullptr;
+                        char wpDesc[160]{};
+                        FormatModuleOffset(wp, wpDesc, sizeof(wpDesc));
+                        app::Log("console: warning - WH_KEYBOARD saw 3 keydowns but ConsoleWndProc saw 0 (hwnd=%p fg=%p focus=%p wp=%s)",
+                                 hw, ::GetForegroundWindow(), ::GetFocus(), wpDesc);
                     }
                 }
+                // Return 0 WITHOUT CallNextHookEx so downstream WH_KEYBOARD hooks (e.g. mhw_hfi)
+                // never see keystrokes while TranslateMessage/IMM32/TSF deliver to ConsoleWndProc.
+                return 0;
             }
             return 1;
         }
@@ -592,14 +1215,23 @@ std::uint64_t __fastcall Hook_Present(std::uintptr_t d3dRender,
             DWORD wndTid = hwnd ? ::GetWindowThreadProcessId(hwnd, nullptr) : 0U;
             if (wndTid == 0U) wndTid = ::GetCurrentThreadId();
             if (!g_kbHookInstalled.exchange(true, std::memory_order_acq_rel)) {
+                if (hwnd) g_gameHwnd.store(hwnd, std::memory_order_release);
                 g_wndTid.store(wndTid, std::memory_order_release);
                 g_kbHook = ::SetWindowsHookExW(WH_KEYBOARD, RngKeyboardProc, g_selfModule, wndTid);
                 if (g_cfg.consoleEnabled) {
                     g_getMsgHook = ::SetWindowsHookExW(WH_GETMESSAGE, RngGetMsgProc, g_selfModule, wndTid);
                 }
-                app::Log("init: window input hooks installed after orig present (tid=%lu, kb=%p, getmsg=%p)",
-                         wndTid, g_kbHook, g_getMsgHook);
+                app::Log("init: window input hooks installed after orig present (hwnd=%p, tid=%lu, kb=%p, getmsg=%p)",
+                         hwnd, wndTid, g_kbHook, g_getMsgHook);
             }
+        }
+    } else if (g_cfg.consoleEnabled && (g_presentHookFrames.fetch_add(1U, std::memory_order_relaxed) % 60U) == 0U) {
+        const HWND curHwnd = GetSwapWindowSEH(d3dRender);
+        const HWND prevHwnd = g_gameHwnd.load(std::memory_order_relaxed);
+        if (curHwnd && curHwnd != prevHwnd) {
+            app::Log("present: swapchain HWND changed (%p -> %p)", prevHwnd, curHwnd);
+            g_gameHwnd.store(curHwnd, std::memory_order_release);
+            g_wndProcCheckPending.store(true, std::memory_order_release);
         }
     }
     return ret;
@@ -982,6 +1614,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     } else if (reason == DLL_PROCESS_DETACH && reserved == nullptr) {
         g_detaching.store(true, std::memory_order_release);
         SyncConsoleMouseStateSEH(g_exeBase, false, g_mouseOverrideApplied, g_savedForceCursor, g_savedOverlayActive);
+        if (g_wndProcInstalled && g_subclassedHwnd && ::IsWindow(g_subclassedHwnd) && g_origWndProc &&
+            reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(g_subclassedHwnd, GWLP_WNDPROC)) == &ConsoleWndProc) {
+            ::SetWindowLongPtrW(g_subclassedHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_origWndProc));
+        }
+        g_wndProcInstalled = false;
+        g_subclassedHwnd   = nullptr;
+        SyncConsoleImeStateOnWindowThread(true);
         if (g_getMsgHook) {
             ::UnhookWindowsHookEx(g_getMsgHook);
             g_getMsgHook = nullptr;

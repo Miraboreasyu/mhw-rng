@@ -3,8 +3,11 @@
 本文档说明 `mhw_rng` 随机数接管框架的职责划分、底层 Hook 点位、MASM 寄存器现场捕获层、复合条件槽数据结构、多插件 Hook 链与后置过滤机制、插件热重载流程以及插件 SDK（`kMhwRngApiVersion == 3`，向后兼容至 v3.4 扩展）接口规范。目标客户端版本为《怪物猎人：世界 冰原》Steam 15.23（Build 15539686，默认镜像基址 `0x140000000`）。
 
 > [!NOTE]
-> **职责边界**
+> **职责边界与延伸阅读**
 > 核心模块 [mhw_rng.dll](../src/dllmain.cpp) 仅负责底层随机数入口拦截、`(CondID, CallSiteRVA)` 槽位状态维护、插件生命周期管理与 `$rng` 聊天命令分发，不包含怪物 ID、数值换算公式或调用点词典等具体游戏业务逻辑。业务相关的内存读取、条件判断与命令扩展由 `nativePC\plugins\mhw_rng\*.dll` 下的子插件实现。
+> - AI Harness / 新手接入入口：[AGENTS.md](../AGENTS.md)
+> - 独立第三方插件开发手册：[PLUGIN_DEV_GUIDE.md](PLUGIN_DEV_GUIDE.md)
+> - 内核维护、控制台/IME 与回归测试手册：[MAINTENANCE_AND_TESTING.md](MAINTENANCE_AND_TESTING.md)
 
 ---
 
@@ -299,11 +302,12 @@ cl.exe /nologo /std:c++17 /O2 /EHsc /MT /utf-8 /I "include" rng_meal.cpp /LD /Fe
 - `$rng help [subcmd|plugin]`：列出核心命令与当前已注册的所有插件子命令名；带参数时按当前语言显示匹配插件/子命令的详细用法与说明。
 - `$rng plugins` / `load <name>` / `unload <name>` / `reload [name|ini]`：查询、加载、卸载或热重载子插件（无参 `reload` 重读 `mhw_rng.ini`、保留运行时切换的 `Mode`/`Seed` 除非 INI 有修改、重跑 `AutoExec` 并重载全部插件；`reload ini` 强制按 INI 覆写）。
 - `$rng lang [zh|en|...]` / `$rng chat [on|off]` / `$rng exec <file> [quiet]`：切换输出语言（广播 `kMhwRngEventLanguageChanged` 生命周期事件，并通过 `SelectText` 的 `active -> en -> zh -> first -> fallback` 回退链即时切换已注册文本）；切换是否同步输出到游戏原版聊天框；从脚本批量执行长命令（支持 `;`/`#`/`//` 注释与 `AutoExec` 开机自启）。
-- **游戏内内置命令行终端窗口**（`ConsoleEnabled = true`，默认快捷键 `` ` `` / `~`，可通过 `KeyToggleConsole` 自定义）：基于 `cD3DRender::present` + `sKeyboard::move` 链式 Hook 实现，支持 DirectX 11 / DirectX 12 与 SDR / HDR10（ST.2084 PQ）/ scRGB 适配；开启后清空 `sKeyboard` 按键状态防误触，提供 UTF-8 Readline 行编辑（`Ctrl+A/E/B/F/W/U/K/Y/L/C/V/R`、上下方向键历史、`PgUp/PgDn`/滚轮翻页）与基于已加载插件注册表的动态 `Tab` / `Shift+Tab` 自动补全（终端内可省略 `$rng` 前缀，`clear`/`cls` 清屏），默认关闭原版聊天框同步回显（`ShowChatFeedback = false`）以免刷屏。
+- **游戏内内置命令行终端窗口**（`ConsoleEnabled = true`，默认快捷键 `` ` `` / `~`，可通过 `KeyToggleConsole` 自定义）：基于 `cD3DRender::present` + `sKeyboard::move` 链式 Hook 与 `ConsoleWndProc` 窗口过程子类化实现，支持 DirectX 11 / DirectX 12 与 SDR / HDR10（ST.2084 PQ）/ scRGB 适配；开启后清空 `sKeyboard` 按键状态防误触，提供 UTF-8 Readline 行编辑（`Ctrl+A/E/B/F/W/U/K/Y/L/C/V/R`、上下方向键历史、`PgUp/PgDn`/滚轮翻页）、完整的中文 / CJK 输入法组字与内联候选条渲染（`WM_IME_*` + `ImmSetCompositionWindow`）、鼠标拖拽/双击选词/三击选行与剪贴板复制，以及基于已加载插件注册表的动态 `Tab` / `Shift+Tab` 自动补全（终端内可省略 `$rng` 前缀，`clear`/`cls` 清屏），默认关闭原版聊天框同步回显（`ShowChatFeedback = false`）以免刷屏。若游戏同时安装 SharpPluginLoader，需使用仓库 [patches/spl/winmm.dll](../patches/spl/winmm.dll) 以避免回标题 DXGI `ResizeBuffers` 重挂窗口过程成环导致输入法与按键失灵（见 [SPL 补丁说明](../patches/spl/README.md)）。
 - `$rng selective` / `on` / `off` / `observe` / `seed <u64>` / `reset` / `clearall`：切换按需接管/全局接管/直通/仅观测模式、修改总种子、递增轮次、清空所有槽覆盖规则。
 - `$rng save [name]` / `restore [name]` / `saves`：保存、恢复与列出内存中的 RNG 全表二进制状态快照。
 - `$rng rawfix` / `rawseed` / `rawseq` / `rawbypass` / `rawclear`：在不加载任何插件的情况下直接按数值 RVA 操作固定值、自定义种子、序列、直通与清理。
 
-### 2. 构建与脱机回归测试
+### 2. 构建、脱机回归测试与发布打包
 - 运行 [build.bat](../build.bat)：依次执行 `sync_plugin_sdks.bat` 与 `ml64` 汇编 [rng_trampolines.asm](../src/rng_trampolines.asm)，再使用 MSVC x64 编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_inspector.dll`、`build\mhw_rng\rng_size.dll`、`build\mhw_rng\rng_endemic.dll`、`build\mhw_rng\rng_thk.dll`、`build\mhw_rng\rng_steam.dll`、`build\mhw_rng\rng_crit.dll` 及 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
-- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证全部既有回归场景（8 线程隔离、`rng_size`、`rng_endemic`、`rng_thk`、影拷贝热重载与 `sChat` 链自愈）及 SDK v3.0–v3.4 全部能力（非易失寄存器与原入参捕获、多插件 Hook 优先级链、`ObserveOnly` 与通配观测器、`FilterVanilla` / `FilterSlot` 过滤、二进制快照恢复、生命周期事件、并发异步聊天投递、堆序列与 Tombstone 槽回收、动态透明包装、私有实例策略、`rng_steam` 真实代码测试 `V3-9`、64 KB 预留独立 W^X 跳板池、`Selective` 与 `ProtectSaveSeeds` 回归、标准化 i18n 零 CJK 扫描与终端多级 Tab 补全，以及 `rng_crit` 在真实 `0x141f51380` / `0x141f605f0` 上的全部模式与热重载验证）。
+- 运行 [run_tests.bat](../run_tests.bat)（测试源码：[test_rng_harness.cpp](../tests/test_rng_harness.cpp)）：在测试进程中加载 `text_1523.bin`，安装全部 10 处 W^X Hook，验证 **Test 1–23** 全量回归场景（8 线程隔离、`rng_size`、`rng_endemic` 体型与稀有环境生物/大鱼/毛吉、`rng_thk`、影拷贝热重载与 `sChat` 链自愈）及 SDK v3.0–v3.4 全部能力（非易失寄存器与 `XMM6/7` / 原入参捕获、多插件 Hook 优先级链、`ObserveOnly` 与通配观测器、`FilterVanilla` / `FilterSlot` 过滤、二进制快照恢复、生命周期事件、并发异步聊天投递、堆序列与 Tombstone 槽回收、动态透明包装、私有实例策略、`rng_steam` 真实代码测试 `V3-9`、64 KB 预留独立 W^X 跳板池、`Selective` 与 `ProtectSaveSeeds` 回归、标准化 i18n 零 CJK 扫描、终端 Readline/IME 状态与多级 Tab 补全，以及 `rng_crit` 在真实 `0x141f51380` / `0x141f605f0` 上的全部模式与热重载验证）。
+- 发布打包：执行 `python tools/package_release.py --check`（或 `--out <zip路径>`），将 [patches/spl/winmm.dll](../patches/spl/winmm.dll) 与游戏实际加载的 9 个运行时文件打包为纯净发布包，具体维护与发版检查流程详见 [MAINTENANCE_AND_TESTING.md](MAINTENANCE_AND_TESTING.md)。

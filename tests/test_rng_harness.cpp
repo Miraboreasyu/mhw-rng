@@ -279,8 +279,8 @@ int main(int argc, char** argv) {
 
     plugin_host::Init(base, end, plugDir, &CaptureChatSink, &CaptureAsyncChatSink);
     const std::size_t loadedCnt = plugin_host::LoadAllFromDirectory();
-    if (loadedCnt < 6U) {
-        std::printf("FAIL: Expected >= 6 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
+    if (loadedCnt != 6U) {
+        std::printf("FAIL: Expected == 6 plugins in %s, loaded %zu\n", plugDir.c_str(), loadedCnt);
         return 1;
     }
     std::printf("[OK] Shadow-copy loaded %zu official plugins (`inspector` + `size` + `endemic` + `thk` + `steam` + `crit`)!\n", loadedCnt);
@@ -3195,6 +3195,16 @@ int main(int argc, char** argv) {
             "$rng size monsters rajang",
             "$rng endemic ec059 max",
             "$rng endemic status",
+            "$rng endemic rare on",
+            "$rng endemic rare status",
+            "$rng endemic rare history",
+            "$rng endemic rare help",
+            "$rng endemic rare ec058 0%",
+            "$rng endemic rare wintermoon_nettle on",
+            "$rng endemic rare moly* 0%",
+            "$rng endemic rare log on",
+            "$rng endemic rare log off",
+            "$rng endemic rare off",
             "$rng steam status",
             "$rng steam help",
             "$rng crit status",
@@ -3252,10 +3262,12 @@ int main(int argc, char** argv) {
         }
 
         // Verify dynamic QuerySiteMeta in `en` and immediate restoration in `zh` WITHOUT reloading plugins
-        const std::uint32_t probeRvas[6] = {
+        const std::uint32_t probeRvas[8] = {
             0x0169BA15U, // size: em.size
             0x005CA0A2U, // steam: steam.autowin
             0x01D2A3CCU, // endemic: endemic.special_size
+            0x01A4ACEDU, // endemic: endemic.rare
+            0x00271F25U, // endemic: endemic.rare_moly
             0x01339C8CU, // thk: ai.thk_rand
             0x01F606D6U, // crit: pl.crit_seed
             0x00F99246U  // inspector fallback: meal.trigger
@@ -3393,11 +3405,69 @@ int main(int argc, char** argv) {
             !checkTabComplete("size min e", "size min e", "size-min-noop") ||
             !checkTabComplete("endemic ec059 n", "endemic ec059 normal ", "endemic-sub") ||
             !checkTabComplete("endemic min n", "endemic min n", "endemic-min-noop") ||
+            !checkTabComplete("endemic r", "endemic rare ", "endemic-rare") ||
+            !checkTabComplete("endemic rare l", "endemic rare log ", "endemic-rare-log") ||
+            !checkTabComplete("endemic rare ec058 b", "endemic rare ec058 block ", "endemic-rare-sp-block") ||
+            !checkTabComplete("endemic ec058 r", "endemic ec058 rare ", "endemic-sp-rare") ||
+            !checkTabComplete("endemic ec058 rare b", "endemic ec058 rare block ", "endemic-sp-rare-block") ||
+            !checkTabComplete(u8"endemic rare \u6708\u7FBD", u8"endemic rare \u6708\u7FBD\u5929\u6BCD ", "endemic-rare-zhname") ||
+            !checkTabComplete("endemic rare wintermoon", "endemic rare wintermoon_nettle ", "endemic-rare-slug") ||
+            !checkTabComplete("endemic rocky_m", "endemic rocky_moly ", "endemic-size-slug") ||
             !checkTabComplete("fix em.size r", "fix em.size raw:", "fix-raw") ||
             !checkTabComplete("seq em.size 10,20 h", "seq em.size 10,20 hold ", "seq-pol") ||
             !checkTabComplete("trace dum", "trace dump ", "trace-dump") ||
             !checkTabComplete("trace log d", "trace log d", "trace-log-noop")) {
             return 1;
+        }
+        // `endemic rare <Tab>`, `endemic <Tab>`, and `endemic clear <Tab>` with empty prefixes MUST list species names
+        {
+            std::vector<std::string> rareCands;
+            plugin_host::CompletePluginSubcommand("endemic", {"rare"}, "", rareCands);
+            std::size_t nameCnt = 0U;
+            bool sawWintermoon = false, sawGreatFish = false, sawCommon = false, sawSlug = false;
+            for (const auto& c : rareCands) {
+                if (c == u8"\u6708\u7FBD\u5929\u6BCD") sawWintermoon = true;             // 月羽天母 (ec058_00, rare)
+                if (c == u8"\u7C89\u8272\u5F02\u5F62\u9C7C") sawGreatFish = true;        // 粉色异形鱼 (ec011_00, Great-size fish)
+                if (c == u8"\u7ED5\u884C\u5154") sawCommon = true;                       // 绕行兔 (ec001_00, common)
+                if (c == "wintermoon_nettle") sawSlug = true;
+                if (!c.empty() && static_cast<unsigned char>(c[0]) >= 0x80U) ++nameCnt;
+            }
+            if (!sawWintermoon || !sawGreatFish || sawCommon || sawSlug || nameCnt < 30U) {
+                std::printf("FAIL [console-tab-endemic-rare-list]: names=%zu wintermoon=%d greatFish=%d common=%d slug=%d\n",
+                            nameCnt, sawWintermoon, sawGreatFish, sawCommon, sawSlug);
+                return 1;
+            }
+
+            std::vector<std::string> allCands;
+            plugin_host::CompletePluginSubcommand("endemic", {}, "", allCands);
+            std::size_t allNameCnt = 0U;
+            bool allRare = false, allCommon = false, allSlug = false;
+            for (const auto& c : allCands) {
+                if (c == u8"\u6708\u7FBD\u5929\u6BCD") allRare = true;
+                if (c == u8"\u7ED5\u884C\u5154") allCommon = true;
+                if (c == "wintermoon_nettle") allSlug = true;
+                if (!c.empty() && static_cast<unsigned char>(c[0]) >= 0x80U) ++allNameCnt;
+            }
+            if (!allRare || !allCommon || allSlug || allNameCnt < 90U) {
+                std::printf("FAIL [console-tab-endemic-all-list]: names=%zu rare=%d common=%d slug=%d\n",
+                            allNameCnt, allRare, allCommon, allSlug);
+                return 1;
+            }
+
+            std::vector<std::string> clearCands;
+            plugin_host::CompletePluginSubcommand("endemic", {"clear"}, "", clearCands);
+            std::size_t clrNameCnt = 0U;
+            bool clrRare = false, clrCommon = false;
+            for (const auto& c : clearCands) {
+                if (c == u8"\u6708\u7FBD\u5929\u6BCD") clrRare = true;
+                if (c == u8"\u7ED5\u884C\u5154") clrCommon = true;
+                if (!c.empty() && static_cast<unsigned char>(c[0]) >= 0x80U) ++clrNameCnt;
+            }
+            if (!clrRare || !clrCommon || clrNameCnt < 90U) {
+                std::printf("FAIL [console-tab-endemic-clear-list]: names=%zu rare=%d common=%d\n",
+                            clrNameCnt, clrRare, clrCommon);
+                return 1;
+            }
         }
         // Ambiguous sub-sub-command: `thk preset tag bipedal_lock ` -> LCP `'o'`, then cycles `off` -> `on`
         if (!checkTabComplete("thk preset tag bipedal_lock ", "thk preset tag bipedal_lock o", "thk-tag-lcp")) {
@@ -3521,13 +3591,94 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        // Console IME composition, candidate list, UTF-16 surrogate pair, and CJK Ctrl+R reverse search
+        {
+            console::OnKeyDown('U', true, false, false);
+            console::SetImeCompositionUtf16(L"yueyu", 5, 3);
+            console::CaptureSnapshot(0U, snap);
+            if (!console::HasImeComposition() || snap.imeCompText != "yueyu" || snap.imeCompCursorByte != 3U) {
+                std::printf("FAIL [console-ime-comp-ascii]: has=%d text='%s' cur=%zu\n",
+                            console::HasImeComposition() ? 1 : 0, snap.imeCompText.c_str(), snap.imeCompCursorByte);
+                return 1;
+            }
+
+            console::SetImeCompositionUtf16(L"\u6708\u7FBD\u5929\u6BCD", 4, 2);
+            console::CaptureSnapshot(0U, snap);
+            if (snap.imeCompText != u8"\u6708\u7FBD\u5929\u6BCD" || snap.imeCompCursorByte != 6U) {
+                std::printf("FAIL [console-ime-comp-cjk]: text='%s' cur=%zu\n",
+                            snap.imeCompText.c_str(), snap.imeCompCursorByte);
+                return 1;
+            }
+
+            console::SetImeCandidatesUtf16({L"\u6708\u7FBD\u5929\u6BCD", L"\u6708\u5149\u58C1\u864E"}, 1U, 0U, 14U);
+            console::CaptureSnapshot(0U, snap);
+            if (!console::HasImeComposition() || snap.imeCandidates.size() != 2U ||
+                snap.imeCandSelected != 1U || snap.imeCandTotal != 14U) {
+                std::printf("FAIL [console-ime-cands]: has=%d n=%zu sel=%zu tot=%zu\n",
+                            console::HasImeComposition() ? 1 : 0, snap.imeCandidates.size(),
+                            snap.imeCandSelected, snap.imeCandTotal);
+                return 1;
+            }
+
+            console::ClearImeCandidates();
+            console::CaptureSnapshot(0U, snap);
+            if (!console::HasImeComposition() || !snap.imeCandidates.empty() || snap.imeCompText.empty()) {
+                std::printf("FAIL [console-ime-clear-cands]: has=%d cands=%zu comp='%s'\n",
+                            console::HasImeComposition() ? 1 : 0, snap.imeCandidates.size(), snap.imeCompText.c_str());
+                return 1;
+            }
+
+            console::ClearImeComposition();
+            console::CaptureSnapshot(0U, snap);
+            if (console::HasImeComposition() || !snap.imeCompText.empty() || !snap.imeCandidates.empty()) {
+                std::printf("FAIL [console-ime-clear-all]: has=%d\n", console::HasImeComposition() ? 1 : 0);
+                return 1;
+            }
+
+            // Closing console clears active IME state automatically
+            console::SetImeCompositionUtf16(L"test", 4, 2);
+            console::SetImeCandidatesUtf16({L"\u6D4B\u8BD5"}, 0U, 0U, 1U);
+            console::SetOpen(false);
+            console::CaptureSnapshot(0U, snap);
+            if (console::HasImeComposition() || !snap.imeCompText.empty() || !snap.imeCandidates.empty()) {
+                std::printf("FAIL [console-ime-close-clear]: IME state survived SetOpen(false)\n");
+                return 1;
+            }
+            console::SetOpen(true);
+
+            // Surrogate pair UTF-16 insertion (`U+1F409` dragon emoji = `\xF0\x9F\x90\x89`)
+            console::OnKeyDown('U', true, false, false);
+            const wchar_t kDragonSurrogate[2] = { static_cast<wchar_t>(0xD83D), static_cast<wchar_t>(0xDC09) };
+            console::InsertUtf16(kDragonSurrogate, 2);
+            console::CaptureSnapshot(0U, snap);
+            if (snap.inputLine != "\xF0\x9F\x90\x89") {
+                std::printf("FAIL [console-ime-surrogate]: unexpected UTF-8 output (len=%zu)\n", snap.inputLine.size());
+                return 1;
+            }
+
+            // Reverse-i-search with CJK UTF-8 history & CJK search query
+            if (!runConsoleLine(u8"endemic rare \u6708\u7FBD\u5929\u6BCD status")) {
+                std::printf("FAIL [console-ime-cjk-history-exec]\n");
+                return 1;
+            }
+            console::OnKeyDown('U', true, false, false);
+            console::OnKeyDown('R', true, false, false);
+            console::InsertUtf8(u8"\u6708\u7FBD");
+            console::CaptureSnapshot(0U, snap);
+            if (snap.inputLine != u8"endemic rare \u6708\u7FBD\u5929\u6BCD status" || snap.searchPrompt.empty()) {
+                std::printf("FAIL [console-ime-cjk-ctrlr]: got '%s'\n", snap.inputLine.c_str());
+                return 1;
+            }
+            console::OnKeyDown(VK_ESCAPE, false, false, false); // exit Ctrl+R
+        }
+
         console::OnKeyDown(VK_ESCAPE, false, false, false); // close console
         if (console::IsOpen()) {
             std::printf("FAIL [console-esc]: Esc did not close console\n");
             return 1;
         }
         cmd_router::Init(&cfg, &CaptureChatSink);
-        std::printf("[OK] Terminal core (UTF-8 readline, history, Ctrl+R, dynamic plugin Tab completion, chat echo toggle) verified!\n");
+        std::printf("[OK] Terminal core (UTF-8/IME readline, history, Ctrl+R, dynamic plugin Tab completion, chat echo toggle) verified!\n");
     }
 
     // ------------------------------------------------------------------------
@@ -3921,6 +4072,401 @@ int main(int argc, char** argv) {
         restoreCritTestMem();
         host->ClearAllRules();
         std::printf("[OK] Test 22: `rng_crit.dll` (remote passthrough, rate override, random/ratio/seq/mv_bank/mv_tier/bag/prd & hot unload/reload) verified!\n");
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 23: Verify Rare Endemic Life Spawn Controller (`rng_endemic.dll` v1.3.0)
+    //          on Real MHW 15.23 `FUN_141a4a9b0`, `0x140271ce0`, `0x140271f90 -> 0x14166d070`,
+    //          and `FUN_141a44f50` (Mutual-Exclusion Tie-Breaker) Machine Code!
+    // ------------------------------------------------------------------------
+    {
+        *reinterpret_cast<float*>(base + 0x30C8AC4U) = 0.015f;
+
+        alignas(16) static std::uint8_t synTime[0x100]{};
+        alignas(16) static std::uint8_t synZeroBuf[0x100]{};
+        alignas(16) static std::uint8_t synQuest[0x13000]{};
+        *reinterpret_cast<float*>(synTime + 0x38U)        = 12.0f; // Noon (in [0, 24) window)
+        *reinterpret_cast<std::uint32_t*>(synTime + 0x8CU) = 0U;   // Normal clear weather
+        *reinterpret_cast<std::int32_t*>(synQuest + 0x12FF0U) = -1;
+
+        void* const prevTimePtr  = *reinterpret_cast<void**>(base + 0x5013830U);
+        void* const prevZeroPtr  = *reinterpret_cast<void**>(base + 0x51C46B8U);
+        void* const prevQuestPtr = *reinterpret_cast<void**>(base + 0x500ED30U);
+        void* const prevBlockPtr = *reinterpret_cast<void**>(base + 0x51C42B8U); // `FUN_14166c870` quest-block flag holder
+        *reinterpret_cast<void**>(base + 0x5013830U) = synTime;
+        *reinterpret_cast<void**>(base + 0x51C46B8U) = synZeroBuf;
+        *reinterpret_cast<void**>(base + 0x500ED30U) = synQuest;
+        *reinterpret_cast<void**>(base + 0x51C42B8U) = synQuest; // `[ptr + 0xD2EB] == 0` -> not blocked
+
+        std::uint8_t origB417C0[8]{}, origB02720[3]{}, origA486F0[12]{};
+        std::uint8_t origB545D0[6]{}, orig272450[1]{}, origA4A830[12]{};
+        std::memcpy(origB417C0, img + 0x1B417C0U, sizeof(origB417C0));
+        std::memcpy(origB02720, img + 0x1B02720U, sizeof(origB02720));
+        std::memcpy(origA486F0, img + 0x1A486F0U, sizeof(origA486F0));
+        std::memcpy(origB545D0, img + 0x1B545D0U, sizeof(origB545D0));
+        std::memcpy(orig272450, img + 0x0272450U, sizeof(orig272450));
+        std::memcpy(origA4A830, img + 0x1A4A830U, sizeof(origA4A830));
+
+        auto restoreRareTestMem = [&]() {
+            cmd_router::HandleCommandLine("$rng endemic clear", true);
+            cmd_router::HandleCommandLine("$rng endemic rare log off", true);
+            std::memcpy(img + 0x1B417C0U, origB417C0, sizeof(origB417C0));
+            std::memcpy(img + 0x1B02720U, origB02720, sizeof(origB02720));
+            std::memcpy(img + 0x1A486F0U, origA486F0, sizeof(origA486F0));
+            std::memcpy(img + 0x1B545D0U, origB545D0, sizeof(origB545D0));
+            std::memcpy(img + 0x0272450U, orig272450, sizeof(orig272450));
+            std::memcpy(img + 0x1A4A830U, origA4A830, sizeof(origA4A830));
+            *reinterpret_cast<void**>(base + 0x5013830U) = prevTimePtr;
+            *reinterpret_cast<void**>(base + 0x51C46B8U) = prevZeroPtr;
+            *reinterpret_cast<void**>(base + 0x500ED30U) = prevQuestPtr;
+            *reinterpret_cast<void**>(base + 0x51C42B8U) = prevBlockPtr;
+            ::FlushInstructionCache(::GetCurrentProcess(), img, kImageSize);
+        };
+
+        auto writeAbsJump12 = [&](std::uint32_t rva, void* dst) {
+            std::uint8_t* p = img + rva;
+            p[0] = 0x48; p[1] = 0xB8;
+            const auto addr = reinterpret_cast<std::uintptr_t>(dst);
+            std::memcpy(p + 2, &addr, 8);
+            p[10] = 0xFF; p[11] = 0xE0;
+        };
+
+        // Patch tiny deterministic helper stubs into MHW code buffer
+        // `0x141b417c0`: mov rax, -1; ret (48 C7 C0 FF FF FF FF C3)
+        static constexpr std::uint8_t kRetNeg1[8] = { 0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3 };
+        // `0x141b02720`: xor eax, eax; ret (31 C0 C3)
+        static constexpr std::uint8_t kRetZero[3] = { 0x31, 0xC0, 0xC3 };
+        // `0x141b545d0`: mov eax, 7; ret (B8 07 00 00 00 C3) -> GL region level 7
+        static constexpr std::uint8_t kRetLvl7[6] = { 0xB8, 0x07, 0x00, 0x00, 0x00, 0xC3 };
+        static constexpr std::uint8_t kRetVoid[1] = { 0xC3 };
+
+        std::memcpy(img + 0x1B417C0U, kRetNeg1, sizeof(kRetNeg1));
+        std::memcpy(img + 0x1B02720U, kRetZero, sizeof(kRetZero));
+        std::memcpy(img + 0x1B545D0U, kRetLvl7, sizeof(kRetLvl7));
+        std::memcpy(img + 0x0272450U, kRetVoid, sizeof(kRetVoid));
+
+        // Synthetic RareSetData & Ec059RareSetData
+        alignas(16) static std::uint8_t synRareMaster[0x30]{};
+        alignas(16) static std::uint8_t synRareMoly[0x30]{};
+        *reinterpret_cast<std::int32_t*>(synRareMaster + 0x08U) = 0;     // any weather
+        *reinterpret_cast<float*>(synRareMaster + 0x0CU)        = 0.01f; // 1%
+        synRareMaster[0x10U] = 0U;
+        synRareMaster[0x11U] = 24U;
+
+        *reinterpret_cast<std::int32_t*>(synRareMoly + 0x08U)  = 0;     // any weather
+        *reinterpret_cast<float*>(synRareMoly + 0x0CU)         = 0.05f; // 5%
+        synRareMoly[0x10U] = 0U;
+        synRareMoly[0x11U] = 24U;
+        *reinterpret_cast<std::uint32_t*>(synRareMoly + 0x18U) = 5U;    // minPopLv
+        *reinterpret_cast<std::uint32_t*>(synRareMoly + 0x1CU) = 7U;    // maxPopLv
+
+        static void* synRareMasterPtrs[1] = { synRareMaster };
+        static void* synRareMolyPtrs[1]   = { synRareMoly };
+        alignas(16) static std::uint8_t synRareArrHolder[0x28]{};
+        *reinterpret_cast<std::uint32_t*>(synRareArrHolder + 0x08U) = 1U;
+        *reinterpret_cast<void***>(synRareArrHolder + 0x18U)        = synRareMasterPtrs;
+
+        alignas(16) static std::uint8_t synMolyArr[0x28]{};
+        *reinterpret_cast<std::uint32_t*>(synMolyArr + 0x08U) = 1U;
+        *reinterpret_cast<void***>(synMolyArr + 0x18U)        = synRareMolyPtrs;
+
+        // C++ helper via thunk for `0x141a486f0(rcx, rdx_tmpMtArr, r8d_animalType)`
+        auto* getMolyArrFn = +[](void*, std::uint8_t* tmpArr, std::uint32_t) noexcept -> void* {
+            tmpArr[0x10U] = 0U;
+            *reinterpret_cast<std::uintptr_t*>(tmpArr + 0x18U) = 0U;
+            return synMolyArr;
+        };
+        writeAbsJump12(0x1A486F0U, reinterpret_cast<void*>(getMolyArrFn));
+
+        static std::uint32_t g_despawnMask = 0U;
+        auto* despawnSpyFn = +[](std::uint8_t* sAnimPtr, std::uint32_t slotIdx, std::uint8_t) noexcept {
+            if (slotIdx < 32U) {
+                g_despawnMask |= (1U << slotIdx);
+                sAnimPtr[0x70A8U + static_cast<std::size_t>(slotIdx) * 0xD0U + 0xC9U] = 0xFFU;
+            }
+        };
+        writeAbsJump12(0x1A4A830U, reinterpret_cast<void*>(despawnSpyFn));
+        ::FlushInstructionCache(::GetCurrentProcess(), img, kImageSize);
+
+        // Synthetic sAnimal + 3 uAnimals (slot 0, 1, 2)
+        alignas(16) static std::uint8_t synSAnimal[0x10000]{};
+        alignas(16) static std::uint8_t synUAnimals[3][0x2000]{};
+        auto setupSlot = [&](std::uint32_t slotIdx, std::uint32_t aid, std::uint32_t atp, std::int8_t mutexId) {
+            std::uint8_t* u = synUAnimals[slotIdx];
+            std::memset(u, 0, 0x2000U);
+            *reinterpret_cast<std::uint32_t*>(u + 0x1AF0U) = aid;
+            *reinterpret_cast<std::uint32_t*>(u + 0x1AF4U) = atp;
+            std::uint8_t* sl = synSAnimal + 0x70A8U + static_cast<std::size_t>(slotIdx) * 0xD0U;
+            std::memset(sl, 0, 0xD0U);
+            *reinterpret_cast<void**>(sl + 0x00U)       = u;
+            sl[0xC9U]                                   = 0xFFU; // inactive
+            sl[0xCAU]                                   = static_cast<std::uint8_t>(mutexId);
+            sl[0xCBU]                                   = 0U;
+        };
+
+        using MasterRareRollFn = void(__fastcall*)(void* sAnim, std::uint8_t isInit, std::uint32_t aid,
+                                                   std::uint32_t atp, std::uint32_t regIdx,
+                                                   void* arrHolder, std::uint32_t slotIdx,
+                                                   float prevTime, float curTime, std::uint8_t isSpecW);
+        using MolyRollFn       = void(__fastcall*)(void* molyCtrl);
+        using GroupRareFn      = void(__fastcall*)(void* grpCtrl);
+        using MutexTieFn       = void(__fastcall*)(void* param);
+
+        const auto fnMaster = reinterpret_cast<MasterRareRollFn>(base + 0x1A4A9B0U);
+        const auto fnMoly   = reinterpret_cast<MolyRollFn>(base + 0x0271CE0U);
+        const auto fnGroup  = reinterpret_cast<GroupRareFn>(base + 0x0271F90U);
+        const auto fnMutex  = reinterpret_cast<MutexTieFn>(base + 0x1A44F50U);
+
+        // (a) Master rare roll (`FUN_141a4a9b0` @ `RVA 0x01A4ACED`)
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "on"}, "rare on");
+        for (int i = 0; i < 10; ++i) {
+            setupSlot(0U, 58U, 0U, 0);
+            *reinterpret_cast<float*>(synRareMaster + 0x0CU) = 0.01f;
+            fnMaster(synSAnimal, 1U, 58U, 0U, 0U, synRareArrHolder, 0U, 12.0f, 12.0f, 0U);
+            const std::uint8_t* sl = synSAnimal + 0x70A8U;
+            if (sl[0xC9U] != 24U || sl[0xCBU] != 1U) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-master-on]: trial %d endTime=%u justRolled=%u\n",
+                            i, sl[0xC9U], sl[0xCBU]);
+                return 1;
+            }
+        }
+        // Disabled 0.0f-prob row MUST NOT be falsely forced!
+        setupSlot(0U, 58U, 0U, 0);
+        *reinterpret_cast<float*>(synRareMaster + 0x0CU) = 0.0f;
+        fnMaster(synSAnimal, 1U, 58U, 0U, 0U, synRareArrHolder, 0U, 12.0f, 12.0f, 0U);
+        if (synSAnimal[0x70A8U + 0xC9U] != 0xFFU) {
+            restoreRareTestMem();
+            std::printf("FAIL [rare-zero-prob]: disabled 0.0f row should stay unspawned!\n");
+            return 1;
+        }
+        // Global `0%` blocks even 95%-prob entry
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "0%"}, "rare 0%");
+        for (int i = 0; i < 10; ++i) {
+            setupSlot(0U, 58U, 0U, 0);
+            *reinterpret_cast<float*>(synRareMaster + 0x0CU) = 0.95f;
+            fnMaster(synSAnimal, 1U, 58U, 0U, 0U, synRareArrHolder, 0U, 12.0f, 12.0f, 0U);
+            if (synSAnimal[0x70A8U + 0xC9U] != 0xFFU) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-master-block]: trial %d spawned under 0%%!\n", i);
+                return 1;
+            }
+        }
+        // Per-species: `ec058` on (1%), `ec025` blocked (95%)
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "off"}, "rare off");
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "ec058", "on"}, "rare ec058 on");
+        plugin_host::DispatchPluginSubcommand("endemic", {"ec025", "rare", "0%"}, "ec025 rare 0%");
+        for (int i = 0; i < 10; ++i) {
+            setupSlot(0U, 58U, 0U, 0);
+            *reinterpret_cast<float*>(synRareMaster + 0x0CU) = 0.01f;
+            fnMaster(synSAnimal, 1U, 58U, 0U, 0U, synRareArrHolder, 0U, 12.0f, 12.0f, 0U);
+            if (synSAnimal[0x70A8U + 0xC9U] != 24U) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-sp-on]: ec058 did not spawn at trial %d\n", i);
+                return 1;
+            }
+            setupSlot(1U, 25U, 0U, -1);
+            *reinterpret_cast<float*>(synRareMaster + 0x0CU) = 0.95f;
+            fnMaster(synSAnimal, 1U, 25U, 0U, 0U, synRareArrHolder, 1U, 12.0f, 12.0f, 0U);
+            if (synSAnimal[0x70A8U + 0xD0U + 0xC9U] != 0xFFU) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-sp-block]: ec025 spawned despite 0%% at trial %d\n", i);
+                return 1;
+            }
+        }
+
+        // (b) Guiding Lands Rare Regional Moly (`0x140271ce0` @ `RVA 0x00271F25`)
+        alignas(16) static std::uint8_t synMolyCtrl[0x500]{};
+        *reinterpret_cast<std::uint32_t*>(synMolyCtrl + 0x328U) = 59U;
+        *reinterpret_cast<std::uint32_t*>(synMolyCtrl + 0x32CU) = 2U;
+        *reinterpret_cast<std::uint32_t*>(synMolyCtrl + 0x330U) = 2U; // Coral region
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "off"}, "rare off");
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "ec059", "on"}, "rare ec059 on");
+        for (int i = 0; i < 10; ++i) {
+            *reinterpret_cast<std::uint32_t*>(synMolyCtrl + 0x40CU) = 8U;
+            fnMoly(synMolyCtrl);
+            if (*reinterpret_cast<std::uint32_t*>(synMolyCtrl + 0x40CU) != 7U) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-moly-on]: expected state=7, got %u\n",
+                            *reinterpret_cast<std::uint32_t*>(synMolyCtrl + 0x40CU));
+                return 1;
+            }
+        }
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "ec059", "0%"}, "rare ec059 0%");
+        *reinterpret_cast<float*>(synRareMoly + 0x0CU) = 0.95f;
+        for (int i = 0; i < 10; ++i) {
+            *reinterpret_cast<std::uint32_t*>(synMolyCtrl + 0x40CU) = 7U;
+            fnMoly(synMolyCtrl);
+            if (*reinterpret_cast<std::uint32_t*>(synMolyCtrl + 0x40CU) != 8U) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-moly-block]: expected state=8, got %u\n",
+                            *reinterpret_cast<std::uint32_t*>(synMolyCtrl + 0x40CU));
+                return 1;
+            }
+        }
+
+        // (c) Group-level rare roll (`0x140271f90 -> 0x14166d070` @ `RVA 0x0166D12E`)
+        alignas(16) static std::uint8_t synGroupCtrl[0x400]{};
+        *reinterpret_cast<std::uint32_t*>(synGroupCtrl + 0x328U) = 25U;
+        *reinterpret_cast<std::uint32_t*>(synGroupCtrl + 0x32CU) = 0U;
+        *reinterpret_cast<std::uint32_t*>(synGroupCtrl + 0x388U) = 4U; // non-zero without weather/time bits
+        *reinterpret_cast<std::uint32_t*>(synGroupCtrl + 0x348U + 0x08U) = 1U;
+        *reinterpret_cast<void***>(synGroupCtrl + 0x348U + 0x18U)        = synRareMasterPtrs;
+        *reinterpret_cast<float*>(synRareMaster + 0x0CU) = 0.02f;
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "on"}, "rare on");
+        fnGroup(synGroupCtrl);
+        if (synGroupCtrl[0x334U] != 1U) {
+            restoreRareTestMem();
+            std::printf("FAIL [rare-group-on]: expected ctrl[0x334]=1, got %u\n", synGroupCtrl[0x334U]);
+            return 1;
+        }
+        *reinterpret_cast<float*>(synRareMaster + 0x0CU) = 0.95f;
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "ec025", "0%"}, "rare ec025 0%");
+        fnGroup(synGroupCtrl);
+        if (synGroupCtrl[0x334U] != 0U) {
+            restoreRareTestMem();
+            std::printf("FAIL [rare-group-block]: expected ctrl[0x334]=0, got %u\n", synGroupCtrl[0x334U]);
+            return 1;
+        }
+
+        // (d) Mutual-exclusion tie-breaker (`FUN_141a44f50` @ `RVA 0x01A44FCC`)
+        alignas(16) static std::uint32_t mutexSlotList[0x90]{};
+        mutexSlotList[0] = 0U; // Inactive sibling
+        mutexSlotList[1] = 1U; // ec015_00 active
+        mutexSlotList[2] = 2U; // ec058_00 active
+        *reinterpret_cast<std::uint64_t*>(mutexSlotList + 0x80U) = 3ULL; // count at +0x200
+        static std::uint8_t synMutexFlag = 0U;
+        struct MutexParam { void* list; void* sAnim; void* flagPtr; } mutexParam{
+            mutexSlotList, synSAnimal, &synMutexFlag
+        };
+
+        auto resetMutexSlots = [&]() {
+            g_despawnMask = 0U;
+            setupSlot(0U, 10U, 0U, 0); // inactive (0xC9=0xFF, 0xCB=0)
+            setupSlot(1U, 15U, 0U, 0);
+            synSAnimal[0x70A8U + 1U * 0xD0U + 0xC9U] = 5U;
+            synSAnimal[0x70A8U + 1U * 0xD0U + 0xCBU] = 1U;
+            setupSlot(2U, 58U, 0U, 0);
+            synSAnimal[0x70A8U + 2U * 0xD0U + 0xC9U] = 5U;
+            synSAnimal[0x70A8U + 2U * 0xD0U + 0xCBU] = 1U;
+        };
+
+        // Case d1: `rare on` globally -> inactive slot 0 must NEVER wipe both active slots
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "off"}, "rare off");
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "on"}, "rare on");
+        for (int i = 0; i < 30; ++i) {
+            resetMutexSlots();
+            fnMutex(&mutexParam);
+            const bool alive1 = (synSAnimal[0x70A8U + 1U * 0xD0U + 0xC9U] == 5U);
+            const bool alive2 = (synSAnimal[0x70A8U + 2U * 0xD0U + 0xC9U] == 5U);
+            if (!(alive1 ^ alive2)) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-mutex-global]: trial %d alive1=%d alive2=%d\n", i, alive1, alive2);
+                return 1;
+            }
+        }
+        // Case d2: per-species `ec058` forced -> slot 2 (`ec058`) survives 30/30!
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "off"}, "rare off");
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "ec058", "on"}, "rare ec058 on");
+        for (int i = 0; i < 30; ++i) {
+            resetMutexSlots();
+            fnMutex(&mutexParam);
+            const bool alive1 = (synSAnimal[0x70A8U + 1U * 0xD0U + 0xC9U] == 5U);
+            const bool alive2 = (synSAnimal[0x70A8U + 2U * 0xD0U + 0xC9U] == 5U);
+            if (alive1 || !alive2) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-mutex-sp]: trial %d expected slot2 win, alive1=%d alive2=%d\n",
+                            i, alive1, alive2);
+                return 1;
+            }
+        }
+        // Case d3: global `rare on` + `ec058 0%` -> slot 1 (`ec015`) survives 30/30!
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "on"}, "rare on");
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "ec058", "0%"}, "rare ec058 0%");
+        for (int i = 0; i < 30; ++i) {
+            resetMutexSlots();
+            fnMutex(&mutexParam);
+            const bool alive1 = (synSAnimal[0x70A8U + 1U * 0xD0U + 0xC9U] == 5U);
+            const bool alive2 = (synSAnimal[0x70A8U + 2U * 0xD0U + 0xC9U] == 5U);
+            if (!alive1 || alive2) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-mutex-deny]: trial %d expected slot1 win, alive1=%d alive2=%d\n",
+                            i, alive1, alive2);
+                return 1;
+            }
+        }
+
+        // (e) Telemetry (`rare log on` async delivery & `rare history`)
+        g_capturedAsyncChatLines.clear();
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "log", "on"}, "rare log on");
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "ec058", "on"}, "rare ec058 on");
+        setupSlot(0U, 58U, 0U, 0);
+        *reinterpret_cast<float*>(synRareMaster + 0x0CU) = 0.02f;
+        fnMaster(synSAnimal, 1U, 58U, 0U, 0U, synRareArrHolder, 0U, 12.0f, 12.0f, 0U);
+        if (g_capturedAsyncChatLines.empty()) {
+            restoreRareTestMem();
+            std::printf("FAIL [rare-log-async]: expected async rare spawn log message\n");
+            return 1;
+        }
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "history"}, "rare history");
+
+        // (f) Game-data name selectors (Simplified Chinese name / English slug / family `name*`)
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "log", "off"}, "rare log off");
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "off"}, "rare off");
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", u8"\u6708\u7FBD\u5929\u6BCD", "on"}, "rare zh-name on");
+        for (int i = 0; i < 5; ++i) {
+            setupSlot(0U, 58U, 0U, 0);
+            *reinterpret_cast<float*>(synRareMaster + 0x0CU) = 0.01f;
+            fnMaster(synSAnimal, 1U, 58U, 0U, 0U, synRareArrHolder, 0U, 12.0f, 12.0f, 0U);
+            if (synSAnimal[0x70A8U + 0xC9U] != 24U) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-name-zh]: zh name selector did not force ec058_00\n");
+                return 1;
+            }
+        }
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "wintermoon_nettle", "0%"}, "rare slug 0%");
+        for (int i = 0; i < 5; ++i) {
+            setupSlot(0U, 58U, 0U, 0);
+            *reinterpret_cast<float*>(synRareMaster + 0x0CU) = 0.95f;
+            fnMaster(synSAnimal, 1U, 58U, 0U, 0U, synRareArrHolder, 0U, 12.0f, 12.0f, 0U);
+            if (synSAnimal[0x70A8U + 0xC9U] != 0xFFU) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-name-slug]: slug selector did not block ec058_00\n");
+                return 1;
+            }
+        }
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "off"}, "rare off");
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "rocky_moly", "0%"}, "rare rocky_moly 0%");
+        *reinterpret_cast<float*>(synRareMoly + 0x0CU) = 0.95f;
+        for (int i = 0; i < 5; ++i) {
+            *reinterpret_cast<std::uint32_t*>(synMolyCtrl + 0x40CU) = 7U;
+            fnMoly(synMolyCtrl); // ctrl animalType = 2 (Rocky Moly)
+            if (*reinterpret_cast<std::uint32_t*>(synMolyCtrl + 0x40CU) != 8U) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-name-moly]: rocky_moly 0%% did not block ec059_02\n");
+                return 1;
+            }
+        }
+        g_capturedChatLines.clear();
+        plugin_host::DispatchPluginSubcommand("endemic", {"rare", "status"}, "rare status names");
+        {
+            bool sawName = false;
+            for (const auto& l : g_capturedChatLines) {
+                if (l.find(u8"ec059_02(\u6398\u571F\u6BDB\u5409)") != std::string::npos ||
+                    l.find("ec059_02(Rocky Moly)") != std::string::npos) {
+                    sawName = true;
+                }
+            }
+            if (!sawName) {
+                restoreRareTestMem();
+                std::printf("FAIL [rare-name-label]: status did not show `ec059_02(<name>)` label\n");
+                return 1;
+            }
+        }
+
+        restoreRareTestMem();
+        MhwRng_GetHostApi()->ClearAllRules();
+        std::printf("[OK] Test 23: `rng_endemic.dll` v1.3.0 (master rare, GL rare Moly, group rare, mutex tie-breaker & async log) verified!\n");
     }
 
     plugin_host::ShutdownAll();

@@ -68,7 +68,7 @@ flowchart LR
 
 5. **Plugin Arbitration Pipeline & In-Game Terminal**
    - Push-mode condition switching (`SetActiveCondition`), prioritized multi-plugin Hook chains (up to 8 hooks per RVA), `FilterVanilla` / `FilterSlot` post-draw & slot-filtered hooks, global wildcard observers, main-thread async chat queueing via `sChat::move`, lifecycle broadcasts, standardized `SelectText` / `Register*I18n` localization, and `RegisterSubcommandCompleter` multi-level completion.
-   - Built-in D3D11/D3D12 (SDR / HDR10 / scRGB) **in-game overlay terminal window** (default hotkey `` ` `` / `~`) featuring UTF-8 `libreadline` editing, history + `Ctrl+R`, dynamic multi-level plugin `Tab` completion, mouse drag / double-click word / triple-click line selection & clipboard copy, and default-muted native chat echo (`$rng chat on|off`).
+   - Built-in D3D11/D3D12 (SDR / HDR10 / scRGB) **in-game overlay terminal window** (default hotkey `` ` `` / `~`) featuring UTF-8 `libreadline` editing, Chinese/CJK IME composition & inline candidate strip rendering, history + `Ctrl+R`, dynamic multi-level plugin `Tab` completion, mouse drag / double-click word / triple-click line selection & clipboard copy, and default-muted native chat echo (`$rng chat on|off`).
 
 ---
 
@@ -79,7 +79,7 @@ Plugins placed in `nativePC\plugins\mhw_rng\*.dll` are loaded through shadow cop
 | Plugin | Output DLL | Hook RVA(s) | Capabilities & Example Commands | Repo & Docs |
 | :--- | :--- | :--- | :--- | :--- |
 | **`size`** | `rng_size.dll` | `0x169BA15` | Per-`MonsterID` crown and size control for all 71 large monsters; safe open interval `[0x00000001U, 0xFFFFFF00U]` skips zero-weight disabled rows; live `cSizeTable` inverse solving (`exact`). Examples: `$rng size furious_rajang min`, `$rng size rajang* exact 116` | [mhw-rng-size](https://github.com/Miraboreasyu/mhw-rng-size) \| [README](plugins/size/README.md) |
-| **`endemic`** | `rng_endemic.dll` | `0x166CFE1` / `0x0672FBC` / `0x1669CB6` | Covers both map spawn and capture size rolls, filters shared float helpers by caller return address, supports crown tiers, per-`ecXXX_YY` rules, and live `rAnimalSize` scale/cm solving. Examples: `$rng endemic max`, `$rng endemic ec059_02 exact 25.5cm` | [mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic) \| [README](plugins/endemic/README.md) |
+| **`endemic`** | `rng_endemic.dll` | `0x166CFE1` / `0x0672FBC` / `0x1669CB6` / `0x1A4ACED` / `0x0271F25` / `0x166D12E` / `0x1A44FCC` | Covers both map spawn and capture size rolls, filters shared float helpers by caller return address, supports crown tiers, per-`ecXXX_YY` rules, and live `rAnimalSize` scale/cm solving. Also forces or blocks rare endemic life, extra Great-size fish and regional rare Moly spawns via pure RNG (vanilla weather/time/Guiding Lands level gates still apply), with in-game Simplified Chinese / English name selectors. Examples: `$rng endemic max`, `$rng endemic ec059_02 exact 25.5cm`, `$rng endemic rare wintermoon_nettle on` | [mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic) \| [README](plugins/endemic/README.md) |
 | **`thk`** | `rng_thk.dll` + `thk_presets\*.txt` | `0x1339C8C` | Pure-RNG THK AI node probing, per-monster move/decision counters, count-gated rules, weighted branch splits, move sequences, and hot-reloadable `.txt` presets; includes Fatalis Phase 1 bipedal + quadruped preset (`f=0,4`). Examples: `$rng fatalis on`, `$rng thk probe on 91` | [mhw-rng-thk](https://github.com/Miraboreasyu/mhw-rng-thk) \| [README](plugins/thk/README.md) \| [PRESET_GUIDE](plugins/thk/PRESET_GUIDE.md) |
 | **`steam`** | `rng_steam.dll` (`1.3.0`) | `0x066679A` / `0x06667BB` / `0x05CA0A2` | Real-time Steamworks 3-key order, red round, and hidden-pity decoding in both `ObserveOnly` and `Takeover`; optional sequence lock (bare `$rng steam lock` defaults to `awd`); default `verbose off` keeps locked rounds and pity triggers quiet (`$rng steam verbose on` enables them). Also serves as the SDK v3 showcase | [mhw-rng-steam](https://github.com/Miraboreasyu/mhw-rng-steam) \| [README](plugins/steam/README.md) |
 | **`crit`** | `rng_crit.dll` (`1.0.0`) | `0x01F606D6` (+ plugin `0x1F51380`) | Override affinity `-100..100%` or follow live panel+WEX (`auto`); supports Pure Random (`CondID 1`), exact hit-counted `m:n` ratio / custom `seq`, high-MV credit bank (`mv_bank`), MV-tier `CondID` streams (`mv_tier`), shuffle bag (`bag`), and progressive PRD (`prd`). Examples: `$rng crit rate 50`, `$rng crit mv_bank 50`, `$rng crit ratio 3:2 spread` | [mhw-rng-crit](https://github.com/Miraboreasyu/mhw-rng-crit) \| [README](plugins/crit/README.md) |
@@ -88,7 +88,8 @@ Plugins placed in `nativePC\plugins\mhw_rng\*.dll` are loaded through shadow cop
 ### Installation & Core Commands
 
 1. **Prerequisite**: Install [Stracker's Loader](https://www.nexusmods.com/monsterhunterworld/mods/1982).
-2. **Deploy files** under the game's `nativePC\plugins\` directory:
+2. **Deploy files** under the game directory:
+   - **(If using SharpPluginLoader)** Game root `winmm.dll` from [patches/spl/winmm.dll](patches/spl/winmm.dll) (minimal WndProc re-subclass fix preventing post-return-to-title input/IME lockups when SPL coexists with overlay mods; see [SPL patch notes](patches/spl/README.md))
    - `nativePC\plugins\mhw_rng.dll`
    - `nativePC\plugins\mhw_rng.ini`
    - `nativePC\plugins\mhw_rng\rng_size.dll`, `rng_endemic.dll`, `rng_thk.dll`, `rng_steam.dll`, `rng_crit.dll`, `rng_inspector.dll`
@@ -191,10 +192,13 @@ git clone --recursive https://github.com/Miraboreasyu/mhw-rng.git
 ```
 
 - **Build all modules**: run [`build.bat`](build.bat) to sync plugin SDK headers and build `build\mhw_rng.dll`, `build\mhw_rng\rng_*.dll`, and `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`.
-- **Run offline tests**: run [`run_tests.bat`](run_tests.bat) (requires an unpacked 15.23 `.text` dump `text_1523.bin` via CLI argument or `MHW_TEXT_BIN`) to exercise all 10 W^X hooks, 8-thread isolation, all 6 official plugins, and SDK v3.0 behavior against real machine code.
+- **Run offline tests**: run [`run_tests.bat`](run_tests.bat) (requires an unpacked 15.23 `.text` dump `text_1523.bin` via CLI argument or `MHW_TEXT_BIN`) to exercise all 10 W^X hooks, 8-thread isolation, all 6 official plugins, and SDK v3 behavior against real machine code.
+- **Package release zip**: run `python tools/package_release.py --out <zip_path>` (or `--check` to validate) to build a clean release archive bundling the patched `winmm.dll` ([patches/spl/winmm.dll](patches/spl/winmm.dll)) with the runtime `nativePC\plugins\...` files.
 
 ### 4. Documentation Index
 
+- AI Harness Entrypoint: [AGENTS.md](AGENTS.md)
 - Core Architecture & SDK Specification: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- Public Header & Config: [include/mhw_rng_api.h](include/mhw_rng_api.h) | [mhw_rng.ini](mhw_rng.ini)
+- Standalone Plugin Developer Guide: [docs/PLUGIN_DEV_GUIDE.md](docs/PLUGIN_DEV_GUIDE.md) | Maintenance & QA Runbook: [docs/MAINTENANCE_AND_TESTING.md](docs/MAINTENANCE_AND_TESTING.md)
+- Public Header, Config & SPL Patch: [include/mhw_rng_api.h](include/mhw_rng_api.h) | [mhw_rng.ini](mhw_rng.ini) | [SPL Patch Notes](patches/spl/README.md)
 - Official Plugin Docs: [size](plugins/size/README.md) | [endemic](plugins/endemic/README.md) | [thk](plugins/thk/README.md) ([Preset Guide](plugins/thk/PRESET_GUIDE.md)) | [steam](plugins/steam/README.md) | [crit](plugins/crit/README.md) | [inspector](plugins/inspector/README.md)

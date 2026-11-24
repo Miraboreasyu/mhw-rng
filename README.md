@@ -68,7 +68,7 @@ flowchart LR
 
 5. **插件介入流水线与游戏内终端**
    - 支持 Push 模式条件切换（`SetActiveCondition`）、同 RVA 最多 8 个回调按 `priority` 排序的 Pre/Post Hook 链、`FilterVanilla` 原版结果后置过滤/钳位、`FilterSlot` 条件组、全局通配观测器、`sChat::move` 主线程异步聊天队列、内核生命周期事件广播，以及标准化的 `SelectText` / `Register*I18n` 多语言表与 `RegisterSubcommandCompleter` 多级补全。
-   - 内置游戏内 D3D11/D3D12（SDR / HDR10 / scRGB）**命令行终端叠加层**（默认快捷键 `` ` `` / `~`）：支持 UTF-8 `libreadline` 行编辑、历史记录与 `Ctrl+R` 反向搜索、多级动态 `Tab` 补全、鼠标拖拽/双击选词/三击选行与剪贴板复制；默认关闭原版聊天框回显（可通过 `$rng chat on|off` 切换）以免刷屏。
+   - 内置游戏内 D3D11/D3D12（SDR / HDR10 / scRGB）**命令行终端叠加层**（默认快捷键 `` ` `` / `~`）：支持 UTF-8 `libreadline` 行编辑、完整中文 / CJK 输入法组字与内联候选条显示、历史记录与 `Ctrl+R` 反向搜索、多级动态 `Tab` 补全、鼠标拖拽/双击选词/三击选行与剪贴板复制；默认关闭原版聊天框回显（可通过 `$rng chat on|off` 切换）以免刷屏。
 
 ---
 
@@ -79,7 +79,7 @@ flowchart LR
 | 插件 | 模块产物 | 挂钩点位 (RVA) | 核心功能与典型指令 | 独立仓库与文档 |
 | :--- | :--- | :--- | :--- | :--- |
 | **`size`** | `rng_size.dll` | `0x169BA15` | 支持冰原全 71 种大型怪物按 `MonsterID` 条件控制大小金；采用安全开区间 `[0x00000001U, 0xFFFFFF00U]` 避开零权重非法行，并可读取实时 `cSizeTable` 反算指定百分比（如 `$rng size furious_rajang min`、`$rng size rajang* exact 116`） | [mhw-rng-size](https://github.com/Miraboreasyu/mhw-rng-size) \| [技术文档](plugins/size/README.md) |
-| **`endemic`** | `rng_endemic.dll` | `0x166CFE1` / `0x0672FBC` / `0x1669CB6` | 覆盖环境生物地图刷新与捕获抽签，通过调用栈过滤共享随机函数，支持小金/普通/大金档位、按 `ecXXX_YY` 物种分流以及实时查 `rAnimalSize` 反算倍率或厘米数（如 `$rng endemic max`、`$rng endemic ec059_02 exact 25.5cm`） | [mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic) \| [技术文档](plugins/endemic/README.md) |
+| **`endemic`** | `rng_endemic.dll` | `0x166CFE1` / `0x0672FBC` / `0x1669CB6` / `0x1A4ACED` / `0x0271F25` / `0x166D12E` / `0x1A44FCC` | 覆盖环境生物地图刷新与捕获抽签，通过调用栈过滤共享随机函数，支持小金/普通/大金档位、按 `ecXXX_YY` 物种分流以及实时查 `rAnimalSize` 反算倍率或厘米数；另含稀有环境生物/大型个体鱼/地区稀有毛吉纯 RNG 必刷或屏蔽（遵守原版天气/时段/聚魔等级），支持游戏内简中名/英文别名选物种（如 `$rng endemic max`、`$rng endemic ec059_02 exact 25.5cm`、`$rng endemic rare 月羽天母 on`） | [mhw-rng-endemic](https://github.com/Miraboreasyu/mhw-rng-endemic) \| [技术文档](plugins/endemic/README.md) |
 | **`thk`** | `rng_thk.dll` + `thk_presets\*.txt` | `0x1339C8C` | 通用 THK 随机节点探测、按怪物实例的决策与出招计数、计数门控、概率组合分枝、有序序列与热重读 `.txt` 预设；内置黑龙一阶段二足+四足全距离预设（怒前 `f=0` 与怒后 `f=4`，`$rng fatalis on` / `$rng thk probe on 91`） | [mhw-rng-thk](https://github.com/Miraboreasyu/mhw-rng-thk) \| [技术文档](plugins/thk/README.md) \| [预设语法指南](plugins/thk/PRESET_GUIDE.md) |
 | **`steam`** | `rng_steam.dll`（`1.3.0`） | `0x066679A` / `0x06667BB` / `0x05CA0A2` | 在 `ObserveOnly` 与 `Takeover` 下实时解码蒸汽机三键顺序、红槽倍率与隐藏保底，支持可选固定按键顺序（`$rng steam lock` 默认锁 `awd`）；`verbose` 默认关闭，仅在未锁序时提示键位，`$rng steam verbose on` 后播报锁序与保底详情；同时作为 SDK v3 官方参考示例 | [mhw-rng-steam](https://github.com/Miraboreasyu/mhw-rng-steam) \| [技术文档](plugins/steam/README.md) |
 | **`crit`** | `rng_crit.dll`（`1.0.0`） | `0x01F606D6`（+插件 `0x1F51380`） | 支持无视面板强制设定 `-100..100%` 会心率或跟随实时面板+弱特（`auto`）；内置纯随机无保底（`CondID 1`）、严格真命中 `m:n` 比例/自定义序列、高动作值优先预算池 `mv_bank`、动作值分档独立流 `mv_tier`、洗牌袋 `bag` 与 `prd` 渐进保底（例：`$rng crit rate 50`、`$rng crit mv_bank 50`、`$rng crit ratio 3:2 spread`） | [mhw-rng-crit](https://github.com/Miraboreasyu/mhw-rng-crit) \| [技术文档](plugins/crit/README.md) |
@@ -88,7 +88,8 @@ flowchart LR
 ### 安装与内核基础指令
 
 1. **前置**：确保已安装 [Stracker's Loader](https://www.nexusmods.com/monsterhunterworld/mods/1982)。
-2. **部署**：将构建产物或发布文件按如下结构放入游戏目录的 `nativePC\plugins\` 下：
+2. **部署**：将构建产物或发布文件按如下结构放入游戏目录：
+   - **（若使用 SharpPluginLoader）** 游戏根目录 `winmm.dll`（取自 [patches/spl/winmm.dll](patches/spl/winmm.dll)，已打最小补丁，用于避免回标题 `ResizeBuffers` 重挂窗口过程成环导致输入法与按键输入失效，详见 [SPL 补丁说明](patches/spl/README.md)）
    - `nativePC\plugins\mhw_rng.dll`
    - `nativePC\plugins\mhw_rng.ini`
    - `nativePC\plugins\mhw_rng\rng_size.dll`、`rng_endemic.dll`、`rng_thk.dll`、`rng_steam.dll`、`rng_crit.dll`、`rng_inspector.dll`
@@ -191,10 +192,13 @@ git clone --recursive https://github.com/Miraboreasyu/mhw-rng.git
 ```
 
 - **全量构建**：执行 [`build.bat`](build.bat)，同步全部子模块 SDK 头文件并编译产出 `build\mhw_rng.dll`、`build\mhw_rng\rng_*.dll` 与 `build\mhw_rng\thk_presets\fatalis_p1_nasty.txt`。
-- **脱机回归测试**：执行 [`run_tests.bat`](run_tests.bat)（需通过参数或环境变量 `MHW_TEXT_BIN` 指定解壳后的 15.23 `.text` 段文件 `text_1523.bin`），在真实游戏机器码上验证 10 处 W^X Hook、8 线程隔离、全部 6 个官方插件与 SDK v3.0 接口。
+- **脱机回归测试**：执行 [`run_tests.bat`](run_tests.bat)（需通过参数或环境变量 `MHW_TEXT_BIN` 指定解壳后的 15.23 `.text` 段文件 `text_1523.bin`），在真实游戏机器码上验证 10 处 W^X Hook、8 线程隔离、全部 6 个官方插件与 SDK v3 接口。
+- **发布打包**：执行 `python tools/package_release.py --out <zip路径>`（或 `--check` 预检），自动将补丁版 `winmm.dll`（[patches/spl/winmm.dll](patches/spl/winmm.dll)）与 `build\` 运行时文件打入纯净发布包（不含源码与说明文档）。
 
 ### 4. 技术文档导航
 
+- AI Harness 接手总览：[AGENTS.md](AGENTS.md)
 - 核心框架原理与 SDK 详细规范：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- 公共头文件与默认配置：[include/mhw_rng_api.h](include/mhw_rng_api.h) | [mhw_rng.ini](mhw_rng.ini)
+- 独立插件开发手册：[docs/PLUGIN_DEV_GUIDE.md](docs/PLUGIN_DEV_GUIDE.md) | 内核维护与回归测试指南：[docs/MAINTENANCE_AND_TESTING.md](docs/MAINTENANCE_AND_TESTING.md)
+- 公共头文件与默认配置：[include/mhw_rng_api.h](include/mhw_rng_api.h) | [mhw_rng.ini](mhw_rng.ini) | [SPL 补丁说明](patches/spl/README.md)
 - 官方插件文档：[size](plugins/size/README.md) | [endemic](plugins/endemic/README.md) | [thk](plugins/thk/README.md)（[预设指南](plugins/thk/PRESET_GUIDE.md)）| [steam](plugins/steam/README.md) | [crit](plugins/crit/README.md) | [inspector](plugins/inspector/README.md)

@@ -163,6 +163,7 @@ constexpr std::size_t kOffChatNetMsgType       = 0x1B;      // int8_t (1 = typed
 constexpr std::size_t kOffChatNetMsgText       = 0x44;      // char[128] UTF-8
 
 // ---- Input Focus Check & Keyboard State Hook ----
+constexpr std::uintptr_t kRvaGlobalWndProc          = 0x047FD50; // Global::WndProc -> sMhInputText -> sApp::WndProc
 constexpr std::uintptr_t kRvaSMhInputTextInstance   = 0x4CB8498;
 constexpr std::size_t    kOffInputTextEditor        = 0x1D9E8;
 constexpr std::size_t    kOffMhInputTextUnfocused   = 0x1DA00;

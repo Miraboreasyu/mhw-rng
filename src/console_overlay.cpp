@@ -295,6 +295,9 @@ struct GdiSurface {
     int                     cacheLogTop     = 32;
     int                     cacheLogBot     = 400;
     int                     cacheLineStep   = 21;
+    int                     cacheCaretBbX   = 0;
+    int                     cacheCaretBbY   = 0;
+    int                     cacheCaretH     = 20;
     std::size_t             visStartRow     = 0U;
     std::size_t             visEndRow       = 0U;
     std::vector<WrappedRow> cachedRows;
@@ -506,7 +509,8 @@ struct GdiSurface {
         }
         lastTotalLines = snap.totalLines;
 
-        const bool hasAuxBar = !snap.searchPrompt.empty() || !snap.completionHint.empty();
+        const bool hasImeCands = !snap.imeCandidates.empty();
+        const bool hasAuxBar   = hasImeCands || !snap.searchPrompt.empty() || !snap.completionHint.empty();
         const int auxH = hasAuxBar ? std::max(22, static_cast<int>(std::lround(24.0f * sc))) : 0;
         const int logTop = headerH + 5;
         const int logBot = ph - inputH - 3 - auxH;
@@ -519,15 +523,106 @@ struct GdiSurface {
 
         if (hasAuxBar) {
             const RECT auxRc{1, ph - inputH - 1 - auxH, pw - 1, ph - inputH - 1};
-            HBRUSH auxBrush = ::CreateSolidBrush(RGB(24, 38, 52));
+            HBRUSH auxBrush = ::CreateSolidBrush(hasImeCands ? RGB(20, 34, 50) : RGB(24, 38, 52));
             ::FillRect(memDc, &auxRc, auxBrush);
             ::DeleteObject(auxBrush);
-            const std::string& auxStr = !snap.searchPrompt.empty() ? snap.searchPrompt : snap.completionHint;
-            const std::wstring wAux = Utf8ToWide(auxStr);
-            RECT auxTextRc{pad, auxRc.top, pw - pad, auxRc.bottom};
-            ::SetTextColor(memDc, !snap.searchPrompt.empty() ? RGB(255, 214, 102) : RGB(164, 216, 255));
-            ::DrawTextW(memDc, wAux.c_str(), static_cast<int>(wAux.size()), &auxTextRc,
-                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+            if (hasImeCands) {
+                HBRUSH topSep = ::CreateSolidBrush(RGB(64, 128, 180));
+                const RECT auxTopSep{1, auxRc.top, pw - 1, auxRc.top + 1};
+                ::FillRect(memDc, &auxTopSep, topSep);
+                ::DeleteObject(topSep);
+
+                const std::size_t pageSz = snap.imeCandidates.size();
+                char hdrBuf[48]{};
+                if (snap.imeCandTotal > pageSz && pageSz > 0U) {
+                    const std::size_t curPage    = (snap.imeCandPageStart / pageSz) + 1U;
+                    const std::size_t totalPages = (snap.imeCandTotal + pageSz - 1U) / pageSz;
+                    std::snprintf(hdrBuf, sizeof(hdrBuf), "[IME %zu/%zu]", curPage, totalPages);
+                } else {
+                    std::snprintf(hdrBuf, sizeof(hdrBuf), "[IME]");
+                }
+                const std::wstring wPref = Utf8ToWide(hdrBuf);
+                const int textTop = auxRc.top + std::max(1, (auxH - fontPx) / 2);
+                const int itemGap = std::max(10, static_cast<int>(std::lround(12.0f * sc)));
+                int x = pad;
+
+                SIZE prefSz{};
+                ::GetTextExtentPoint32W(memDc, wPref.c_str(), static_cast<int>(wPref.size()), &prefSz);
+                ::SetTextColor(memDc, RGB(124, 212, 255));
+                ::ExtTextOutW(memDc, x, textTop, ETO_CLIPPED, &auxRc,
+                              wPref.c_str(), static_cast<UINT>(wPref.size()), nullptr);
+                x += prefSz.cx + itemGap;
+
+                struct CandItem {
+                    std::wstring wNum;
+                    std::wstring wWord;
+                    int          numW  = 0;
+                    int          wordW = 0;
+                    int          totW  = 0;
+                };
+                std::vector<CandItem> items(pageSz);
+                for (std::size_t i = 0U; i < pageSz; ++i) {
+                    const unsigned numDigit = (i == 9U) ? 0U : static_cast<unsigned>(i + 1U);
+                    wchar_t nbuf[8]{};
+                    std::swprintf(nbuf, 8, L"%u.", numDigit);
+                    items[i].wNum  = nbuf;
+                    items[i].wWord = Utf8ToWide(snap.imeCandidates[i]);
+                    SIZE nSz{}, wSz{};
+                    ::GetTextExtentPoint32W(memDc, items[i].wNum.c_str(), static_cast<int>(items[i].wNum.size()), &nSz);
+                    if (!items[i].wWord.empty()) {
+                        ::GetTextExtentPoint32W(memDc, items[i].wWord.c_str(), static_cast<int>(items[i].wWord.size()), &wSz);
+                    }
+                    items[i].numW  = nSz.cx;
+                    items[i].wordW = wSz.cx;
+                    items[i].totW  = nSz.cx + wSz.cx;
+                }
+
+                const int rightEdge = pw - pad;
+                const std::size_t selIdx = std::min(snap.imeCandSelected, pageSz - 1U);
+                std::size_t firstVis = 0U;
+                while (firstVis < selIdx) {
+                    int span = x;
+                    for (std::size_t k = firstVis; k <= selIdx; ++k) {
+                        if (k > firstVis) span += itemGap;
+                        span += items[k].totW;
+                    }
+                    if (span <= rightEdge) break;
+                    ++firstVis;
+                }
+
+                HBRUSH selCandBrush = ::CreateSolidBrush(RGB(42, 98, 164));
+                for (std::size_t i = firstVis; i < pageSz; ++i) {
+                    if (i > firstVis && x + items[i].totW > rightEdge) break;
+                    const bool isSel = (i == selIdx);
+                    if (isSel) {
+                        const RECT hiRc{std::max(1, x - 3), auxRc.top + 2, std::min(rightEdge, x + items[i].totW + 3), auxRc.bottom - 2};
+                        ::FillRect(memDc, &hiRc, selCandBrush);
+                        ::SetTextColor(memDc, RGB(255, 244, 176));
+                        ::ExtTextOutW(memDc, x, textTop, ETO_CLIPPED, &auxRc,
+                                      items[i].wNum.c_str(), static_cast<UINT>(items[i].wNum.size()), nullptr);
+                        ::ExtTextOutW(memDc, x + items[i].numW, textTop, ETO_CLIPPED, &auxRc,
+                                      items[i].wWord.c_str(), static_cast<UINT>(items[i].wWord.size()), nullptr);
+                    } else {
+                        ::SetTextColor(memDc, RGB(126, 174, 212));
+                        ::ExtTextOutW(memDc, x, textTop, ETO_CLIPPED, &auxRc,
+                                      items[i].wNum.c_str(), static_cast<UINT>(items[i].wNum.size()), nullptr);
+                        ::SetTextColor(memDc, RGB(234, 240, 248));
+                        ::ExtTextOutW(memDc, x + items[i].numW, textTop, ETO_CLIPPED, &auxRc,
+                                      items[i].wWord.c_str(), static_cast<UINT>(items[i].wWord.size()), nullptr);
+                    }
+                    x += items[i].totW + itemGap;
+                    if (x >= rightEdge) break;
+                }
+                ::DeleteObject(selCandBrush);
+            } else {
+                const std::string& auxStr = !snap.searchPrompt.empty() ? snap.searchPrompt : snap.completionHint;
+                const std::wstring wAux = Utf8ToWide(auxStr);
+                RECT auxTextRc{pad, auxRc.top, pw - pad, auxRc.bottom};
+                ::SetTextColor(memDc, !snap.searchPrompt.empty() ? RGB(255, 214, 102) : RGB(164, 216, 255));
+                ::DrawTextW(memDc, wAux.c_str(), static_cast<int>(wAux.size()), &auxTextRc,
+                            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
         }
 
         const int availLogW = std::max(100, pw - pad * 2 - 14);
@@ -680,7 +775,7 @@ struct GdiSurface {
             }
         }
 
-        // Input bar (`> ` + horizontally-panned UTF-16 input + blinking cursor)
+        // Input bar (`> ` + horizontally-panned UTF-16 input + inline IME pre-edit + cursor)
         const std::wstring wPrompt = snap.searchPrompt.empty() ? L"> " : L"(search)> ";
         SIZE promptSz{};
         ::GetTextExtentPoint32W(memDc, wPrompt.c_str(), static_cast<int>(wPrompt.size()), &promptSz);
@@ -693,26 +788,77 @@ struct GdiSurface {
         const std::size_t curByte = std::min(snap.cursorByte, snap.inputLine.size());
         const std::wstring wBefore = Utf8ToWide(snap.inputLine.substr(0U, curByte));
         const std::wstring wAfter  = Utf8ToWide(snap.inputLine.substr(curByte));
-        const std::wstring wFull   = wBefore + wAfter;
+
+        const std::size_t compCurByte = std::min(snap.imeCompCursorByte, snap.imeCompText.size());
+        const std::wstring wCompBefore = Utf8ToWide(snap.imeCompText.substr(0U, compCurByte));
+        const std::wstring wCompAfter  = Utf8ToWide(snap.imeCompText.substr(compCurByte));
+        const std::wstring wComp       = wCompBefore + wCompAfter;
+        const std::wstring wFull       = wBefore + wComp + wAfter;
+        const std::size_t  caretIdx    = wBefore.size() + wCompBefore.size();
 
         std::size_t visStart = 0U;
         SIZE beforeSz{};
-        ::GetTextExtentPoint32W(memDc, wBefore.c_str(), static_cast<int>(wBefore.size()), &beforeSz);
-        while (visStart < wBefore.size() && beforeSz.cx > availInpW - 12) {
-            ++visStart;
-            ::GetTextExtentPoint32W(memDc, wBefore.c_str() + visStart,
-                                    static_cast<int>(wBefore.size() - visStart), &beforeSz);
+        if (caretIdx > 0U) {
+            ::GetTextExtentPoint32W(memDc, wFull.c_str(), static_cast<int>(caretIdx), &beforeSz);
+            while (visStart < caretIdx && beforeSz.cx > availInpW - 12) {
+                ++visStart;
+                ::GetTextExtentPoint32W(memDc, wFull.c_str() + visStart,
+                                        static_cast<int>(caretIdx - visStart), &beforeSz);
+            }
         }
 
-        if (visStart < wFull.size()) {
-            const RECT clipInp{textX, ph - inputH + 1, pw - pad, ph - 1};
+        const RECT clipInp{textX, ph - inputH + 1, pw - pad, ph - 1};
+        const std::size_t compOff   = wBefore.size();
+        const std::size_t compEnd   = wBefore.size() + wComp.size();
+        const std::size_t visBefore = std::max(visStart, compOff);
+        int drawX = textX;
+
+        if (visStart < compOff) {
+            const std::size_t nBefore = compOff - visStart;
+            SIZE sz{};
+            ::GetTextExtentPoint32W(memDc, wFull.c_str() + visStart, static_cast<int>(nBefore), &sz);
             ::SetTextColor(memDc, RGB(244, 248, 255));
-            ::ExtTextOutW(memDc, textX, inpY, ETO_CLIPPED, &clipInp,
-                          wFull.c_str() + visStart, static_cast<UINT>(wFull.size() - visStart), nullptr);
+            ::ExtTextOutW(memDc, drawX, inpY, ETO_CLIPPED, &clipInp,
+                          wFull.c_str() + visStart, static_cast<UINT>(nBefore), nullptr);
+            drawX += sz.cx;
         }
 
-        if (blink) {
-            const int cursorX = textX + beforeSz.cx;
+        if (!wComp.empty() && visBefore < compEnd) {
+            const std::size_t nComp = compEnd - visBefore;
+            SIZE sz{};
+            ::GetTextExtentPoint32W(memDc, wFull.c_str() + visBefore, static_cast<int>(nComp), &sz);
+            const int compRight = std::min<int>(pw - pad, drawX + sz.cx);
+            if (compRight > drawX) {
+                HBRUSH compBg = ::CreateSolidBrush(RGB(30, 48, 68));
+                const RECT compRc{drawX, ph - inputH + 3, compRight, ph - 4};
+                ::FillRect(memDc, &compRc, compBg);
+                ::DeleteObject(compBg);
+
+                HBRUSH ulBrush = ::CreateSolidBrush(RGB(255, 206, 94));
+                const RECT ulRc{drawX, ph - 4, compRight, ph - 2};
+                ::FillRect(memDc, &ulRc, ulBrush);
+                ::DeleteObject(ulBrush);
+            }
+            ::SetTextColor(memDc, RGB(255, 226, 134));
+            ::ExtTextOutW(memDc, drawX, inpY, ETO_CLIPPED, &clipInp,
+                          wFull.c_str() + visBefore, static_cast<UINT>(nComp), nullptr);
+            drawX += sz.cx;
+        }
+
+        const std::size_t visAfterStart = std::max(visStart, compEnd);
+        if (visAfterStart < wFull.size()) {
+            const std::size_t nAfter = wFull.size() - visAfterStart;
+            ::SetTextColor(memDc, RGB(244, 248, 255));
+            ::ExtTextOutW(memDc, drawX, inpY, ETO_CLIPPED, &clipInp,
+                          wFull.c_str() + visAfterStart, static_cast<UINT>(nAfter), nullptr);
+        }
+
+        const int cursorX = textX + beforeSz.cx;
+        cacheCaretBbX = static_cast<int>(ox) + std::max(0, std::min(cursorX, pw));
+        cacheCaretBbY = static_cast<int>(oy) + ph - inputH;
+        cacheCaretH   = inputH;
+
+        if (blink || !wComp.empty()) {
             const int cursorW = std::max(2, static_cast<int>(std::lround(2.0f * sc)));
             const RECT curRc{cursorX, ph - inputH + 5, std::min(pw - pad, cursorX + cursorW), ph - 5};
             HBRUSH curBrush = ::CreateSolidBrush(RGB(120, 232, 255));
@@ -1688,6 +1834,25 @@ bool CopySelectionToClipboard(bool clearAfterCopy) noexcept {
         }
         g_selGen.fetch_add(1ULL, std::memory_order_release);
     }
+    return true;
+}
+
+bool GetInputCaretClientPos(void* hwnd, int& outClientX, int& outClientY, int& outLineHeight) noexcept {
+    std::lock_guard<std::mutex> lk(g_uiMx);
+    if (!hwnd || g_gdi.bbWidth == 0U || g_gdi.bbHeight == 0U || g_gdi.width == 0U) {
+        return false;
+    }
+    RECT cr{};
+    if (!::GetClientRect(static_cast<HWND>(hwnd), &cr)) return false;
+    const int cw = cr.right - cr.left;
+    const int ch = cr.bottom - cr.top;
+    if (cw <= 0 || ch <= 0) return false;
+
+    const double sx = static_cast<double>(cw) / static_cast<double>(g_gdi.bbWidth);
+    const double sy = static_cast<double>(ch) / static_cast<double>(g_gdi.bbHeight);
+    outClientX    = static_cast<int>(std::lround(static_cast<double>(g_gdi.cacheCaretBbX) * sx));
+    outClientY    = static_cast<int>(std::lround(static_cast<double>(g_gdi.cacheCaretBbY) * sy));
+    outLineHeight = std::max(12, static_cast<int>(std::lround(static_cast<double>(g_gdi.cacheCaretH) * sy)));
     return true;
 }
 
