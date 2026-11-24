@@ -28,9 +28,15 @@ if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 ml64.exe /nologo /c /Fo"%OUTDIR%\rng_trampolines.obj" "%SRCDIR%\rng_trampolines.asm"
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
-cl.exe /nologo /std:c++17 /O2 /W4 /EHsc /MT /utf-8 /D "NOMINMAX" /D "MHW_RNG_EXPORTS" ^
-    /I "%SRCDIR%" /I "%INCDIR%" ^
-    "%ROOT%tests\test_rng_harness.cpp" ^
+cl.exe /nologo /std:c++17 /O2 /MP /W4 /EHsc /MT /utf-8 /D "NOMINMAX" /D "MHW_RNG_EXPORTS" ^
+    /I "%SRCDIR%" /I "%INCDIR%" /I "%ROOT%tests" ^
+    "%ROOT%tests\test_main.cpp" ^
+    "%ROOT%tests\test_kernel_core.cpp" ^
+    "%ROOT%tests\test_sdk_v3.cpp" ^
+    "%ROOT%tests\test_console_i18n.cpp" ^
+    "%ROOT%tests\test_plugin_size_thk_steam.cpp" ^
+    "%ROOT%tests\test_plugin_endemic_crit.cpp" ^
+    "%ROOT%tests\test_world_e2e.cpp" ^
     "%SRCDIR%\command_router.cpp" ^
     "%SRCDIR%\console_core.cpp" ^
     "%SRCDIR%\hook.cpp" ^

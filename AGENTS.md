@@ -14,7 +14,7 @@ This file is the cold-start manual for any AI harness or contributor maintaining
 
 1. **Frozen Official Plugin Roster (6 Submodules Only)**:
    - Official plugins in [`plugins/`](plugins) are maintained exclusively as Git submodules ([.gitmodules](.gitmodules)): `size`, `inspector`, `endemic`, `thk`, `steam`, `crit`.
-   - **Do NOT add new official plugins or new submodules** under `plugins/` and do NOT bundle third-party/standalone plugins into `build.bat`, `sync_plugin_sdks.bat`, `tools/package_release.py`, or `tests/test_rng_harness.cpp`.
+   - **Do NOT add new official plugins or new submodules** under `plugins/` and do NOT bundle third-party/standalone plugins into `build.bat`, `sync_plugin_sdks.bat`, `tools/package_release.py`, or `tests/`.
    - All new gameplay plugins MUST live as **standalone external projects** that consume [`include/mhw_rng_api.h`](include/mhw_rng_api.h) and deploy their DLLs into `nativePC\plugins\mhw_rng\`. See [docs/PLUGIN_DEV_GUIDE.md](docs/PLUGIN_DEV_GUIDE.md).
 2. **Git Submodule & Authoring Hygiene**:
    - Never commit `build/`, `dist/`, `.hotload/`, `*.dll` build outputs, or test scratch files (exception: [`patches/spl/winmm.dll`](patches/spl/winmm.dll)).
@@ -35,7 +35,7 @@ This file is the cold-start manual for any AI harness or contributor maintaining
 | [`world/`](world/world_plugin.cpp) | Built-in core service provider `mhw_world.dll`: polls 15.23 world singletons via `RegisterMainThreadTick`, registers `"mhw.world"` v1 (`MhwWorldApi`), emits `"mhw.world.*"` transition events, drains main-thread `DisplayPopup` calls, and provides `$rng world`. |
 | [`src/`](src) | Microkernel C++/MASM source: entry/3-phase startup (`dllmain.cpp`), W^X pool (`hook.cpp`/`hook.h`), GPR+XMM capture (`rng_trampolines.asm`), 16K slot table & hook chains (`rng_engine.cpp`/`rng_engine.h`), shadow-copy plugin & service host (`plugin_host.cpp`/`plugin_host.h`), command router (`command_router.cpp`/`command_router.h`), DX11/DX12 overlay terminal & IME (`console_core.*`, `console_overlay.*`), INI/log (`log_config.*`), static 15.23 RVAs (`mhw_addresses.h`). |
 | [`plugins/`](plugins) | 6 official submodule plugins (`size`, `inspector`, `endemic`, `thk`, `steam`, `crit`). |
-| [`tests/test_rng_harness.cpp`](tests/test_rng_harness.cpp) | Real-machine-code offline regression suite (**Test 1–25**) mapping unpacked `text_1523.bin` via `VirtualAlloc` (`kImageSize = 0x06000000`). |
+| [`tests/`](tests/test_main.cpp) | Modular real-machine-code offline regression suite (`test_main.cpp` + 6 topic suites covering **Test 1–25**; supports `--list` and `--filter <name>`) mapping unpacked `text_1523.bin` via `VirtualAlloc` (`kImageSize = 0x06000000`). |
 | [`patches/spl/`](patches/spl/README.md) | Minimal patched `winmm.dll` preventing post-return-to-title DXGI `ResizeBuffers` WndProc re-subclass loop. |
 | [`tools/`](tools) | [`package_release.py`](tools/package_release.py) (`--check` / `--out`), [`gen_rng_catalog.py`](tools/gen_rng_catalog.py), [`annotate_rng_dump.py`](tools/annotate_rng_dump.py). |
 | [`mhw_rng.ini`](mhw_rng.ini) | Default runtime INI shipped inside `nativePC\plugins\mhw_rng.ini`. |

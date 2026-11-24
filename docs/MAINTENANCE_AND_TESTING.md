@@ -69,13 +69,15 @@ Each official plugin under `plugins/` is an independent Git submodule:
 
 ---
 
-## 4. Offline Regression Harness (`tests/test_rng_harness.cpp`)
+## 4. Offline Regression Harness (`tests/test_main.cpp` + Modular Suites)
 
-All **Test 1–25** run **offline** against the real MHW 15.23 `.text` bytes (`text_1523.bin`, 48,304,640 B):
+All **Test 1–25** are organized into 7 modular C++ compilation units (`test_main.cpp`, `test_kernel_core.cpp`, `test_sdk_v3.cpp`, `test_console_i18n.cpp`, `test_plugin_size_thk_steam.cpp`, `test_plugin_endemic_crit.cpp`, `test_world_e2e.cpp`) sharing [`tests/test_env.h`](../tests/test_env.h), and run **offline** against the real MHW 15.23 `.text` bytes (`text_1523.bin`, 48,304,640 B):
 
 ```bat
 set MHW_TEXT_BIN=<path-to-text_1523.bin>
 run_tests.bat
+run_tests.bat --list
+run_tests.bat --filter world_e2e
 ```
 
 ### Coverage Summary
