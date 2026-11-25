@@ -676,3 +676,68 @@ bool RunSuite_KernelWrappersMt(TestEnv& env) {
     return true;
 }
 
+bool RunSuite_PluginNames(TestEnv& env) {
+    const auto& plugDir = env.plugDir;
+
+    // 1. Validate strict plugin shortName rules ([a-z_], 1..24, not 'kernel') & auto-suffixing (_1, _2, ...)
+    {
+        if (!plugin_host::ValidateDeclaredShortName("crit") ||
+            !plugin_host::ValidateDeclaredShortName("end") ||
+            !plugin_host::ValidateDeclaredShortName("my_plugin") ||
+            !plugin_host::ValidateDeclaredShortName("a_b_c")) {
+            std::printf("FAIL [NameRule-1]: valid lowercase_underscore names rejected\n");
+            return false;
+        }
+        const char* badNames[] = {
+            nullptr, "", "Crit", "foo1", "foo-bar", "foo.bar", "kernel",
+            "abcdefghijklmnopqrstuvwxy" // 25 chars > 24
+        };
+        for (const char* bn : badNames) {
+            if (plugin_host::ValidateDeclaredShortName(bn)) {
+                std::printf("FAIL [NameRule-2]: invalid shortName '%s' was accepted\n", bn ? bn : "<null>");
+                return false;
+            }
+        }
+        std::vector<std::string> existing = {"foo", "bar"};
+        const std::string s1 = plugin_host::AllocateUniqueShortName("foo", existing);
+        existing.push_back(s1);
+        const std::string s2 = plugin_host::AllocateUniqueShortName("foo", existing);
+        existing.push_back(s2);
+        const std::string s3 = plugin_host::AllocateUniqueShortName("baz", existing);
+        if (s1 != "foo_1" || s2 != "foo_2" || s3 != "baz") {
+            std::printf("FAIL [NameRule-3]: unexpected suffixes (%s, %s, %s)\n",
+                        s1.c_str(), s2.c_str(), s3.c_str());
+            return false;
+        }
+
+        // Real DLL collision test: copy `rng_steam.dll` -> `_test_dup_steam.dll`, load alongside `steam`, verify `steam_1`
+        const std::string srcDll = plugDir + "\\rng_steam.dll";
+        const std::string dupDll = plugDir + "\\_test_dup_steam.dll";
+        ::DeleteFileA(dupDll.c_str());
+        if (!::CopyFileA(srcDll.c_str(), dupDll.c_str(), FALSE)) {
+            std::printf("FAIL [NameRule-DupCopy]: failed to copy rng_steam.dll\n");
+            return false;
+        }
+        std::string loadMsg;
+        const bool okDup = plugin_host::LoadOrReloadSingle("_test_dup_steam.dll", loadMsg);
+        const auto pluginsAfter = plugin_host::ListLoadedPlugins();
+        bool sawSteam = false, sawSteam1 = false;
+        for (const auto& p : pluginsAfter) {
+            if (p.shortName == "steam") sawSteam = true;
+            if (p.shortName == "steam_1") sawSteam1 = true;
+        }
+        std::string unloadDupMsg, reloadOrigMsg;
+        if (sawSteam1) plugin_host::UnloadSingle("steam_1", unloadDupMsg);
+        ::DeleteFileA(dupDll.c_str());
+        plugin_host::LoadOrReloadSingle("steam", reloadOrigMsg);
+        if (!okDup || !sawSteam || !sawSteam1) {
+            std::printf("FAIL [NameRule-DupLoad]: ok=%d steam=%d steam_1=%d msg='%s'\n",
+                        okDup ? 1 : 0, sawSteam ? 1 : 0, sawSteam1 ? 1 : 0, loadMsg.c_str());
+            return false;
+        }
+    }
+
+    std::printf("[OK] Test 26: Plugin shortName rules ([a-z_], 1..24) & collision auto-suffixing verified!\n");
+    return true;
+}
+

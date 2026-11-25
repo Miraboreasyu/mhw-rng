@@ -122,6 +122,7 @@ int main(int argc, char** argv) {
         { "plugin_endemic_rare","Test 23: rng_endemic rare/GL Moly/group/mutex tie-breaker & async log",  &RunSuite_PluginEndemicRare },
         { "sdk_v35",            "Test 24: SDK v3.5 tick, event bus & concurrent ServiceGuard reload",     &RunSuite_SdkV35            },
         { "world_e2e",          "Test 25: mhw_world.dll + 5 plugins + mhw.catalog + steam showcase",      &RunSuite_WorldE2E          },
+        { "plugin_names",       "Test 26: Plugin shortName rules ([a-z_], 1..24) & collision auto-suffix", &RunSuite_PluginNames       },
     };
 
     bool listOnly = false;

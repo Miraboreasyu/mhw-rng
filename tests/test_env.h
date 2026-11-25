@@ -93,3 +93,4 @@ bool RunSuite_PluginCrit(TestEnv& env);
 bool RunSuite_PluginEndemicRare(TestEnv& env);
 bool RunSuite_SdkV35(TestEnv& env);
 bool RunSuite_WorldE2E(TestEnv& env);
+bool RunSuite_PluginNames(TestEnv& env);

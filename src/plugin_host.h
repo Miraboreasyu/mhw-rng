@@ -60,6 +60,9 @@ void DispatchMainThreadTicks() noexcept;
 bool        QuerySiteMeta(std::uint32_t rva, MhwRngSiteMeta* outMeta);
 bool        FormatSlotCustom(const MhwRngSlotSnapshot* snap, char* outBuf, std::size_t bufCap);
 const char* GetPluginShortName(MhwRngPluginId id) noexcept;
+bool        ValidateDeclaredShortName(const char* rawName) noexcept;
+std::string AllocateUniqueShortName(const std::string& baseName,
+                                    const std::vector<std::string>& existingLower);
 
 std::vector<LoadedPluginSummary> ListLoadedPlugins();
 std::vector<SubcommandHelpEntry> ListPluginSubcommands();

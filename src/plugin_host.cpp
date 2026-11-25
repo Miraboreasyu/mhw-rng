@@ -607,51 +607,71 @@ bool LoadDllPathLifecycleLocked(const std::string& fullDllPath,
         return false;
     }
 
-    const std::string shortLow = LowerAscii(desc->shortName);
-    MhwRngPluginId existingId = 0U;
+    if (!ValidateDeclaredShortName(desc->shortName)) {
+        ::FreeLibrary(mod);
+        ::DeleteFileA(shadowPath.c_str());
+        outMsg = (en ? "Invalid plugin shortName (must be 1..24 lowercase [a-z_], not 'kernel'): "
+                     : u8"插件 shortName 无效 (仅允许 1..24 位小写字母和下划线，且不能为 kernel): ") +
+                 std::string(desc->shortName);
+        return false;
+    }
+
+    const std::string fullLow = LowerAscii(fullDllPath);
+    const std::string fileLow = LowerAscii(fileName);
+    MhwRngPluginId sameFileId = 0U;
     {
         std::lock_guard<std::mutex> rlk(g_registryMx);
         for (const auto& p : g_plugins) {
-            if (p.shortNameLower == shortLow) {
-                existingId = p.id;
+            if (LowerAscii(p.sourcePath) == fullLow || LowerAscii(p.fileName) == fileLow) {
+                sameFileId = p.id;
                 break;
             }
         }
     }
-    if (existingId != 0U) {
-        UnloadByIdLifecycleLocked(existingId);
+    if (sameFileId != 0U) {
+        UnloadByIdLifecycleLocked(sameFileId);
     }
 
-    const MhwRngPluginId newId = g_nextPluginId++;
-    CopyTrunc(g_shortNameCache[newId % kShortNameSlotCount],
-              sizeof(g_shortNameCache[0]),
-              desc->shortName);
-
-    LoadedPlugin lp{};
-    lp.id             = newId;
-    lp.shortName      = desc->shortName;
-    lp.shortNameLower = shortLow;
-    lp.displayName    = desc->displayName ? desc->displayName : desc->shortName;
-    lp.version        = desc->version ? desc->version : "1.0";
-    lp.description    = desc->description ? desc->description : "";
-    lp.sourcePath     = fullDllPath;
-    lp.fileName       = fileName;
-    lp.shadowPath     = shadowPath;
-    lp.module         = mod;
-    lp.shutdownFn     = fnShutdown;
+    std::string assignedShort;
+    MhwRngPluginId newId = 0U;
     {
         std::lock_guard<std::mutex> rlk(g_registryMx);
-        g_plugins.push_back(lp);
+        std::vector<std::string> existingLower;
+        existingLower.reserve(g_plugins.size());
+        for (const auto& p : g_plugins) {
+            existingLower.push_back(p.shortNameLower);
+        }
+        assignedShort = AllocateUniqueShortName(desc->shortName, existingLower);
+        newId = g_nextPluginId++;
+        CopyTrunc(g_shortNameCache[newId % kShortNameSlotCount],
+                  sizeof(g_shortNameCache[0]),
+                  assignedShort.c_str());
+
+        LoadedPlugin lp{};
+        lp.id             = newId;
+        lp.shortName      = assignedShort;
+        lp.shortNameLower = assignedShort;
+        lp.displayName    = desc->displayName ? desc->displayName : assignedShort;
+        lp.version        = desc->version ? desc->version : "1.0";
+        lp.description    = desc->description ? desc->description : "";
+        lp.sourcePath     = fullDllPath;
+        lp.fileName       = fileName;
+        lp.shadowPath     = shadowPath;
+        lp.module         = mod;
+        lp.shutdownFn     = fnShutdown;
+        g_plugins.push_back(std::move(lp));
     }
 
     if (!InvokePluginInitSEH(fnInit, &g_hostApi, newId)) {
         UnloadByIdLifecycleLocked(newId);
-        outMsg = (en ? "Plugin Init returned false: " : u8"插件初始化返回失败: ") + std::string(desc->shortName);
+        outMsg = (en ? "Plugin Init returned false: " : u8"插件初始化返回失败: ") + assignedShort;
         return false;
     }
 
     std::size_t cmdCnt = 0;
-    std::string dispName = lp.displayName;
+    std::string dispName = assignedShort;
+    std::string versionStr = "1.0";
+    std::string finalShort = assignedShort;
     {
         std::lock_guard<std::mutex> rlk(g_registryMx);
         for (const auto& c : g_subcmds) {
@@ -659,21 +679,23 @@ bool LoadDllPathLifecycleLocked(const std::string& fullDllPath,
         }
         for (const auto& p : g_plugins) {
             if (p.id == newId) {
-                dispName = ResolveOwnedLocale(p.displayNamesI18n, p.displayName);
+                dispName   = ResolveOwnedLocale(p.displayNamesI18n, p.displayName);
+                versionStr = p.version;
+                finalShort = p.shortName;
                 break;
             }
         }
     }
     app::Log("plugin_host: loaded '%s' v%s (%s, id=%u, cmds=%zu)",
-             lp.shortName.c_str(), lp.version.c_str(), fileName.c_str(), newId, cmdCnt);
+             finalShort.c_str(), versionStr.c_str(), fileName.c_str(), newId, cmdCnt);
 
     char okBuf[192]{};
     if (en) {
         std::snprintf(okBuf, sizeof(okBuf), "%s v%s (%s, %zu cmds)",
-                      lp.shortName.c_str(), lp.version.c_str(), dispName.c_str(), cmdCnt);
+                      finalShort.c_str(), versionStr.c_str(), dispName.c_str(), cmdCnt);
     } else {
         std::snprintf(okBuf, sizeof(okBuf), u8"%s v%s (%s, 注册%zu条指令)",
-                      lp.shortName.c_str(), lp.version.c_str(), dispName.c_str(), cmdCnt);
+                      finalShort.c_str(), versionStr.c_str(), dispName.c_str(), cmdCnt);
     }
     outMsg = okBuf;
     return true;
@@ -1547,6 +1569,46 @@ const char* GetPluginShortName(MhwRngPluginId id) noexcept {
     if (id == kMhwRngPluginIdKernel) return "kernel";
     const char* cached = g_shortNameCache[id % kShortNameSlotCount];
     return (cached[0] != '\0') ? cached : "plugin";
+}
+
+bool ValidateDeclaredShortName(const char* rawName) noexcept {
+    if (!rawName || rawName[0] == '\0') return false;
+    std::size_t len = 0U;
+    while (rawName[len] != '\0') {
+        const char c = rawName[len];
+        if (!((c >= 'a' && c <= 'z') || c == '_')) {
+            return false;
+        }
+        ++len;
+        if (len > 24U) return false;
+    }
+    if (std::strcmp(rawName, "kernel") == 0) {
+        return false;
+    }
+    return true;
+}
+
+std::string AllocateUniqueShortName(const std::string& baseName,
+                                    const std::vector<std::string>& existingLower) {
+    auto exists = [&](const std::string& cand) -> bool {
+        const std::string low = LowerAscii(cand);
+        for (const auto& ex : existingLower) {
+            if (LowerAscii(ex) == low) return true;
+        }
+        return false;
+    };
+    if (!exists(baseName)) {
+        return baseName;
+    }
+    for (std::uint32_t n = 1U; n < 10000U; ++n) {
+        const std::string suffix = "_" + std::to_string(n);
+        const std::size_t maxPrefix = (suffix.size() < 31U) ? (31U - suffix.size()) : 0U;
+        const std::string cand = baseName.substr(0U, maxPrefix) + suffix;
+        if (!exists(cand)) {
+            return cand;
+        }
+    }
+    return baseName;
 }
 
 std::vector<LoadedPluginSummary> ListLoadedPlugins() {
