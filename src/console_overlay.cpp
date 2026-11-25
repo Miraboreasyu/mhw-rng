@@ -7,6 +7,7 @@
 #include "log_config.h"
 #include "mhw_addresses.h"
 #include "mhw_rng_api.h"
+#include "peer_beacon.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -109,13 +110,90 @@ struct alignas(16) ConsoleConstants {
 };
 static_assert(sizeof(ConsoleConstants) == 32, "ConsoleConstants must be 32 bytes");
 
-ID3DBlob* g_vsBlob      = nullptr;
-ID3DBlob* g_psBlob      = nullptr;
-bool      g_shaderTried = false;
+ID3DBlob* g_vsBlob          = nullptr;
+ID3DBlob* g_psBlob          = nullptr;
+bool      g_shaderTried     = false;
 
-bool CompileEntry(pD3DCompile fnCompile, const char* entry, const char* target, ID3DBlob** outBlob) {
+constexpr const char* kAuxHlsl = R"(
+cbuffer AuxCB : register(b0) {
+    float4 gCellW[48];
+    float4 gParams;
+};
+
+struct AuxVSOut {
+    float4 pos : SV_POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+AuxVSOut VSAux(uint vid : SV_VertexID) {
+    float2 p = float2((vid == 2u) ? 3.0f : -1.0f, (vid == 1u) ? -3.0f : 1.0f);
+    AuxVSOut o;
+    o.pos = float4(p, 0.0f, 1.0f);
+    o.uv  = float2(p.x * 0.5f + 0.5f, 0.5f - p.y * 0.5f);
+    return o;
+}
+
+float4 PSAux(AuxVSOut i) : SV_TARGET {
+    if (i.uv.x < 0.05f || i.uv.x >= 0.95f || i.uv.y < 0.05f || i.uv.y >= 0.95f) discard;
+    float gx = (i.uv.x - 0.05f) * (16.0f / 0.90f);
+    float gy = (i.uv.y - 0.05f) * (12.0f / 0.90f);
+    uint c = min(15u, (uint)gx);
+    uint r = min(11u, (uint)gy);
+    float u = gx - (float)c;
+    float v = gy - (float)r;
+
+    float su = sin(3.14159265f * u);
+    float sv = sin(3.14159265f * v);
+    float hu = su * su;
+    float hv = sv * sv;
+    float shape = (((r + c) & 1u) == 0u)
+        ? (2.59807621f * hu * cos(3.14159265f * u) * hv)
+        : (2.59807621f * hv * cos(3.14159265f * v) * hu);
+
+    uint cid = r * 16u + c;
+    float4 vec = gCellW[cid >> 2u];
+    uint lane = cid & 3u;
+    float cw = (lane == 0u) ? vec.x : ((lane == 1u) ? vec.y : ((lane == 2u) ? vec.z : vec.w));
+
+    float e  = gParams.x * cw * shape;
+    float ae = abs(e);
+    if (ae < 1e-5f) discard;
+
+    if (gParams.z > 0.0f && ae < gParams.z) {
+        float ign = frac(52.9829189f * frac(dot(i.pos.xy, float2(0.06711056f, 0.00583715f))));
+        ae = (ign * gParams.z < ae) ? gParams.z : 0.0f;
+        if (ae <= 0.0f) discard;
+    }
+
+    float eB = ae;
+    float eR = ae * gParams.y;
+    bool isAdd = (gParams.w < 0.5f);
+    if (e >= 0.0f) {
+        return isAdd ? float4(0.0f, 0.0f, eB, 0.0f) : float4(eR, 0.0f, 0.0f, 0.0f);
+    }
+    return isAdd ? float4(eR, 0.0f, 0.0f, 0.0f) : float4(0.0f, 0.0f, eB, 0.0f);
+}
+)";
+
+struct alignas(16) MarkCbData {
+    float        cellW[192];
+    float        params[4];
+    std::uint8_t pad[240];
+};
+static_assert(sizeof(MarkCbData) == 1024U, "MarkCbData must be 256-byte aligned");
+
+ID3DBlob* g_markVsBlob      = nullptr;
+ID3DBlob* g_markPsBlob      = nullptr;
+bool      g_markShaderTried = false;
+
+bool CompileSourceEntry(pD3DCompile fnCompile,
+                        const char* src,
+                        const char* srcName,
+                        const char* entry,
+                        const char* target,
+                        ID3DBlob** outBlob) {
     ID3DBlob* err = nullptr;
-    const HRESULT hr = fnCompile(kConsoleHlsl, std::strlen(kConsoleHlsl), "console_overlay.hlsl",
+    const HRESULT hr = fnCompile(src, std::strlen(src), srcName,
                                  nullptr, nullptr, entry, target,
                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, outBlob, &err);
     if (FAILED(hr)) {
@@ -128,24 +206,84 @@ bool CompileEntry(pD3DCompile fnCompile, const char* entry, const char* target, 
     return true;
 }
 
+pD3DCompile ResolveD3DCompileFn() {
+    HMODULE d3dc = ::GetModuleHandleW(L"d3dcompiler_47.dll");
+    if (!d3dc) d3dc = ::LoadLibraryW(L"d3dcompiler_47.dll");
+    if (!d3dc) {
+        app::Log("console: failed to load d3dcompiler_47.dll (err=%lu)", ::GetLastError());
+        return nullptr;
+    }
+    auto fnCompile = reinterpret_cast<pD3DCompile>(::GetProcAddress(d3dc, "D3DCompile"));
+    if (!fnCompile) {
+        app::Log("console: D3DCompile export not found");
+        return nullptr;
+    }
+    return fnCompile;
+}
+
 bool EnsureShaderBlobs() {
     if (g_vsBlob && g_psBlob) return true;
     if (g_shaderTried) return false;
     g_shaderTried = true;
 
-    HMODULE d3dc = ::GetModuleHandleW(L"d3dcompiler_47.dll");
-    if (!d3dc) d3dc = ::LoadLibraryW(L"d3dcompiler_47.dll");
-    if (!d3dc) {
-        app::Log("console: failed to load d3dcompiler_47.dll (err=%lu)", ::GetLastError());
-        return false;
+    auto fnCompile = ResolveD3DCompileFn();
+    if (!fnCompile) return false;
+    return CompileSourceEntry(fnCompile, kConsoleHlsl, "console_overlay.hlsl", "VSMain", "vs_4_0", &g_vsBlob) &&
+           CompileSourceEntry(fnCompile, kConsoleHlsl, "console_overlay.hlsl", "PSMain", "ps_4_0", &g_psBlob);
+}
+
+bool EnsureMarkShaderBlobs() {
+    if (g_markVsBlob && g_markPsBlob) return true;
+    if (g_markShaderTried) return false;
+    g_markShaderTried = true;
+
+    auto fnCompile = ResolveD3DCompileFn();
+    if (!fnCompile) return false;
+    return CompileSourceEntry(fnCompile, kAuxHlsl, "console_aux.hlsl", "VSAux", "vs_4_0", &g_markVsBlob) &&
+           CompileSourceEntry(fnCompile, kAuxHlsl, "console_aux.hlsl", "PSAux", "ps_4_0", &g_markPsBlob);
+}
+
+void ComputeMarkParams(std::uint32_t hdrMode,
+                       bool debugVis,
+                       float& outEpsB,
+                       float& outRedRatio,
+                       float& outIgnPulse) noexcept {
+    if (hdrMode == 2U) {
+        outEpsB     = 0.030f;
+        outRedRatio = 0.340f;
+        outIgnPulse = 0.0f;
+    } else if (hdrMode == 1U) {
+        outEpsB     = 0.010f;
+        outRedRatio = 0.226f;
+        outIgnPulse = 0.0f;
+    } else {
+        outEpsB     = 0.014f;
+        outRedRatio = 0.340f;
+        outIgnPulse = 0.022f;
     }
-    auto fnCompile = reinterpret_cast<pD3DCompile>(::GetProcAddress(d3dc, "D3DCompile"));
-    if (!fnCompile) {
-        app::Log("console: D3DCompile export not found");
-        return false;
+    if (debugVis) {
+        const float boosted = outEpsB * 16.0f;
+        outEpsB     = (boosted < 0.45f) ? boosted : 0.45f;
+        outIgnPulse = 0.0f;
     }
-    return CompileEntry(fnCompile, "VSMain", "vs_4_0", &g_vsBlob) &&
-           CompileEntry(fnCompile, "PSMain", "ps_4_0", &g_psBlob);
+}
+
+void PackMarkBuffers(const peer_beacon::VideoMarkFrame& f,
+                     float epsB,
+                     float redRatio,
+                     float ignPulse,
+                     MarkCbData& outAdd,
+                     MarkCbData& outSub) noexcept {
+    std::memcpy(outAdd.cellW, f.cellWeights, sizeof(outAdd.cellW));
+    std::memcpy(outSub.cellW, f.cellWeights, sizeof(outSub.cellW));
+    outAdd.params[0] = epsB;
+    outAdd.params[1] = redRatio;
+    outAdd.params[2] = ignPulse;
+    outAdd.params[3] = 0.0f;
+    outSub.params[0] = epsB;
+    outSub.params[1] = redRatio;
+    outSub.params[2] = ignPulse;
+    outSub.params[3] = 1.0f;
 }
 
 inline bool IsValidPtr(std::uintptr_t p) noexcept {
@@ -887,41 +1025,114 @@ struct GdiSurface {
 } g_gdi;
 
 // ============================================================================
-//  DirectX 11 Single-Quad Overlay Backend
+//  DirectX 11 Overlay & Aux Backend
 // ============================================================================
 struct D3D11State {
-    ID3D11Device*             device  = nullptr;
-    ID3D11VertexShader*       vs      = nullptr;
-    ID3D11PixelShader*        ps      = nullptr;
-    ID3D11BlendState*         blend   = nullptr;
-    ID3D11RasterizerState*    rast    = nullptr;
-    ID3D11DepthStencilState*  depth   = nullptr;
-    ID3D11Buffer*             cb      = nullptr;
-    ID3D11Texture2D*          tex     = nullptr;
-    ID3D11ShaderResourceView* srv     = nullptr;
-    UINT                      texW    = 0U;
-    UINT                      texH    = 0U;
+    ID3D11Device*             device       = nullptr;
+    ID3D11VertexShader*       vs           = nullptr;
+    ID3D11PixelShader*        ps           = nullptr;
+    ID3D11BlendState*         blend        = nullptr;
+    ID3D11RasterizerState*    rast         = nullptr;
+    ID3D11DepthStencilState*  depth        = nullptr;
+    ID3D11Buffer*             cb           = nullptr;
+    ID3D11Texture2D*          tex          = nullptr;
+    ID3D11ShaderResourceView* srv          = nullptr;
+    UINT                      texW         = 0U;
+    UINT                      texH         = 0U;
+    ID3D11VertexShader*       vsMark       = nullptr;
+    ID3D11PixelShader*        psMark       = nullptr;
+    ID3D11BlendState*         blendMarkAdd = nullptr;
+    ID3D11BlendState*         blendMarkSub = nullptr;
+    ID3D11Buffer*             cbMark       = nullptr;
 
     void release() {
-        if (srv)   { srv->Release();   srv = nullptr; }
-        if (tex)   { tex->Release();   tex = nullptr; }
-        if (cb)    { cb->Release();    cb = nullptr; }
-        if (depth) { depth->Release(); depth = nullptr; }
-        if (rast)  { rast->Release();  rast = nullptr; }
-        if (blend) { blend->Release(); blend = nullptr; }
-        if (ps)    { ps->Release();    ps = nullptr; }
-        if (vs)    { vs->Release();    vs = nullptr; }
+        if (cbMark)       { cbMark->Release();       cbMark = nullptr; }
+        if (blendMarkSub) { blendMarkSub->Release(); blendMarkSub = nullptr; }
+        if (blendMarkAdd) { blendMarkAdd->Release(); blendMarkAdd = nullptr; }
+        if (psMark)       { psMark->Release();       psMark = nullptr; }
+        if (vsMark)       { vsMark->Release();       vsMark = nullptr; }
+        if (srv)          { srv->Release();          srv = nullptr; }
+        if (tex)          { tex->Release();          tex = nullptr; }
+        if (cb)           { cb->Release();           cb = nullptr; }
+        if (depth)        { depth->Release();        depth = nullptr; }
+        if (rast)         { rast->Release();         rast = nullptr; }
+        if (blend)        { blend->Release();        blend = nullptr; }
+        if (ps)           { ps->Release();           ps = nullptr; }
+        if (vs)           { vs->Release();           vs = nullptr; }
         device = nullptr;
         texW   = 0U;
         texH   = 0U;
     }
 
-    bool ensure(ID3D11Device* dev, UINT pw, UINT ph, bool& outNewTex) {
-        outNewTex = false;
+    bool ensureCommon(ID3D11Device* dev) {
         if (device != dev) {
             release();
             device = dev;
         }
+        if (!rast) {
+            D3D11_RASTERIZER_DESC rd{};
+            rd.FillMode        = D3D11_FILL_SOLID;
+            rd.CullMode        = D3D11_CULL_NONE;
+            rd.DepthClipEnable = FALSE;
+            rd.ScissorEnable   = FALSE;
+            if (FAILED(dev->CreateRasterizerState(&rd, &rast))) return false;
+        }
+        if (!depth) {
+            D3D11_DEPTH_STENCIL_DESC dd{};
+            dd.DepthEnable   = FALSE;
+            dd.StencilEnable = FALSE;
+            if (FAILED(dev->CreateDepthStencilState(&dd, &depth))) return false;
+        }
+        return true;
+    }
+
+    bool ensureMark(ID3D11Device* dev) {
+        if (!ensureCommon(dev)) return false;
+        if (!EnsureMarkShaderBlobs()) return false;
+        if (!vsMark && FAILED(dev->CreateVertexShader(g_markVsBlob->GetBufferPointer(), g_markVsBlob->GetBufferSize(), nullptr, &vsMark))) {
+            return false;
+        }
+        if (!psMark && FAILED(dev->CreatePixelShader(g_markPsBlob->GetBufferPointer(), g_markPsBlob->GetBufferSize(), nullptr, &psMark))) {
+            return false;
+        }
+        if (!blendMarkAdd) {
+            D3D11_BLEND_DESC bd{};
+            bd.RenderTarget[0].BlendEnable           = TRUE;
+            bd.RenderTarget[0].SrcBlend              = D3D11_BLEND_DEST_COLOR;
+            bd.RenderTarget[0].DestBlend             = D3D11_BLEND_ONE;
+            bd.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
+            bd.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ZERO;
+            bd.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_ONE;
+            bd.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+            bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_BLUE;
+            if (FAILED(dev->CreateBlendState(&bd, &blendMarkAdd))) return false;
+        }
+        if (!blendMarkSub) {
+            D3D11_BLEND_DESC bd{};
+            bd.RenderTarget[0].BlendEnable           = TRUE;
+            bd.RenderTarget[0].SrcBlend              = D3D11_BLEND_DEST_COLOR;
+            bd.RenderTarget[0].DestBlend             = D3D11_BLEND_ONE;
+            bd.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_REV_SUBTRACT;
+            bd.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ZERO;
+            bd.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_ONE;
+            bd.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+            bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_BLUE;
+            if (FAILED(dev->CreateBlendState(&bd, &blendMarkSub))) return false;
+        }
+        if (!cbMark) {
+            D3D11_BUFFER_DESC cbd{};
+            cbd.ByteWidth      = sizeof(MarkCbData);
+            cbd.Usage          = D3D11_USAGE_DYNAMIC;
+            cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+            cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            if (FAILED(dev->CreateBuffer(&cbd, nullptr, &cbMark))) return false;
+        }
+        return true;
+    }
+
+    bool ensureConsole(ID3D11Device* dev, UINT pw, UINT ph, bool& outNewTex) {
+        outNewTex = false;
+        if (!ensureCommon(dev)) return false;
         if (!EnsureShaderBlobs()) return false;
         if (!vs && FAILED(dev->CreateVertexShader(g_vsBlob->GetBufferPointer(), g_vsBlob->GetBufferSize(), nullptr, &vs))) {
             return false;
@@ -940,20 +1151,6 @@ struct D3D11State {
             bd.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
             bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
             if (FAILED(dev->CreateBlendState(&bd, &blend))) return false;
-        }
-        if (!rast) {
-            D3D11_RASTERIZER_DESC rd{};
-            rd.FillMode        = D3D11_FILL_SOLID;
-            rd.CullMode        = D3D11_CULL_NONE;
-            rd.DepthClipEnable = FALSE;
-            rd.ScissorEnable   = FALSE;
-            if (FAILED(dev->CreateRasterizerState(&rd, &rast))) return false;
-        }
-        if (!depth) {
-            D3D11_DEPTH_STENCIL_DESC dd{};
-            dd.DepthEnable   = FALSE;
-            dd.StencilEnable = FALSE;
-            if (FAILED(dev->CreateDepthStencilState(&dd, &depth))) return false;
         }
         if (!cb) {
             D3D11_BUFFER_DESC cbd{};
@@ -997,7 +1194,7 @@ struct D3D11State {
 } g_d3d11;
 
 // ============================================================================
-//  DirectX 12 Single-Quad Overlay Backend
+//  DirectX 12 Overlay & Aux Backend
 // ============================================================================
 struct D3D12State {
     ID3D12Device*              device        = nullptr;
@@ -1011,6 +1208,12 @@ struct D3D12State {
     UINT                       texW          = 0U;
     UINT                       texH          = 0U;
     UINT                       uploadPitch   = 0U;
+    ID3D12RootSignature*       markRootSig   = nullptr;
+    ID3D12PipelineState*       psoMarkAdd    = nullptr;
+    ID3D12PipelineState*       psoMarkSub    = nullptr;
+    DXGI_FORMAT                markPsoFormat = DXGI_FORMAT_UNKNOWN;
+    ID3D12Resource*            markCbBuf     = nullptr;
+    std::uint8_t*              markCbMapped  = nullptr;
     ID3D12CommandAllocator*    allocs[4]{};
     UINT64                     slotFence[4]{};
     ID3D12GraphicsCommandList* cmdList       = nullptr;
@@ -1043,6 +1246,15 @@ struct D3D12State {
     void release() {
         waitForIdle();
         releaseTex();
+        if (markCbBuf) {
+            if (markCbMapped) { markCbBuf->Unmap(0, nullptr); markCbMapped = nullptr; }
+            markCbBuf->Release();
+            markCbBuf = nullptr;
+        }
+        if (psoMarkSub)  { psoMarkSub->Release();  psoMarkSub = nullptr; }
+        if (psoMarkAdd)  { psoMarkAdd->Release();  psoMarkAdd = nullptr; }
+        if (markRootSig) { markRootSig->Release(); markRootSig = nullptr; }
+        markPsoFormat = DXGI_FORMAT_UNKNOWN;
         for (int i = 0; i < 4; ++i) {
             if (allocs[i]) { allocs[i]->Release(); allocs[i] = nullptr; }
             slotFence[i] = 0ULL;
@@ -1059,12 +1271,142 @@ struct D3D12State {
         slotIndex    = 0U;
     }
 
-    bool ensure(ID3D12Device* dev, DXGI_FORMAT rtvFmt, UINT pw, UINT ph, bool& outNewTex) {
-        outNewTex = false;
+    bool ensureCore(ID3D12Device* dev) {
         if (device != dev) {
             release();
             device = dev;
         }
+        if (!fence) {
+            if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return false;
+            fenceEvent = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!fenceEvent) return false;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (!allocs[i] &&
+                FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocs[i])))) {
+                return false;
+            }
+        }
+        if (!cmdList) {
+            if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocs[0], nullptr,
+                                              IID_PPV_ARGS(&cmdList)))) {
+                return false;
+            }
+            cmdList->Close();
+        }
+        return true;
+    }
+
+    bool ensureMark(ID3D12Device* dev, DXGI_FORMAT rtvFmt) {
+        if (!ensureCore(dev)) return false;
+        if (!EnsureMarkShaderBlobs()) return false;
+
+        if (!markRootSig) {
+            D3D12_ROOT_PARAMETER param{};
+            param.ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            param.Descriptor.ShaderRegister = 0;
+            param.Descriptor.RegisterSpace  = 0;
+            param.ShaderVisibility          = D3D12_SHADER_VISIBILITY_PIXEL;
+
+            D3D12_ROOT_SIGNATURE_DESC rsd{};
+            rsd.NumParameters = 1;
+            rsd.pParameters   = &param;
+            rsd.Flags         = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+            HMODULE d3d12Mod = ::GetModuleHandleW(L"d3d12.dll");
+            auto fnSer = d3d12Mod
+                             ? reinterpret_cast<PFN_D3D12_SERIALIZE_ROOT_SIGNATURE>(
+                                   ::GetProcAddress(d3d12Mod, "D3D12SerializeRootSignature"))
+                             : nullptr;
+            if (!fnSer) return false;
+            ID3DBlob* sig = nullptr;
+            ID3DBlob* err = nullptr;
+            if (FAILED(fnSer(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
+                if (err) err->Release();
+                return false;
+            }
+            if (err) err->Release();
+            const HRESULT hr = dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                                        IID_PPV_ARGS(&markRootSig));
+            sig->Release();
+            if (FAILED(hr)) return false;
+        }
+
+        if (!psoMarkAdd || !psoMarkSub || markPsoFormat != rtvFmt) {
+            waitForIdle();
+            if (psoMarkAdd) { psoMarkAdd->Release(); psoMarkAdd = nullptr; }
+            if (psoMarkSub) { psoMarkSub->Release(); psoMarkSub = nullptr; }
+
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature                                   = markRootSig;
+            pd.VS                                               = {g_markVsBlob->GetBufferPointer(), g_markVsBlob->GetBufferSize()};
+            pd.PS                                               = {g_markPsBlob->GetBufferPointer(), g_markPsBlob->GetBufferSize()};
+            pd.SampleMask                                       = UINT_MAX;
+            pd.BlendState.RenderTarget[0].BlendEnable           = TRUE;
+            pd.BlendState.RenderTarget[0].SrcBlend              = D3D12_BLEND_DEST_COLOR;
+            pd.BlendState.RenderTarget[0].DestBlend             = D3D12_BLEND_ONE;
+            pd.BlendState.RenderTarget[0].BlendOp               = D3D12_BLEND_OP_ADD;
+            pd.BlendState.RenderTarget[0].SrcBlendAlpha         = D3D12_BLEND_ZERO;
+            pd.BlendState.RenderTarget[0].DestBlendAlpha        = D3D12_BLEND_ONE;
+            pd.BlendState.RenderTarget[0].BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+            pd.BlendState.RenderTarget[0].RenderTargetWriteMask =
+                D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_BLUE;
+            pd.RasterizerState.FillMode                         = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode                         = D3D12_CULL_MODE_NONE;
+            pd.RasterizerState.DepthClipEnable                  = FALSE;
+            pd.DepthStencilState.DepthEnable                    = FALSE;
+            pd.PrimitiveTopologyType                            = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            pd.NumRenderTargets                                 = 1;
+            pd.RTVFormats[0]                                    = rtvFmt;
+            pd.SampleDesc.Count                                 = 1;
+            if (FAILED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoMarkAdd)))) return false;
+
+            pd.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_REV_SUBTRACT;
+            if (FAILED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoMarkSub)))) {
+                psoMarkAdd->Release();
+                psoMarkAdd = nullptr;
+                return false;
+            }
+            markPsoFormat = rtvFmt;
+        }
+
+        if (!markCbBuf || !markCbMapped) {
+            if (markCbBuf) {
+                if (markCbMapped) { markCbBuf->Unmap(0, nullptr); markCbMapped = nullptr; }
+                markCbBuf->Release();
+                markCbBuf = nullptr;
+            }
+            D3D12_HEAP_PROPERTIES upHp{};
+            upHp.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width            = 4ULL * 2ULL * sizeof(MarkCbData);
+            bd.Height           = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels        = 1;
+            bd.Format           = DXGI_FORMAT_UNKNOWN;
+            bd.SampleDesc.Count = 1;
+            bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(dev->CreateCommittedResource(&upHp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                    nullptr, IID_PPV_ARGS(&markCbBuf)))) {
+                return false;
+            }
+            const D3D12_RANGE readNone{0, 0};
+            void* mapped = nullptr;
+            if (FAILED(markCbBuf->Map(0, &readNone, &mapped)) || !mapped) {
+                markCbBuf->Release();
+                markCbBuf = nullptr;
+                return false;
+            }
+            markCbMapped = static_cast<std::uint8_t*>(mapped);
+        }
+        return true;
+    }
+
+    bool ensureConsole(ID3D12Device* dev, DXGI_FORMAT rtvFmt, UINT pw, UINT ph, bool& outNewTex) {
+        outNewTex = false;
+        if (!ensureCore(dev)) return false;
         if (!EnsureShaderBlobs()) return false;
 
         if (!rootSig) {
@@ -1146,26 +1488,6 @@ struct D3D12State {
             shd.NumDescriptors = 1;
             shd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             if (FAILED(dev->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&srvHeap)))) return false;
-        }
-
-        if (!fence) {
-            if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return false;
-            fenceEvent = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (!fenceEvent) return false;
-        }
-
-        for (int i = 0; i < 4; ++i) {
-            if (!allocs[i] &&
-                FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocs[i])))) {
-                return false;
-            }
-        }
-        if (!cmdList) {
-            if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocs[0], pso,
-                                              IID_PPV_ARGS(&cmdList)))) {
-                return false;
-            }
-            cmdList->Close();
         }
 
         if (!tex || !uploadBuf || texW != pw || texH != ph) {
@@ -1254,7 +1576,10 @@ void ComputePanelLayout(UINT bbW, UINT bbH, float& outScale,
     outH = ph;
 }
 
-void RenderD3D11(std::uintptr_t exeBase, std::uintptr_t d3dRender) {
+void RenderD3D11(std::uintptr_t exeBase,
+                 std::uintptr_t d3dRender,
+                 bool drawConsole,
+                 const peer_beacon::VideoMarkFrame& markFrame) {
     if (*reinterpret_cast<const std::uint8_t*>(d3dRender + mhw::kOffD3DOccludedByte) != 0) return;
     if (*reinterpret_cast<const std::uint32_t*>(d3dRender + mhw::kOffD3DSwapChainCount) == 0U) return;
 
@@ -1272,47 +1597,48 @@ void RenderD3D11(std::uintptr_t exeBase, std::uintptr_t d3dRender) {
         backBuf->GetDesc(&bbDesc);
         const DXGI_FORMAT rtvFmt = ResolveTypedRtvFormat(bbDesc.Format);
 
+        std::uint32_t hdrMode = 0U;
+        float targetNits = 200.0f;
+        ResolveHdrModeSEH(exeBase, rtvFmt, hdrMode, targetNits);
+
+        bool willDrawMark = markFrame.active && g_d3d11.ensureMark(dev);
+        MarkCbData cbAdd{}, cbSub{};
+        if (willDrawMark) {
+            float epsB = 0.0f, redRatio = 0.0f, ignPulse = 0.0f;
+            ComputeMarkParams(hdrMode, markFrame.debugVisible, epsB, redRatio, ignPulse);
+            PackMarkBuffers(markFrame, epsB, redRatio, ignPulse, cbAdd, cbSub);
+        }
+
         float sc = 1.0f;
         UINT ox = 0U, oy = 0U, pw = 0U, ph = 0U;
-        ComputePanelLayout(bbDesc.Width, bbDesc.Height, sc, ox, oy, pw, ph);
-
-        bool newTex = false;
-        if (pw > 0U && ph > 0U && g_d3d11.ensure(dev, pw, ph, newTex)) {
-            bool needClamp = false;
-            std::size_t clampMax = 0U;
-            {
-                std::lock_guard<std::mutex> uiLk(g_uiMx);
-                const bool dirty = g_gdi.updateIfDirty(bbDesc.Width, bbDesc.Height, ox, oy, pw, ph, sc,
-                                                       needClamp, clampMax);
-                if ((dirty || newTex) && g_gdi.bits) {
-                    ctx->UpdateSubresource(g_d3d11.tex, 0, nullptr, g_gdi.bits, pw * 4U, 0U);
+        bool willDrawConsole = false;
+        if (drawConsole) {
+            ComputePanelLayout(bbDesc.Width, bbDesc.Height, sc, ox, oy, pw, ph);
+            bool newTex = false;
+            if (pw > 0U && ph > 0U && g_d3d11.ensureConsole(dev, pw, ph, newTex)) {
+                bool needClamp = false;
+                std::size_t clampMax = 0U;
+                {
+                    std::lock_guard<std::mutex> uiLk(g_uiMx);
+                    const bool dirty = g_gdi.updateIfDirty(bbDesc.Width, bbDesc.Height, ox, oy, pw, ph, sc,
+                                                           needClamp, clampMax);
+                    if ((dirty || newTex) && g_gdi.bits) {
+                        ctx->UpdateSubresource(g_d3d11.tex, 0, nullptr, g_gdi.bits, pw * 4U, 0U);
+                    }
                 }
+                if (needClamp) {
+                    console::ClampScrollOffset(clampMax);
+                }
+                willDrawConsole = true;
             }
-            if (needClamp) {
-                console::ClampScrollOffset(clampMax);
-            }
+        }
 
+        if (willDrawMark || willDrawConsole) {
             D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
             rtvDesc.Format        = rtvFmt;
             rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
             ID3D11RenderTargetView* rtv = nullptr;
             if (SUCCEEDED(dev->CreateRenderTargetView(backBuf, &rtvDesc, &rtv)) && rtv) {
-                ConsoleConstants cbData{};
-                cbData.panelOriginX = static_cast<float>(ox);
-                cbData.panelOriginY = static_cast<float>(oy);
-                cbData.panelW       = static_cast<float>(pw);
-                cbData.panelH       = static_cast<float>(ph);
-                cbData.invBbW       = 1.0f / static_cast<float>(bbDesc.Width);
-                cbData.invBbH       = 1.0f / static_cast<float>(bbDesc.Height);
-                ResolveHdrModeSEH(exeBase, rtvFmt, cbData.hdrMode, cbData.targetNits);
-
-                D3D11_MAPPED_SUBRESOURCE mapped{};
-                if (SUCCEEDED(ctx->Map(g_d3d11.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-                    std::memcpy(mapped.pData, &cbData, sizeof(cbData));
-                    ctx->Unmap(g_d3d11.cb, 0);
-                }
-
-                // Save D3D11 state
                 ID3D11RenderTargetView*   oldRtv = nullptr;
                 ID3D11DepthStencilView*   oldDsv = nullptr;
                 ID3D11BlendState*         oldBlend = nullptr;
@@ -1350,19 +1676,61 @@ void RenderD3D11(std::uintptr_t exeBase, std::uintptr_t d3dRender) {
                                         static_cast<FLOAT>(bbDesc.Height), 0.0f, 1.0f};
                 const FLOAT bf[4]{0, 0, 0, 0};
                 ctx->OMSetRenderTargets(1, &rtv, nullptr);
-                ctx->OMSetBlendState(g_d3d11.blend, bf, 0xFFFFFFFFU);
                 ctx->OMSetDepthStencilState(g_d3d11.depth, 0);
                 ctx->RSSetState(g_d3d11.rast);
                 ctx->RSSetViewports(1, &vp);
                 ctx->IASetInputLayout(nullptr);
                 ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                ctx->VSSetShader(g_d3d11.vs, nullptr, 0);
                 ctx->GSSetShader(nullptr, nullptr, 0);
-                ctx->PSSetShader(g_d3d11.ps, nullptr, 0);
-                ctx->VSSetConstantBuffers(0, 1, &g_d3d11.cb);
-                ctx->PSSetConstantBuffers(0, 1, &g_d3d11.cb);
-                ctx->PSSetShaderResources(0, 1, &g_d3d11.srv);
-                ctx->Draw(6U, 0U);
+
+                if (willDrawMark) {
+                    ctx->VSSetShader(g_d3d11.vsMark, nullptr, 0);
+                    ctx->PSSetShader(g_d3d11.psMark, nullptr, 0);
+                    ctx->PSSetConstantBuffers(0, 1, &g_d3d11.cbMark);
+                    {
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        if (SUCCEEDED(ctx->Map(g_d3d11.cbMark, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                            std::memcpy(mapped.pData, &cbAdd, sizeof(cbAdd));
+                            ctx->Unmap(g_d3d11.cbMark, 0);
+                            ctx->OMSetBlendState(g_d3d11.blendMarkAdd, bf, 0xFFFFFFFFU);
+                            ctx->Draw(3U, 0U);
+                        }
+                    }
+                    {
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        if (SUCCEEDED(ctx->Map(g_d3d11.cbMark, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                            std::memcpy(mapped.pData, &cbSub, sizeof(cbSub));
+                            ctx->Unmap(g_d3d11.cbMark, 0);
+                            ctx->OMSetBlendState(g_d3d11.blendMarkSub, bf, 0xFFFFFFFFU);
+                            ctx->Draw(3U, 0U);
+                        }
+                    }
+                }
+
+                if (willDrawConsole) {
+                    ConsoleConstants cbData{};
+                    cbData.panelOriginX = static_cast<float>(ox);
+                    cbData.panelOriginY = static_cast<float>(oy);
+                    cbData.panelW       = static_cast<float>(pw);
+                    cbData.panelH       = static_cast<float>(ph);
+                    cbData.invBbW       = 1.0f / static_cast<float>(bbDesc.Width);
+                    cbData.invBbH       = 1.0f / static_cast<float>(bbDesc.Height);
+                    cbData.targetNits   = targetNits;
+                    cbData.hdrMode      = hdrMode;
+
+                    D3D11_MAPPED_SUBRESOURCE mapped{};
+                    if (SUCCEEDED(ctx->Map(g_d3d11.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                        std::memcpy(mapped.pData, &cbData, sizeof(cbData));
+                        ctx->Unmap(g_d3d11.cb, 0);
+                        ctx->OMSetBlendState(g_d3d11.blend, bf, 0xFFFFFFFFU);
+                        ctx->VSSetShader(g_d3d11.vs, nullptr, 0);
+                        ctx->PSSetShader(g_d3d11.ps, nullptr, 0);
+                        ctx->VSSetConstantBuffers(0, 1, &g_d3d11.cb);
+                        ctx->PSSetConstantBuffers(0, 1, &g_d3d11.cb);
+                        ctx->PSSetShaderResources(0, 1, &g_d3d11.srv);
+                        ctx->Draw(6U, 0U);
+                    }
+                }
 
                 ctx->PSSetShaderResources(0, 1, &oldPsSrv);
                 ctx->PSSetConstantBuffers(0, 1, &oldPsCb);
@@ -1399,7 +1767,10 @@ void RenderD3D11(std::uintptr_t exeBase, std::uintptr_t d3dRender) {
     ::LeaveCriticalSection(cs);
 }
 
-void RenderD3D12(std::uintptr_t exeBase, std::uintptr_t d3dRender) {
+void RenderD3D12(std::uintptr_t exeBase,
+                 std::uintptr_t d3dRender,
+                 bool drawConsole,
+                 const peer_beacon::VideoMarkFrame& markFrame) {
     if (*reinterpret_cast<const std::uint8_t*>(d3dRender + mhw::kOffD3DOccludedByte) != 0) return;
     if (*reinterpret_cast<const std::uint32_t*>(d3dRender + mhw::kOffD3DSwapChainCount) == 0U) return;
 
@@ -1438,35 +1809,52 @@ void RenderD3D12(std::uintptr_t exeBase, std::uintptr_t d3dRender) {
     const UINT bbW = static_cast<UINT>(bbDesc.Width);
     const UINT bbH = bbDesc.Height;
 
+    std::uint32_t hdrMode = 0U;
+    float targetNits = 200.0f;
+    ResolveHdrModeSEH(exeBase, rtvFmt, hdrMode, targetNits);
+
+    bool willDrawMark = markFrame.active && g_d3d12.ensureMark(dev, rtvFmt);
+    MarkCbData cbAdd{}, cbSub{};
+    if (willDrawMark) {
+        float epsB = 0.0f, redRatio = 0.0f, ignPulse = 0.0f;
+        ComputeMarkParams(hdrMode, markFrame.debugVisible, epsB, redRatio, ignPulse);
+        PackMarkBuffers(markFrame, epsB, redRatio, ignPulse, cbAdd, cbSub);
+    }
+
     float sc = 1.0f;
     UINT ox = 0U, oy = 0U, pw = 0U, ph = 0U;
-    ComputePanelLayout(bbW, bbH, sc, ox, oy, pw, ph);
-
-    bool newTex = false;
-    if (pw > 0U && ph > 0U && g_d3d12.ensure(dev, rtvFmt, pw, ph, newTex)) {
-        bool needUpload = false;
-        bool needClamp  = false;
-        std::size_t clampMax = 0U;
-        {
-            std::lock_guard<std::mutex> uiLk(g_uiMx);
-            const bool dirty = g_gdi.updateIfDirty(bbW, bbH, ox, oy, pw, ph, sc,
-                                                   needClamp, clampMax);
-            needUpload = (dirty || newTex) && (g_gdi.bits != nullptr);
-            if (needUpload) {
-                g_d3d12.waitForIdle();
-                const auto* srcRows = static_cast<const std::uint8_t*>(g_gdi.bits);
-                auto* dstRows       = static_cast<std::uint8_t*>(g_d3d12.uploadMapped);
-                const std::size_t rowBytes = static_cast<std::size_t>(pw) * 4U;
-                for (UINT y = 0U; y < ph; ++y) {
-                    std::memcpy(dstRows + static_cast<std::size_t>(y) * g_d3d12.uploadPitch,
-                                srcRows + static_cast<std::size_t>(y) * rowBytes, rowBytes);
+    bool willDrawConsole = false;
+    bool needUpload = false;
+    if (drawConsole) {
+        ComputePanelLayout(bbW, bbH, sc, ox, oy, pw, ph);
+        bool newTex = false;
+        if (pw > 0U && ph > 0U && g_d3d12.ensureConsole(dev, rtvFmt, pw, ph, newTex)) {
+            bool needClamp = false;
+            std::size_t clampMax = 0U;
+            {
+                std::lock_guard<std::mutex> uiLk(g_uiMx);
+                const bool dirty = g_gdi.updateIfDirty(bbW, bbH, ox, oy, pw, ph, sc,
+                                                       needClamp, clampMax);
+                needUpload = (dirty || newTex) && (g_gdi.bits != nullptr);
+                if (needUpload) {
+                    g_d3d12.waitForIdle();
+                    const auto* srcRows = static_cast<const std::uint8_t*>(g_gdi.bits);
+                    auto* dstRows       = static_cast<std::uint8_t*>(g_d3d12.uploadMapped);
+                    const std::size_t rowBytes = static_cast<std::size_t>(pw) * 4U;
+                    for (UINT y = 0U; y < ph; ++y) {
+                        std::memcpy(dstRows + static_cast<std::size_t>(y) * g_d3d12.uploadPitch,
+                                    srcRows + static_cast<std::size_t>(y) * rowBytes, rowBytes);
+                    }
                 }
             }
+            if (needClamp) {
+                console::ClampScrollOffset(clampMax);
+            }
+            willDrawConsole = true;
         }
-        if (needClamp) {
-            console::ClampScrollOffset(clampMax);
-        }
+    }
 
+    if (willDrawMark || willDrawConsole) {
         const std::uint32_t curSlot = g_d3d12.slotIndex;
         g_d3d12.slotIndex = (curSlot + 1U) & 3U;
         if (g_d3d12.slotFence[curSlot] > 0ULL &&
@@ -1476,7 +1864,7 @@ void RenderD3D12(std::uintptr_t exeBase, std::uintptr_t d3dRender) {
         }
 
         ID3D12CommandAllocator* alloc = g_d3d12.allocs[curSlot];
-        if (SUCCEEDED(alloc->Reset()) && SUCCEEDED(g_d3d12.cmdList->Reset(alloc, g_d3d12.pso))) {
+        if (SUCCEEDED(alloc->Reset()) && SUCCEEDED(g_d3d12.cmdList->Reset(alloc, nullptr))) {
             auto makeBarrier = [](ID3D12Resource* res, D3D12_RESOURCE_STATES before,
                                   D3D12_RESOURCE_STATES after) noexcept -> D3D12_RESOURCE_BARRIER {
                 D3D12_RESOURCE_BARRIER b{};
@@ -1488,7 +1876,7 @@ void RenderD3D12(std::uintptr_t exeBase, std::uintptr_t d3dRender) {
                 return b;
             };
 
-            if (needUpload) {
+            if (willDrawConsole && needUpload) {
                 const D3D12_RESOURCE_BARRIER bTexIn = makeBarrier(
                     g_d3d12.tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
                 g_d3d12.cmdList->ResourceBarrier(1, &bTexIn);
@@ -1514,7 +1902,7 @@ void RenderD3D12(std::uintptr_t exeBase, std::uintptr_t d3dRender) {
             D3D12_RESOURCE_BARRIER bIn[2]{};
             UINT nIn = 0U;
             bIn[nIn++] = makeBarrier(backBuf, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            if (needUpload) {
+            if (willDrawConsole && needUpload) {
                 bIn[nIn++] = makeBarrier(g_d3d12.tex, D3D12_RESOURCE_STATE_COPY_DEST,
                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             }
@@ -1528,25 +1916,45 @@ void RenderD3D12(std::uintptr_t exeBase, std::uintptr_t d3dRender) {
             const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<FLOAT>(bbW), static_cast<FLOAT>(bbH), 0.0f, 1.0f};
             const D3D12_RECT scRect{0, 0, static_cast<LONG>(bbW), static_cast<LONG>(bbH)};
 
-            ConsoleConstants cbData{};
-            cbData.panelOriginX = static_cast<float>(ox);
-            cbData.panelOriginY = static_cast<float>(oy);
-            cbData.panelW       = static_cast<float>(pw);
-            cbData.panelH       = static_cast<float>(ph);
-            cbData.invBbW       = 1.0f / static_cast<float>(bbW);
-            cbData.invBbH       = 1.0f / static_cast<float>(bbH);
-            ResolveHdrModeSEH(exeBase, rtvFmt, cbData.hdrMode, cbData.targetNits);
-
-            ID3D12DescriptorHeap* heaps[1] = {g_d3d12.srvHeap};
             g_d3d12.cmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
             g_d3d12.cmdList->RSSetViewports(1, &vp);
             g_d3d12.cmdList->RSSetScissorRects(1, &scRect);
-            g_d3d12.cmdList->SetDescriptorHeaps(1, heaps);
-            g_d3d12.cmdList->SetGraphicsRootSignature(g_d3d12.rootSig);
-            g_d3d12.cmdList->SetGraphicsRoot32BitConstants(0, sizeof(ConsoleConstants) / 4U, &cbData, 0U);
-            g_d3d12.cmdList->SetGraphicsRootDescriptorTable(1, g_d3d12.srvHeap->GetGPUDescriptorHandleForHeapStart());
             g_d3d12.cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            g_d3d12.cmdList->DrawInstanced(6U, 1U, 0U, 0U);
+
+            if (willDrawMark) {
+                const std::size_t slotByteOff = static_cast<std::size_t>(curSlot) * (2U * sizeof(MarkCbData));
+                const D3D12_GPU_VIRTUAL_ADDRESS baseGpuVa = g_d3d12.markCbBuf->GetGPUVirtualAddress() + slotByteOff;
+                g_d3d12.cmdList->SetGraphicsRootSignature(g_d3d12.markRootSig);
+                std::memcpy(g_d3d12.markCbMapped + slotByteOff, &cbAdd, sizeof(cbAdd));
+                g_d3d12.cmdList->SetPipelineState(g_d3d12.psoMarkAdd);
+                g_d3d12.cmdList->SetGraphicsRootConstantBufferView(0, baseGpuVa);
+                g_d3d12.cmdList->DrawInstanced(3U, 1U, 0U, 0U);
+
+                std::memcpy(g_d3d12.markCbMapped + slotByteOff + sizeof(MarkCbData), &cbSub, sizeof(cbSub));
+                g_d3d12.cmdList->SetPipelineState(g_d3d12.psoMarkSub);
+                g_d3d12.cmdList->SetGraphicsRootConstantBufferView(0, baseGpuVa + sizeof(MarkCbData));
+                g_d3d12.cmdList->DrawInstanced(3U, 1U, 0U, 0U);
+            }
+
+            if (willDrawConsole) {
+                ConsoleConstants cbData{};
+                cbData.panelOriginX = static_cast<float>(ox);
+                cbData.panelOriginY = static_cast<float>(oy);
+                cbData.panelW       = static_cast<float>(pw);
+                cbData.panelH       = static_cast<float>(ph);
+                cbData.invBbW       = 1.0f / static_cast<float>(bbW);
+                cbData.invBbH       = 1.0f / static_cast<float>(bbH);
+                cbData.targetNits   = targetNits;
+                cbData.hdrMode      = hdrMode;
+
+                ID3D12DescriptorHeap* heaps[1] = {g_d3d12.srvHeap};
+                g_d3d12.cmdList->SetPipelineState(g_d3d12.pso);
+                g_d3d12.cmdList->SetDescriptorHeaps(1, heaps);
+                g_d3d12.cmdList->SetGraphicsRootSignature(g_d3d12.rootSig);
+                g_d3d12.cmdList->SetGraphicsRoot32BitConstants(0, sizeof(ConsoleConstants) / 4U, &cbData, 0U);
+                g_d3d12.cmdList->SetGraphicsRootDescriptorTable(1, g_d3d12.srvHeap->GetGPUDescriptorHandleForHeapStart());
+                g_d3d12.cmdList->DrawInstanced(6U, 1U, 0U, 0U);
+            }
 
             const D3D12_RESOURCE_BARRIER bOut = makeBarrier(
                 backBuf, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
@@ -1603,11 +2011,15 @@ bool ClientToLocalPanel(void* hwndVoid, int clientX, int clientY,
 } // namespace
 
 void OnPresent(std::uintptr_t exeBase, std::uintptr_t d3dRender) noexcept {
-    if (!exeBase || !d3dRender || !console::IsOpen()) return;
+    if (!exeBase || !d3dRender) return;
+    const bool drawConsole = console::IsOpen();
+    peer_beacon::VideoMarkFrame markFrame{};
+    const bool drawMark = peer_beacon::GetCurrentVideoMarkFrame(markFrame);
+    if (!drawConsole && !drawMark) return;
     if (IsDx12ActiveSEH(exeBase)) {
-        RenderD3D12(exeBase, d3dRender);
+        RenderD3D12(exeBase, d3dRender, drawConsole, markFrame);
     } else {
-        RenderD3D11(exeBase, d3dRender);
+        RenderD3D11(exeBase, d3dRender, drawConsole, markFrame);
     }
 }
 
@@ -1870,9 +2282,12 @@ void Shutdown() noexcept {
     }
     g_d3d12.release();
     g_d3d11.release();
-    if (g_psBlob) { g_psBlob->Release(); g_psBlob = nullptr; }
-    if (g_vsBlob) { g_vsBlob->Release(); g_vsBlob = nullptr; }
-    g_shaderTried = false;
+    if (g_markPsBlob) { g_markPsBlob->Release(); g_markPsBlob = nullptr; }
+    if (g_markVsBlob) { g_markVsBlob->Release(); g_markVsBlob = nullptr; }
+    if (g_psBlob)     { g_psBlob->Release();     g_psBlob = nullptr; }
+    if (g_vsBlob)     { g_vsBlob->Release();     g_vsBlob = nullptr; }
+    g_markShaderTried = false;
+    g_shaderTried     = false;
 }
 
 } // namespace console_overlay

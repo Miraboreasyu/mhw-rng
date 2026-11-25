@@ -3,6 +3,7 @@
 #endif
 #include "plugin_host.h"
 #include "log_config.h"
+#include "peer_beacon.h"
 #include "rng_engine.h"
 
 #include <windows.h>
@@ -549,6 +550,7 @@ void UnloadByIdLifecycleLocked(MhwRngPluginId targetId) {
         _mm_pause();
     }
     rng::ClearRulesByOwner(p.id);
+    peer_beacon::ClearTainted(p.id);
 
     // 3. Notify plugin & unmap shadow DLL
     InvokePluginShutdownSEH(p.shutdownFn);

@@ -741,3 +741,534 @@ bool RunSuite_PluginNames(TestEnv& env) {
     return true;
 }
 
+bool RunSuite_KernelBeacon(TestEnv& env) {
+    const auto base = env.base;
+    auto&      cfg  = env.cfg;
+
+    // 2. Codec round-trip across full alphabet, uniform 27-bit distribution, & 100k noise false-positive rejection
+    {
+        const std::string alpha = "abcdefghijklmnopqrstuvwxyz_0123456789,";
+        for (std::size_t i = 0; i < alpha.size(); ++i) {
+            std::uint8_t sym = 0U;
+            if (!peer_beacon::EncodeSymbolChar(alpha[i], sym)) {
+                std::printf("FAIL [Codec-Alpha]: encode failed for '%c'\n", alpha[i]);
+                return false;
+            }
+            char back = '\0';
+            if (!peer_beacon::DecodeSymbolChar(sym, back) || back != alpha[i]) {
+                std::printf("FAIL [Codec-Alpha]: decode mismatch for '%c'\n", alpha[i]);
+                return false;
+            }
+            const std::uint32_t s27 = peer_beacon::PackFrame27(static_cast<std::uint8_t>(i & 31U),
+                                                               static_cast<std::uint8_t>(i & 3U),
+                                                               static_cast<std::uint8_t>(i),
+                                                               sym);
+            std::uint8_t g = 0U, p = 0U, s = 0U;
+            if (s27 == 0U || s27 > 0x07FFFFFFU || !peer_beacon::UnpackFrame27(s27, g, p, s) ||
+                g != (i & 3U) || p != i || s != sym) {
+                std::printf("FAIL [Codec-RoundTrip]: idx=%zu s27=0x%X\n", i, s27);
+                return false;
+            }
+        }
+        // kSymEnd round-trip
+        {
+            const std::uint32_t endFrame = peer_beacon::PackFrame27(17U, 2U, 15U, peer_beacon::kSymEnd);
+            std::uint8_t g = 0U, p = 0U, s = 0U;
+            if (!peer_beacon::UnpackFrame27(endFrame, g, p, s) || g != 2U || p != 15U || s != peer_beacon::kSymEnd) {
+                std::printf("FAIL [Codec-End]: end frame round-trip failed\n");
+                return false;
+            }
+        }
+        // Uniformity check on all 27 bits across 10k SplitMix samples
+        std::uint32_t bitOnes[27]{};
+        std::uint64_t rngState = 0x123456789ABCDEF0ULL;
+        for (int i = 0; i < 10000; ++i) {
+            rngState += 0x9E3779B97F4A7C15ULL;
+            std::uint64_t z = rngState;
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+            z ^= z >> 31;
+            const auto nonce = static_cast<std::uint8_t>((z >> 11) & 0x1FU);
+            const auto gen   = static_cast<std::uint8_t>(z & 0x03U);
+            const auto pos   = static_cast<std::uint8_t>((z >> 2) & 0x3FU);
+            const auto sym   = static_cast<std::uint8_t>((z >> 16) % (peer_beacon::kSymEnd + 1U));
+            const std::uint32_t f = peer_beacon::PackFrame27(nonce, gen, pos, sym);
+            for (int b = 0; b < 27; ++b) {
+                if ((f & (1U << b)) != 0U) ++bitOnes[b];
+            }
+        }
+        for (int b = 0; b < 27; ++b) {
+            if (bitOnes[b] < 4500U || bitOnes[b] > 5500U) {
+                std::printf("FAIL [Codec-Bias]: bit %d ones=%u/10000\n", b, bitOnes[b]);
+                return false;
+            }
+        }
+    }
+
+    // 3. End-to-end synthetic sPlayer/sMhNetwork + hidden check/self_check + deduplication + stealth tests
+    static std::vector<std::string> g_beaconAlerts;
+    g_beaconAlerts.clear();
+    auto beaconAlertSink = +[](const char* msg) noexcept {
+        if (msg) {
+            g_beaconAlerts.emplace_back(msg);
+            console::PushOutputLine(msg);
+        }
+    };
+
+    // Synthetic sMhNetwork + sPlayer layout inside mapped env.img
+    std::vector<std::uint8_t> fakeNet(0x60000U, 0U);
+    std::vector<std::uint8_t> fakeSessionObj0(0x20U, 0U);
+    std::vector<std::uint8_t> fakeSessionInner(0xC020U, 0U);
+    fakeSessionInner[mhw::kOffNetSessionOnlineByte] = 1U;
+    *reinterpret_cast<std::uintptr_t*>(fakeSessionObj0.data() + mhw::kOffNetSessionInner) =
+        reinterpret_cast<std::uintptr_t>(fakeSessionInner.data());
+    *reinterpret_cast<std::int32_t*>(fakeNet.data() + mhw::kOffNetActiveMode) = 1;
+    *reinterpret_cast<std::uintptr_t*>(fakeNet.data() + mhw::kOffNetSessionObj0) =
+        reinterpret_cast<std::uintptr_t>(fakeSessionObj0.data());
+    *reinterpret_cast<std::uintptr_t*>(fakeNet.data() + mhw::kOffNetSessionObj1) =
+        reinterpret_cast<std::uintptr_t>(fakeSessionObj0.data());
+    std::snprintf(reinterpret_cast<char*>(fakeNet.data() + mhw::kOffNetQuestNames + 0 * mhw::kStrideNetMemberName),
+                  36, "LocalTester");
+    std::snprintf(reinterpret_cast<char*>(fakeNet.data() + mhw::kOffNetQuestNames + 1 * mhw::kStrideNetMemberName),
+                  36, "TeammateAlice");
+
+    std::vector<std::uint8_t> fakeSPlayer(0xB000U, 0U);
+    std::vector<std::uint8_t> fakeLocalUPlayer(0x9000U, 0U);
+    std::vector<std::uint8_t> fakeRemoteUPlayer(0x9000U, 0U);
+
+    *reinterpret_cast<std::uint32_t*>(fakeLocalUPlayer.data() + mhw::kOffUPlayerFlags)      = 2U;
+    fakeLocalUPlayer[mhw::kOffUPlayerLocalFlags]                                           = 1U;
+    *reinterpret_cast<std::uint32_t*>(fakeRemoteUPlayer.data() + mhw::kOffUPlayerFlags)     = 2U;
+    fakeRemoteUPlayer[mhw::kOffUPlayerLocalFlags]                                          = 0U;
+
+    const auto setPlayerSlot = [&](std::size_t idx, std::uintptr_t ent, std::int32_t qIdx) {
+        std::uint8_t* pInfo = fakeSPlayer.data() + mhw::kOffSPlayerInfoArray + idx * mhw::kStridePlayerInfo;
+        *reinterpret_cast<std::int32_t*>(pInfo + mhw::kOffPlayerInfoQuestIdx) = qIdx;
+        *reinterpret_cast<std::int32_t*>(pInfo + mhw::kOffPlayerInfoLobbyIdx) = -1;
+        *reinterpret_cast<std::uintptr_t*>(pInfo + mhw::kOffPlayerInfoEntity) = ent;
+    };
+    setPlayerSlot(0U, reinterpret_cast<std::uintptr_t>(fakeLocalUPlayer.data()), 0);
+    setPlayerSlot(1U, reinterpret_cast<std::uintptr_t>(fakeRemoteUPlayer.data()), 1);
+    // Inject a dangling invalid entity pointer into inactive slot 2 (qIdx=-1, lIdx=-1)
+    // to prove CollectPlayers per-slot SEH guard never aborts slots 0/1!
+    {
+        std::uint8_t* badSlot = fakeSPlayer.data() + mhw::kOffSPlayerInfoArray + 2U * mhw::kStridePlayerInfo;
+        *reinterpret_cast<std::int32_t*>(badSlot + mhw::kOffPlayerInfoQuestIdx) = -1;
+        *reinterpret_cast<std::int32_t*>(badSlot + mhw::kOffPlayerInfoLobbyIdx) = -1;
+        *reinterpret_cast<std::uintptr_t*>(badSlot + mhw::kOffPlayerInfoEntity) = 0x0000000012345670ULL;
+    }
+
+    auto cleanupSynth = [&]() {
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerInstance)    = 0ULL;
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerRoot)        = 0ULL;
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerFallback)    = 0ULL;
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSQuestInstance)     = 0ULL;
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSMhNetworkInstance) = 0ULL;
+        peer_beacon::SetVideoMarkDebugVisible(false);
+        peer_beacon::Init(true, false, nullptr);
+        cfg.checkEnabled     = true;
+        cfg.selfCheckEnabled = false;
+        MhwRng_SetLanguage("zh");
+        cmd_router::Init(&cfg, &CaptureChatSink);
+    };
+
+    *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerInstance) =
+        reinterpret_cast<std::uintptr_t>(fakeSPlayer.data());
+    *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSMhNetworkInstance) =
+        reinterpret_cast<std::uintptr_t>(fakeNet.data());
+
+    // Default state: check = ON, self_check = OFF
+    peer_beacon::Init(true, false, beaconAlertSink);
+    if (!peer_beacon::IsCheckEnabled() || peer_beacon::IsSelfCheckEnabled()) {
+        cleanupSynth();
+        std::printf("FAIL [Beacon-Defaults]: unexpected default flags\n");
+        return false;
+    }
+
+    // 100,000 random noise 27-bit values must produce ZERO false detections
+    {
+        std::uint64_t nst = 0xDEADBEEFCAFE1234ULL;
+        for (int i = 0; i < 100000; ++i) {
+            nst = nst * 6364136223846793005ULL + 1442695040888963407ULL;
+            const std::uint32_t r27 = static_cast<std::uint32_t>((nst >> 37) & 0x07FFFFFFU);
+            *reinterpret_cast<std::uint32_t*>(fakeRemoteUPlayer.data() + mhw::kOffUPlayerSeed27) =
+                (r27 == 0U) ? 1U : r27;
+            peer_beacon::TickOnMainThread(base);
+        }
+        if (!g_beaconAlerts.empty()) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-Noise]: false positive count=%zu ('%s')\n",
+                        g_beaconAlerts.size(), g_beaconAlerts[0].c_str());
+            return false;
+        }
+    }
+
+    // Test hidden `self_check` + live emission from RVA 0x01F606D6 + end-tag deduplication
+    {
+        console::Reset();
+        console::Init(&cfg);
+        cmd_router::Init(&cfg, &CaptureChatSink);
+        g_capturedChatLines.clear();
+        if (!cmd_router::HandleCommandLine("$rng lang en", true) ||
+            !cmd_router::HandleCommandLine("$rng self_check on", true) ||
+            !peer_beacon::IsSelfCheckEnabled()) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-SelfCmd]: `$rng self_check on` failed\n");
+            return false;
+        }
+
+        // Offline solo test: mark net offline and confirm self_check STILL emits & detects!
+        fakeSessionInner[mhw::kOffNetSessionOnlineByte] = 0U;
+        peer_beacon::TickOnMainThread(base); // establish baseline local player ptr
+
+        // Taint two plugins (`crit` via `$rng crit random` claiming 0x01F606D6, and `size` directly)
+        const MhwRngHostApi* host = MhwRng_GetHostApi();
+        MhwRngPluginId sizeId = 0U;
+        for (const auto& p : plugin_host::ListLoadedPlugins()) {
+            if (p.shortName == "size") sizeId = p.id;
+        }
+        host->SetEngineMode(kMhwRngModeSelective);
+        plugin_host::DispatchPluginSubcommand("crit", {"random"}, "random");
+        peer_beacon::MarkTainted(sizeId);
+
+        static constexpr std::uint8_t kSeedThunk[] = {
+            0x53, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0xD9, 0xFF, 0xD2, 0x48, 0x83, 0xC4, 0x28, 0x5B, 0xC3
+        };
+        std::memcpy(env.thunkMem + 0x280U, kSeedThunk, sizeof(kSeedThunk));
+        ::FlushInstructionCache(::GetCurrentProcess(), env.thunkMem + 0x280U, sizeof(kSeedThunk));
+        using SeedCallFn = void(__fastcall*)(void* player, void* addr);
+        const auto fnSeedCall = reinterpret_cast<SeedCallFn>(env.thunkMem + 0x280U);
+        const std::uint8_t origEnd = env.img[0x01F606EFU];
+        env.img[0x01F606EFU] = 0xC3;
+        ::FlushInstructionCache(::GetCurrentProcess(), env.img + 0x01F606EFU, 1);
+
+        g_beaconAlerts.clear();
+        for (int step = 0; step < 60; ++step) {
+            fnSeedCall(fakeLocalUPlayer.data(), env.img + 0x01F606C1U);
+            peer_beacon::TickOnMainThread(base);
+        }
+
+        env.img[0x01F606EFU] = origEnd;
+        ::FlushInstructionCache(::GetCurrentProcess(), env.img + 0x01F606EFU, 1);
+        plugin_host::DispatchPluginSubcommand("crit", {"off"}, "off");
+
+        if (g_beaconAlerts.size() != 1U ||
+            g_beaconAlerts[0].find("LocalTester") == std::string::npos ||
+            g_beaconAlerts[0].find("crit,size") == std::string::npos ||
+            g_beaconAlerts[0].find("SelfCheck") == std::string::npos) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-SelfEmit]: alerts=%zu first='%s'\n",
+                        g_beaconAlerts.size(), g_beaconAlerts.empty() ? "" : g_beaconAlerts[0].c_str());
+            return false;
+        }
+
+        // Verify `self_check status` and `check status` in EN (no CJK) & ZH
+        g_capturedChatLines.clear();
+        if (!cmd_router::HandleCommandLine("$rng self_check status", true) ||
+            !cmd_router::HandleCommandLine("$rng check status", true) ||
+            g_capturedChatLines.size() < 2U ||
+            g_capturedChatLines[0].find("TX:") == std::string::npos ||
+            g_capturedChatLines[0].find("crit,size") == std::string::npos ||
+            g_capturedChatLines[0].find("Local:OK") == std::string::npos) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-StatusDiagEn]: lines=%zu first='%s'\n",
+                        g_capturedChatLines.size(), g_capturedChatLines.empty() ? "" : g_capturedChatLines[0].c_str());
+            return false;
+        }
+        cmd_router::HandleCommandLine("$rng lang zh", true);
+        g_capturedChatLines.clear();
+        cmd_router::HandleCommandLine("$rng self_check status", true);
+        if (g_capturedChatLines.empty() || g_capturedChatLines[0].find("crit,size") == std::string::npos) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-StatusDiagZh]: missing active taint in zh status\n");
+            return false;
+        }
+        cmd_router::HandleCommandLine("$rng lang en", true);
+
+        // Verify local player fallback via `sPlayerRoot` when `sPlayerInstance` is null
+        std::vector<std::uint8_t> fakeRoot(0x80U, 0U);
+        *reinterpret_cast<std::uintptr_t*>(fakeRoot.data() + mhw::kOffPlayerRootEntity) =
+            reinterpret_cast<std::uintptr_t>(fakeLocalUPlayer.data());
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerInstance) = 0ULL;
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerRoot)     =
+            reinterpret_cast<std::uintptr_t>(fakeRoot.data());
+        peer_beacon::TickOnMainThread(base);
+        const peer_beacon::DiagSnapshot rootDiag = peer_beacon::GetDiagSnapshot();
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerRoot)     = 0ULL;
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerInstance) =
+            reinterpret_cast<std::uintptr_t>(fakeSPlayer.data());
+        if (!rootDiag.localFound) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-RootFallback]: sPlayerRoot local fallback failed\n");
+            return false;
+        }
+
+        host->ClearAllRules();
+    }
+
+    // Test teammate detection (`check on` vs `check off`) & out-of-order reassembly + dynamic change
+    {
+        fakeSessionInner[mhw::kOffNetSessionOnlineByte] = 1U;
+        peer_beacon::ResetDecoders();
+        g_beaconAlerts.clear();
+
+        const std::string list1 = "crit,thk";
+        const std::uint8_t gen1 = peer_beacon::ComputeListGen2(list1.c_str(), list1.size());
+        // Emit out of order: end first, then odd positions, then even positions (twice to verify no re-spam!)
+        std::vector<std::uint32_t> frames;
+        frames.push_back(peer_beacon::PackFrame27(3U, gen1, static_cast<std::uint8_t>(list1.size()), peer_beacon::kSymEnd));
+        for (std::size_t i = 1U; i < list1.size(); i += 2U) {
+            std::uint8_t sym = 0U;
+            peer_beacon::EncodeSymbolChar(list1[i], sym);
+            frames.push_back(peer_beacon::PackFrame27(static_cast<std::uint8_t>(i & 31U), gen1, static_cast<std::uint8_t>(i), sym));
+        }
+        for (std::size_t i = 0U; i < list1.size(); i += 2U) {
+            std::uint8_t sym = 0U;
+            peer_beacon::EncodeSymbolChar(list1[i], sym);
+            frames.push_back(peer_beacon::PackFrame27(static_cast<std::uint8_t>((i + 7U) & 31U), gen1, static_cast<std::uint8_t>(i), sym));
+        }
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            for (std::uint32_t f : frames) {
+                *reinterpret_cast<std::uint32_t*>(fakeRemoteUPlayer.data() + mhw::kOffUPlayerSeed27) = f;
+                peer_beacon::TickOnMainThread(base);
+            }
+        }
+        if (g_beaconAlerts.size() != 1U ||
+            g_beaconAlerts[0].find("TeammateAlice") == std::string::npos ||
+            g_beaconAlerts[0].find("crit,thk") == std::string::npos) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-Remote]: alerts=%zu first='%s'\n",
+                        g_beaconAlerts.size(), g_beaconAlerts.empty() ? "" : g_beaconAlerts[0].c_str());
+            return false;
+        }
+
+        // Now turn `check off`, change teammate plugin list, and verify NO alert is emitted!
+        cmd_router::HandleCommandLine("$rng check off", true);
+        const std::string list2 = "endemic,thk";
+        const std::uint8_t gen2 = peer_beacon::ComputeListGen2(list2.c_str(), list2.size());
+        for (std::size_t i = 0U; i <= list2.size(); ++i) {
+            std::uint8_t sym = peer_beacon::kSymEnd;
+            if (i < list2.size()) peer_beacon::EncodeSymbolChar(list2[i], sym);
+            *reinterpret_cast<std::uint32_t*>(fakeRemoteUPlayer.data() + mhw::kOffUPlayerSeed27) =
+                peer_beacon::PackFrame27(static_cast<std::uint8_t>(i & 31U), gen2, static_cast<std::uint8_t>(i), sym);
+            peer_beacon::TickOnMainThread(base);
+        }
+        if (g_beaconAlerts.size() != 1U) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-CheckOff]: expected suppressed alert when check off (got %zu)\n", g_beaconAlerts.size());
+            return false;
+        }
+    }
+
+    // 3b. Synthetic sQuest boundary & in-place restart reset (without clearing spawn-time taint!)
+    {
+        std::vector<std::uint8_t> fakeQuest(0x14000U, 0U);
+        auto setFakeQuest = [&](bool inQ, std::uint32_t qid, std::int32_t elapsed) {
+            *reinterpret_cast<std::uint32_t*>(fakeQuest.data() + mhw::kOffQuestState)        = inQ ? 2U : 0U;
+            *reinterpret_cast<std::uint32_t*>(fakeQuest.data() + mhw::kOffQuestId)           = qid;
+            *reinterpret_cast<std::uint32_t*>(fakeQuest.data() + mhw::kOffQuestCategory)     = inQ ? 2U : 0U;
+            *reinterpret_cast<std::int32_t*>(fakeQuest.data() + mhw::kOffQuestInitRemTicks)  = 30000;
+            *reinterpret_cast<std::int32_t*>(fakeQuest.data() + mhw::kOffQuestRemTicks)      = 30000 - elapsed;
+        };
+
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSQuestInstance) =
+            reinterpret_cast<std::uintptr_t>(fakeQuest.data());
+        fakeSessionInner[mhw::kOffNetSessionOnlineByte] = 1U;
+        cmd_router::HandleCommandLine("$rng check on", true);
+        peer_beacon::ResetDecoders();
+        g_beaconAlerts.clear();
+
+        // Spawn-time taint (e.g. `size` marked before quest transitions `false -> true`) MUST survive!
+        MhwRngPluginId sizeId = 0U;
+        for (const auto& p : plugin_host::ListLoadedPlugins()) {
+            if (p.shortName == "size") sizeId = p.id;
+        }
+        peer_beacon::MarkTainted(sizeId);
+
+        setFakeQuest(false, 0U, 0);
+        *reinterpret_cast<std::uint32_t*>(fakeRemoteUPlayer.data() + mhw::kOffUPlayerSeed27) = 0U;
+        peer_beacon::TickOnMainThread(base);
+
+        setFakeQuest(true, 101U, 200);
+        peer_beacon::TickOnMainThread(base);
+        if (!peer_beacon::HasAnyTaint() || !peer_beacon::IsVideoMarkActive()) {
+            cleanupSynth();
+            std::printf("FAIL [Quest-TaintKeep]: pre-quest spawn taint wiped on quest entry\n");
+            return false;
+        }
+
+        const std::string qList = "crit,thk";
+        const std::uint8_t qGen = peer_beacon::ComputeListGen2(qList.c_str(), qList.size());
+        auto sendRemoteListOnce = [&]() {
+            for (std::size_t i = 0U; i <= qList.size(); ++i) {
+                std::uint8_t sym = peer_beacon::kSymEnd;
+                if (i < qList.size()) peer_beacon::EncodeSymbolChar(qList[i], sym);
+                *reinterpret_cast<std::uint32_t*>(fakeRemoteUPlayer.data() + mhw::kOffUPlayerSeed27) =
+                    peer_beacon::PackFrame27(static_cast<std::uint8_t>((i + 3U) & 31U), qGen, static_cast<std::uint8_t>(i), sym);
+                peer_beacon::TickOnMainThread(base);
+            }
+        };
+        sendRemoteListOnce();
+        sendRemoteListOnce(); // repeated frames in Quest 1 must NOT re-spam
+        if (g_beaconAlerts.size() != 1U) {
+            cleanupSynth();
+            std::printf("FAIL [Quest-AlertOnce]: expected 1 alert in quest 1, got %zu\n", g_beaconAlerts.size());
+            return false;
+        }
+
+        // Simulated in-place quest restart (elapsed rewinds 200 -> 10 without changing uPlayer*)
+        setFakeQuest(true, 101U, 10);
+        sendRemoteListOnce();
+        if (g_beaconAlerts.size() != 2U) {
+            cleanupSynth();
+            std::printf("FAIL [Quest-Restart]: expected alert again after quest restart, got %zu\n", g_beaconAlerts.size());
+            return false;
+        }
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSQuestInstance) = 0ULL;
+        peer_beacon::ClearAllTaint();
+    }
+
+    // 3c. Deterministic video watermark grid, sinusoidal inversion, CRC-12, and gating checks
+    {
+        peer_beacon::VideoMarkFrame f{};
+        peer_beacon::VideoMarkFrame fFlip{};
+        peer_beacon::VideoMarkFrame fZero{};
+        if (!peer_beacon::BuildVideoMarkFrameAt(0.0625, "crit,thk", false, f) || !f.active ||
+            !peer_beacon::BuildVideoMarkFrameAt(0.1875, "crit,thk", false, fFlip) || !fFlip.active ||
+            peer_beacon::BuildVideoMarkFrameAt(0.125, "crit,thk", false, fZero)) {
+            cleanupSynth();
+            std::printf("FAIL [Wm-Build]: unexpected frame sinusoidal behavior\n");
+            return false;
+        }
+        int pilotCells = 0, ch1Cells = 0, ch2Cells = 0;
+        static constexpr std::uint8_t kChMap[8] = { 0U, 1U, 1U, 2U, 0U, 2U, 2U, 1U };
+        for (std::size_t r = 0U; r < peer_beacon::kWmGridRows; ++r) {
+            for (std::size_t c = 0U; c < peer_beacon::kWmGridCols; ++c) {
+                const std::size_t cid = r * peer_beacon::kWmGridCols + c;
+                const std::uint8_t ch = kChMap[(r * 3U + c) & 7U];
+                if (ch == 0U) ++pilotCells;
+                else if (ch == 1U) ++ch1Cells;
+                else ++ch2Cells;
+
+                const float w0 = f.cellWeights[cid];
+                const float w1 = fFlip.cellWeights[cid];
+                if (std::fabs(std::fabs(w0) - 1.0f) > 1e-4f || std::fabs(w0 + w1) > 1e-4f) {
+                    cleanupSynth();
+                    std::printf("FAIL [Wm-CellWeight]: cid=%zu w0=%.5f w1=%.5f\n", cid, w0, w1);
+                    return false;
+                }
+            }
+        }
+        if (pilotCells != 48 || ch1Cells != 72 || ch2Cells != 72) {
+            cleanupSynth();
+            std::printf("FAIL [Wm-Channels]: %d/%d/%d (expected 48/72/72)\n", pilotCells, ch1Cells, ch2Cells);
+            return false;
+        }
+
+        // CRC-12 stability & 1-bit error sensitivity across all bits
+        std::uint8_t msgBytes[16]{};
+        for (std::size_t i = 0U; i < 16U; ++i) msgBytes[i] = static_cast<std::uint8_t>((i * 29U + 7U) & 0xFFU);
+        const std::uint16_t baseCrc = peer_beacon::ComputeVideoMarkCrc12(msgBytes, sizeof(msgBytes));
+        if (baseCrc != peer_beacon::ComputeVideoMarkCrc12(msgBytes, sizeof(msgBytes))) {
+            cleanupSynth();
+            std::printf("FAIL [Wm-CrcStable]: CRC-12 unstable\n");
+            return false;
+        }
+        for (std::size_t bit = 0U; bit < 128U; ++bit) {
+            msgBytes[bit >> 3U] ^= static_cast<std::uint8_t>(1U << (bit & 7U));
+            const std::uint16_t flipCrc = peer_beacon::ComputeVideoMarkCrc12(msgBytes, sizeof(msgBytes));
+            msgBytes[bit >> 3U] ^= static_cast<std::uint8_t>(1U << (bit & 7U));
+            if (flipCrc == baseCrc) {
+                cleanupSynth();
+                std::printf("FAIL [Wm-CrcFlip]: single bit flip %zu undetected\n", bit);
+                return false;
+            }
+        }
+
+        // Gate check: off-scene -> inactive, in-scene untainted -> inactive, in-scene tainted -> active, plus hidden `self_check vis`
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerInstance) = 0ULL;
+        peer_beacon::TickOnMainThread(base);
+        MhwRngPluginId sizeId = 0U;
+        for (const auto& p : plugin_host::ListLoadedPlugins()) {
+            if (p.shortName == "size") sizeId = p.id;
+        }
+        peer_beacon::MarkTainted(sizeId);
+        if (peer_beacon::IsVideoMarkActive()) {
+            cleanupSynth();
+            std::printf("FAIL [Wm-OffScene]: active off-scene\n");
+            return false;
+        }
+        *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerInstance) =
+            reinterpret_cast<std::uintptr_t>(fakeSPlayer.data());
+        peer_beacon::TickOnMainThread(base);
+        peer_beacon::MarkTainted(sizeId);
+        if (!peer_beacon::IsVideoMarkActive()) {
+            cleanupSynth();
+            std::printf("FAIL [Wm-InScene]: expected active in-scene when tainted\n");
+            return false;
+        }
+        peer_beacon::ClearAllTaint();
+        if (peer_beacon::IsVideoMarkActive()) {
+            cleanupSynth();
+            std::printf("FAIL [Wm-Untainted]: expected inactive when untainted\n");
+            return false;
+        }
+
+        if (!cmd_router::HandleCommandLine("$rng self_check vis on", true) || !peer_beacon::IsVideoMarkDebugVisible() ||
+            !cmd_router::HandleCommandLine("$rng self_check vis off", true) || peer_beacon::IsVideoMarkDebugVisible()) {
+            cleanupSynth();
+            std::printf("FAIL [Wm-VisCmd]: self_check vis toggle failed\n");
+            return false;
+        }
+    }
+
+    // 4. Verify stealth guarantees: ZERO Tab completion & ZERO `$rng help` / `$rng status` mentions
+    {
+        console::Reset();
+        console::Init(&cfg);
+        console::ToggleOpen();
+        const char* prefixes[] = { "c", "ch", "che", "check", "s", "se", "sel", "self", "self_" };
+        for (const char* pref : prefixes) {
+            console::OnKeyDown('U', true, false, false);
+            console::InsertUtf8(pref);
+            for (int tab = 0; tab < 6; ++tab) {
+                console::OnKeyDown(VK_TAB, false, false, false);
+                console::ConsoleSnapshot snap{};
+                console::CaptureSnapshot(0U, snap);
+                if (snap.inputLine.find("check") != std::string::npos && std::string(pref) != "check") {
+                    cleanupSynth();
+                    std::printf("FAIL [Beacon-StealthTab]: prefix '%s' tab-completed to '%s'\n",
+                                pref, snap.inputLine.c_str());
+                    return false;
+                }
+                if (snap.completionHint.find("check") != std::string::npos) {
+                    cleanupSynth();
+                    std::printf("FAIL [Beacon-StealthHint]: prefix '%s' hint leaked '%s'\n",
+                                pref, snap.completionHint.c_str());
+                    return false;
+                }
+            }
+        }
+        console::OnKeyDown(VK_ESCAPE, false, false, false);
+
+        g_capturedChatLines.clear();
+        cmd_router::HandleCommandLine("$rng help", true);
+        cmd_router::HandleCommandLine("$rng help check", true);
+        cmd_router::HandleCommandLine("$rng help self_check", true);
+        cmd_router::HandleCommandLine("$rng status", true);
+        for (const auto& l : g_capturedChatLines) {
+            const bool isNotFound = (l.find("No subcommand") != std::string::npos ||
+                                     l.find(u8"\u672a\u627e\u5230") != std::string::npos);
+            if (!isNotFound && (l.find("self_check") != std::string::npos || l.find("check") != std::string::npos)) {
+                cleanupSynth();
+                std::printf("FAIL [Beacon-StealthHelp]: leaked in help/status output: '%s'\n", l.c_str());
+                return false;
+            }
+        }
+    }
+
+    cleanupSynth();
+    std::printf("[OK] Test 27: Hidden check/self_check, seed27 beacon & stealth checks verified!\n");
+    return true;
+}
+

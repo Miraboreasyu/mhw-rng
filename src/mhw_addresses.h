@@ -220,4 +220,41 @@ constexpr std::size_t kOffD3DSwapChain11            = 0x1488;    // IDXGISwapCha
 constexpr std::size_t kOffD3DSwapChainCount         = 0x14A0;    // uint32_t
 constexpr std::size_t kOffD3DPresentLock            = 0x1620;    // CRITICAL_SECTION
 
+// ---- Action Seed Call Site, sPlayer, sQuest & sMhNetwork (15.23) ----
+constexpr std::uint32_t  kRvaCritSeedSite           = 0x01F606D6U; // action-start CALL MtRandom::nrand return RVA
+constexpr std::uintptr_t kRvaSPlayerInstance        = 0x0500ECA0U; // sPlayer*
+constexpr std::uintptr_t kRvaSPlayerFallback        = 0x0500CDA0U; // sPlayer* fallback root
+constexpr std::uintptr_t kRvaSQuestInstance         = 0x0500ED30U; // sQuest*
+constexpr std::size_t    kOffQuestState             = 0x00038U;    // uint32_t (`(state - 2) <= 10`)
+constexpr std::size_t    kOffQuestId                = 0x0004CU;    // uint32_t
+constexpr std::size_t    kOffQuestCategory          = 0x00054U;    // uint32_t (`>= 2` when in quest)
+constexpr std::size_t    kOffQuestRemTicks          = 0x13180U;    // int32_t
+constexpr std::size_t    kOffQuestUnlimTicks        = 0x13184U;    // int32_t
+constexpr std::size_t    kOffQuestInitRemTicks      = 0x13194U;    // int32_t
+constexpr std::size_t    kOffSPlayerFallbackLocal   = 0x80U;       // -> local uPlayer*
+constexpr std::size_t    kOffSPlayerInfoArray       = 0x40U;
+constexpr std::size_t    kStridePlayerInfo          = 0x740U;
+constexpr std::size_t    kMaxPlayerInfoSlots        = 24U;
+constexpr std::size_t    kOffPlayerInfoUid          = 0x08U;
+constexpr std::size_t    kOffPlayerInfoQuestIdx     = 0x10U;
+constexpr std::size_t    kOffPlayerInfoLobbyIdx     = 0x14U;
+constexpr std::size_t    kOffPlayerInfoEntity       = 0x18U;
+constexpr std::size_t    kOffSPlayerLocalUid        = 0xAE40U;
+constexpr std::size_t    kOffSPlayerGlobalArray     = 0xAE48U;
+constexpr std::size_t    kOffSPlayerGlobalCount     = 0xAEC8U;
+constexpr std::size_t    kOffUPlayerFlags           = 0x0CU;       // live when (flags & 0x0EU) != 0
+constexpr std::size_t    kOffUPlayerSeed27          = 0x8818U;     // uint32_t (lower 27 bits)
+constexpr std::size_t    kOffUPlayerLocalFlags      = 0x8938U;     // uint8_t (bit 0 == 1 -> local player)
+
+constexpr std::uintptr_t kRvaSMhNetworkInstance     = 0x051C46B8U; // sMhNetwork*
+constexpr std::size_t    kOffNetSessionObj0         = 0x258U;
+constexpr std::size_t    kOffNetSessionObj1         = 0x260U;
+constexpr std::size_t    kOffNetSessionInner        = 0x10U;
+constexpr std::size_t    kOffNetSessionOnlineByte   = 0xBFF0U;
+constexpr std::size_t    kOffNetActiveMode          = 0x549BCU;
+constexpr std::size_t    kOffNetQuestNames          = 0x54E60U;
+constexpr std::size_t    kOffNetLobbyNames          = 0x54F00U;
+constexpr std::size_t    kStrideNetMemberName       = 0x28U;
+constexpr std::size_t    kMaxNetMemberNameBytes     = 35U;
+
 } // namespace mhw

@@ -4,6 +4,7 @@
 #include "command_router.h"
 #include "mhw_addresses.h"
 #include "mhw_rng_api.h"
+#include "peer_beacon.h"
 #include "plugin_host.h"
 #include "rng_engine.h"
 
@@ -796,6 +797,92 @@ bool HandleCommandLineInternal(const char* rawLine, bool requirePrefix, int exec
             NotifyChatFmt(en ? "[RNG] 0x%07X [Cond:%llu] -> CustomSeed %llu"
                              : u8"[RNG] 0x%07X [Cond:%llu] -> 独立种子 %llu",
                           rva, static_cast<unsigned long long>(cid), static_cast<unsigned long long>(val));
+        }
+        return true;
+    }
+
+    // Hidden toggle commands (intentionally omitted from help & tab-completion)
+    if (sub == "check" || sub == "self_check") {
+        const bool isSelf = (sub == "self_check");
+        if (isSelf && toks.size() >= 2U && LowerAscii(toks[1]) == "vis") {
+            bool curVis = peer_beacon::IsVideoMarkDebugVisible();
+            if (toks.size() >= 3U) {
+                const std::string opt = LowerAscii(toks[2]);
+                bool next = curVis;
+                if (opt == "status" || opt == "stat") {
+                    // query only
+                } else if (opt == "on" || opt == "1" || opt == "true" || opt == "enable") {
+                    next = true;
+                } else if (opt == "off" || opt == "0" || opt == "false" || opt == "disable") {
+                    next = false;
+                } else if (opt == "toggle") {
+                    next = !curVis;
+                } else {
+                    NotifyChatFmt(en ? "[RNG] Invalid argument `%s` (use on/off/status)"
+                                     : u8"[RNG] 无效参数 `%s` (可用 on/off/status)",
+                                  toks[2].c_str());
+                    return true;
+                }
+                peer_beacon::SetVideoMarkDebugVisible(next);
+                curVis = next;
+            }
+            NotifyChatFmt(en ? "[RNG] self_check vis: %s" : u8"[RNG] self_check vis: %s",
+                          curVis ? (en ? "ON" : u8"开启") : (en ? "OFF" : u8"关闭"));
+            return true;
+        }
+        bool cur = isSelf ? peer_beacon::IsSelfCheckEnabled() : peer_beacon::IsCheckEnabled();
+        bool isQuery = (toks.size() < 2U);
+        if (toks.size() >= 2U) {
+            const std::string opt = LowerAscii(toks[1]);
+            bool next = cur;
+            if (opt == "status" || opt == "stat") {
+                isQuery = true;
+            } else if (opt == "on" || opt == "1" || opt == "true" || opt == "enable") {
+                next = true;
+            } else if (opt == "off" || opt == "0" || opt == "false" || opt == "disable") {
+                next = false;
+            } else if (opt == "toggle") {
+                next = !cur;
+            } else {
+                NotifyChatFmt(en ? "[RNG] Invalid argument `%s` (use on/off/status)"
+                                 : u8"[RNG] 无效参数 `%s` (可用 on/off/status)",
+                              toks[1].c_str());
+                return true;
+            }
+            if (!isQuery) {
+                if (isSelf) {
+                    if (next != cur) peer_beacon::ResetDecoders();
+                    peer_beacon::SetSelfCheckEnabled(next);
+                    if (g_cfg) g_cfg->selfCheckEnabled = next;
+                } else {
+                    if (next != cur) peer_beacon::ResetDecoders();
+                    peer_beacon::SetCheckEnabled(next);
+                    if (g_cfg) g_cfg->checkEnabled = next;
+                }
+                cur = next;
+            }
+        }
+        if (isSelf && isQuery) {
+            const peer_beacon::DiagSnapshot diag = peer_beacon::GetDiagSnapshot();
+            if (en) {
+                NotifyChatFmt("[RNG] self_check: %s | Taint: %s | TX:%u RX:%u | Local:%s",
+                              cur ? "ON" : "OFF",
+                              diag.activeTaint.empty() ? "none (no RNG override fired yet)" : diag.activeTaint.c_str(),
+                              diag.txFrames,
+                              diag.rxLocalFrames,
+                              diag.localFound ? "OK" : "NONE");
+            } else {
+                NotifyChatFmt(u8"[RNG] self_check: %s | 活跃污点: %s | 发帧:%u 收帧:%u | 本地实体:%s",
+                              cur ? u8"开启" : u8"关闭",
+                              diag.activeTaint.empty() ? u8"无(尚无插件触发RNG改写)" : diag.activeTaint.c_str(),
+                              diag.txFrames,
+                              diag.rxLocalFrames,
+                              diag.localFound ? u8"正常" : u8"无");
+            }
+        } else {
+            NotifyChatFmt(en ? "[RNG] %s: %s" : u8"[RNG] %s: %s",
+                          sub.c_str(),
+                          cur ? (en ? "ON" : u8"开启") : (en ? "OFF" : u8"关闭"));
         }
         return true;
     }

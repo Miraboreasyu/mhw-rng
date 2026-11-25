@@ -41,6 +41,7 @@ cl.exe /nologo /std:c++17 /O2 /MP /W4 /EHsc /MT /utf-8 /D "NOMINMAX" /D "MHW_RNG
     "%SRCDIR%\console_core.cpp" ^
     "%SRCDIR%\hook.cpp" ^
     "%SRCDIR%\log_config.cpp" ^
+    "%SRCDIR%\peer_beacon.cpp" ^
     "%SRCDIR%\plugin_host.cpp" ^
     "%SRCDIR%\rng_engine.cpp" ^
     "%OUTDIR%\rng_trampolines.obj" ^

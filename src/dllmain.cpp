@@ -9,6 +9,7 @@
 #include "log_config.h"
 #include "mhw_addresses.h"
 #include "mhw_rng_api.h"
+#include "peer_beacon.h"
 #include "plugin_host.h"
 #include "rng_engine.h"
 
@@ -132,8 +133,13 @@ wchar_t                     g_pendingHighSurrogate = 0;
 thread_local std::uintptr_t tls_activeSChat    = 0;
 thread_local bool           tls_inChatCmd      = false;
 
+struct AsyncChatItem {
+    char text[256]{};
+    bool forceGameChat = false;
+};
+
 constexpr std::size_t       kAsyncChatCap      = 64U;
-char                        g_asyncChatRing[kAsyncChatCap][256]{};
+AsyncChatItem               g_asyncChatRing[kAsyncChatCap]{};
 std::size_t                 g_asyncChatHead    = 0U;
 std::size_t                 g_asyncChatTail    = 0U;
 std::size_t                 g_asyncChatCount   = 0U;
@@ -148,8 +154,8 @@ inline bool IsValidUserPtr(std::uintptr_t p) noexcept {
     return p >= 0x100000ULL && p <= 0x00007FFFFFFF0000ULL && (p & 0x7ULL) == 0ULL;
 }
 
-bool TryPostChatSystemNoticeSEH(const char* utf8Text) noexcept {
-    if (!g_cfg.showChatFeedback) return true;
+bool TryPostChatSystemNoticeSEH(const char* utf8Text, bool forceGameChat = false) noexcept {
+    if (!forceGameChat && !g_cfg.showChatFeedback) return true;
     if (!g_exeBase || !utf8Text || utf8Text[0] == '\0') return false;
     __try {
         std::uintptr_t sChat = *reinterpret_cast<const std::uintptr_t*>(g_exeBase + mhw::kRvaSChatInstance);
@@ -243,10 +249,7 @@ void NotifyChatFmt(const char* fmt, ...) {
     PostChatSystemNoticeSEH(buf);
 }
 
-void EnqueueAsyncChat(const char* utf8Text) noexcept {
-    if (!utf8Text || utf8Text[0] == '\0') return;
-    console::PushOutputLine(utf8Text);
-    if (!g_cfg.showChatFeedback) return;
+void PushAsyncChatRing(const char* utf8Text, bool forceGameChat) noexcept {
     std::lock_guard<std::mutex> lk(g_asyncChatMx);
     if (g_asyncChatCount >= kAsyncChatCap) {
         g_asyncChatHead = (g_asyncChatHead + 1U) % kAsyncChatCap;
@@ -254,23 +257,38 @@ void EnqueueAsyncChat(const char* utf8Text) noexcept {
     }
     std::size_t n = 0U;
     while (n < 255U && utf8Text[n] != '\0') {
-        g_asyncChatRing[g_asyncChatTail][n] = utf8Text[n];
+        g_asyncChatRing[g_asyncChatTail].text[n] = utf8Text[n];
         ++n;
     }
-    g_asyncChatRing[g_asyncChatTail][n] = '\0';
+    g_asyncChatRing[g_asyncChatTail].text[n] = '\0';
+    g_asyncChatRing[g_asyncChatTail].forceGameChat = forceGameChat;
     g_asyncChatTail = (g_asyncChatTail + 1U) % kAsyncChatCap;
     ++g_asyncChatCount;
     g_asyncChatPending.store(static_cast<std::uint32_t>(g_asyncChatCount), std::memory_order_release);
 }
 
+void EnqueueAsyncChat(const char* utf8Text) noexcept {
+    if (!utf8Text || utf8Text[0] == '\0') return;
+    console::PushOutputLine(utf8Text);
+    if (!g_cfg.showChatFeedback) return;
+    PushAsyncChatRing(utf8Text, false);
+}
+
+void EnqueueForcedAsyncChat(const char* utf8Text) noexcept {
+    if (!utf8Text || utf8Text[0] == '\0') return;
+    app::Log("ui: %s", utf8Text);
+    console::PushOutputLine(utf8Text);
+    PushAsyncChatRing(utf8Text, true);
+}
+
 void DrainAsyncChatOnMainThread(std::uintptr_t sChat, std::uint32_t maxPerTick) noexcept {
-    char msgs[8][256]{};
+    AsyncChatItem msgs[8]{};
     std::uint32_t popped = 0U;
     const std::uint32_t limit = (maxPerTick > 8U) ? 8U : maxPerTick;
     {
         std::lock_guard<std::mutex> lk(g_asyncChatMx);
         while (g_asyncChatCount > 0U && popped < limit) {
-            std::memcpy(msgs[popped], g_asyncChatRing[g_asyncChatHead], 256U);
+            msgs[popped] = g_asyncChatRing[g_asyncChatHead];
             g_asyncChatHead = (g_asyncChatHead + 1U) % kAsyncChatCap;
             --g_asyncChatCount;
             ++popped;
@@ -281,7 +299,7 @@ void DrainAsyncChatOnMainThread(std::uintptr_t sChat, std::uint32_t maxPerTick) 
     const std::uintptr_t prevSChat = tls_activeSChat;
     tls_activeSChat = sChat;
     for (std::uint32_t i = 0U; i < popped; ++i) {
-        (void)TryPostChatSystemNoticeSEH(msgs[i]);
+        (void)TryPostChatSystemNoticeSEH(msgs[i].text, msgs[i].forceGameChat);
     }
     tls_activeSChat = prevSChat;
 }
@@ -408,6 +426,7 @@ void __fastcall Hook_SChatMove(std::uintptr_t sChat) {
     DrainConsoleCommandsOnMainThread(sChat);
     if (!g_kbMoveHooked.load(std::memory_order_acquire) && !g_detaching.load(std::memory_order_relaxed)) {
         plugin_host::DispatchMainThreadTicks();
+        peer_beacon::TickOnMainThread(g_exeBase);
     }
     if (g_startupNoticePending.load(std::memory_order_acquire)) {
         TryFlushStartupNotice(sChat);
@@ -513,6 +532,7 @@ void __fastcall Hook_SKeyboardMove(std::uintptr_t sKb) {
     }
     if (!g_detaching.load(std::memory_order_relaxed)) {
         plugin_host::DispatchMainThreadTicks();
+        peer_beacon::TickOnMainThread(g_exeBase);
     }
     if (!g_cfg.consoleEnabled) return;
 
@@ -1207,8 +1227,10 @@ std::uint64_t __fastcall Hook_Present(std::uintptr_t d3dRender,
                                       std::uint64_t a2,
                                       std::uint64_t a3,
                                       std::uint64_t a4) {
-    if (g_cfg.consoleEnabled && !g_detaching.load(std::memory_order_relaxed)) {
-        DrainConsoleCommandsOnMainThread(0);
+    if (!g_detaching.load(std::memory_order_relaxed)) {
+        if (g_cfg.consoleEnabled) {
+            DrainConsoleCommandsOnMainThread(0);
+        }
         console_overlay::OnPresent(g_exeBase, d3dRender);
     }
 
@@ -1218,7 +1240,8 @@ std::uint64_t __fastcall Hook_Present(std::uintptr_t d3dRender,
 
     // Install WH_KEYBOARD AFTER downstream hooks (e.g. mhw_hfi.dll) on frame 10 so we stay
     // at the head of Windows' LIFO WH_KEYBOARD chain without editing other plugins.
-    if (!g_kbHookInstalled.load(std::memory_order_acquire)) {
+    const bool wantInputHooks = (g_cfg.consoleEnabled || g_cfg.vkToggleTakeover != 0 || g_cfg.vkResetEpoch != 0);
+    if (wantInputHooks && !g_kbHookInstalled.load(std::memory_order_acquire)) {
         if (g_presentHookFrames.fetch_add(1U, std::memory_order_relaxed) + 1U >= 10U) {
             const HWND hwnd = GetSwapWindowSEH(d3dRender);
             DWORD wndTid = hwnd ? ::GetWindowThreadProcessId(hwnd, nullptr) : 0U;
@@ -1359,6 +1382,7 @@ bool TryInstallCoreRngHooks(HMODULE exe, std::uintptr_t& outBase, std::uintptr_t
 
     // Initialize Console Core, Plugin Host & auto-load sub-plugins BEFORE activating UI hooks
     console::Init(&g_cfg);
+    peer_beacon::Init(g_cfg.checkEnabled, g_cfg.selfCheckEnabled, &EnqueueForcedAsyncChat);
     plugin_host::Init(base, end, app::SubPluginDirectory(), &PostChatSystemNoticeSEH, &EnqueueAsyncChat);
     cmd_router::Init(&g_cfg, &PostChatSystemNoticeSEH);
     std::size_t loadedPlugins = 0U;
@@ -1450,7 +1474,6 @@ bool InstallSChatMoveHookWithRetry(std::uintptr_t base, const char* tag) {
 }
 
 void InstallPresentHookWithRetry(std::uintptr_t base, const char* tag) {
-    if (!g_cfg.consoleEnabled && g_cfg.vkToggleTakeover == 0 && g_cfg.vkResetEpoch == 0) return;
     const std::uintptr_t presSite = base + mhw::kRvaD3DPresent;
     char errBuf[192]{};
     for (int retry = 0; retry < 20 && !g_detaching.load(std::memory_order_acquire); ++retry) {

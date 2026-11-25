@@ -58,6 +58,7 @@ cl.exe /nologo /std:c++17 /O2 /GL /GR- ^
     "%SRCDIR%\dllmain.cpp" ^
     "%SRCDIR%\hook.cpp" ^
     "%SRCDIR%\log_config.cpp" ^
+    "%SRCDIR%\peer_beacon.cpp" ^
     "%SRCDIR%\plugin_host.cpp" ^
     "%SRCDIR%\rng_engine.cpp" ^
     "%OUTDIR%\rng_trampolines.obj" ^

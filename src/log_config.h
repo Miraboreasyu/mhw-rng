@@ -26,6 +26,8 @@ struct Config {
     std::uint64_t                  masterSeed       = 12345ULL;
     bool                           consoleEnabled   = true;
     bool                           showChatFeedback = false;
+    bool                           checkEnabled     = true;
+    bool                           selfCheckEnabled = false;
     std::string                    chatPrefix       = "$rng";
     std::string                    language         = "zh";
     std::string                    autoExec;

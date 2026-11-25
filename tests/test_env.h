@@ -13,6 +13,7 @@
 #include "mhw_1523_world.h"
 #include "mhw_world_api.h"
 #include "mhw_catalog_api.h"
+#include "peer_beacon.h"
 #include "plugin_host.h"
 #include "rng_engine.h"
 
@@ -94,3 +95,4 @@ bool RunSuite_PluginEndemicRare(TestEnv& env);
 bool RunSuite_SdkV35(TestEnv& env);
 bool RunSuite_WorldE2E(TestEnv& env);
 bool RunSuite_PluginNames(TestEnv& env);
+bool RunSuite_KernelBeacon(TestEnv& env);

@@ -407,6 +407,10 @@ Config LoadConfig() {
                 cfg.consoleEnabled = ParseBool(val, cfg.consoleEnabled);
             } else if (klow == "showchatfeedback") {
                 cfg.showChatFeedback = ParseBool(val, cfg.showChatFeedback);
+            } else if (klow == "check") {
+                cfg.checkEnabled = ParseBool(val, cfg.checkEnabled);
+            } else if (klow == "selfcheck" || klow == "self_check") {
+                cfg.selfCheckEnabled = ParseBool(val, cfg.selfCheckEnabled);
             } else if (klow == "chatprefix" && !val.empty()) {
                 cfg.chatPrefix = val;
             } else if (klow == "language" || klow == "lang") {

@@ -3,6 +3,7 @@
 #endif
 #include "rng_engine.h"
 #include "mhw_addresses.h"
+#include "peer_beacon.h"
 
 #include <windows.h>
 #include <intrin.h>
@@ -688,6 +689,7 @@ bool RunFilterChain(const RvaHookChain* chain,
             }
             ctx.callFlags |= kMhwRngDrawFlagOverridden;
             ctx.callFlags &= ~kMhwRngDrawFlagBypassed;
+            peer_beacon::MarkTainted(fhe.ownerId);
         } else if (fdec.action == kMhwRngActionReturnFloatBits) {
             outAnyOverrode     = true;
             outReturnFloatBits = true;
@@ -695,6 +697,7 @@ bool RunFilterChain(const RvaHookChain* chain,
             ctx.finalFloat     = BitsToFloat(fdec.value0);
             ctx.callFlags |= kMhwRngDrawFlagOverridden;
             ctx.callFlags &= ~kMhwRngDrawFlagBypassed;
+            peer_beacon::MarkTainted(fhe.ownerId);
         }
     }
     return outAnyOverrode;
@@ -860,6 +863,7 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
         FilterVanilla
     };
     PreOutcome outcome = PreOutcome::UseSlot;
+    MhwRngPluginId preOverrideOwner = kMhwRngPluginIdKernel;
     std::uint32_t filterVanillaMask  = 0U;
     std::uint32_t filterSlotMask     = 0U;
     std::uint32_t executedFilterMask = 0U;
@@ -896,12 +900,16 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
                 if (dec.action == kMhwRngActionClaimCondition) {
                     targetCondId     = dec.condId;
                     ctx.activeCondId = targetCondId;
+                    if (rva == mhw::kRvaCritSeedSite) {
+                        peer_beacon::MarkTainted(he.ownerId);
+                    }
                     recordStaticFilter(i, he);
                     break;
                 }
                 if (dec.action == kMhwRngActionReturnValue) {
                     targetCondId     = dec.condId;
                     ctx.activeCondId = targetCondId;
+                    preOverrideOwner = he.ownerId;
                     preVal0          = dec.value0;
                     preVal1          = dec.value1;
                     outcome          = PreOutcome::DirectValue;
@@ -910,6 +918,7 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
                 if (dec.action == kMhwRngActionReturnFloatBits) {
                     targetCondId     = dec.condId;
                     ctx.activeCondId = targetCondId;
+                    preOverrideOwner = he.ownerId;
                     preVal0          = dec.value0;
                     outcome          = PreOutcome::DirectFloatBits;
                     break;
@@ -917,6 +926,9 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
                 if (dec.action == kMhwRngActionBypass) {
                     targetCondId     = dec.condId;
                     ctx.activeCondId = targetCondId;
+                    if (rva == mhw::kRvaCritSeedSite) {
+                        peer_beacon::ClearTainted(he.ownerId);
+                    }
                     outcome          = PreOutcome::BypassVanilla;
                     break;
                 }
@@ -971,6 +983,7 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
         ctx.finalValue0  = out.val0;
         ctx.finalValue1  = out.val1;
         ctx.finalFloat   = out.finalFloat;
+        peer_beacon::MarkTainted(preOverrideOwner);
     } else if (outcome == PreOutcome::BypassVanilla) {
         std::uint32_t van0 = 0U, van1 = 0U;
         float vanF = 0.0f;
@@ -1033,6 +1046,7 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
     } else {
         // PreOutcome::UseSlot
         std::uint8_t slotMode = kMhwRngSlotMasterDerived;
+        MhwRngPluginId slotOwnerId = kMhwRngPluginIdKernel;
         bool slotBypass       = false;
         std::uint32_t v0 = 0U, v1 = 0U;
         {
@@ -1041,7 +1055,8 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
                 if (targetSlot->sourceKind == kMhwRngSrcUnknown || srcKind != kMhwRngSrcUnknown) {
                     targetSlot->sourceKind = static_cast<std::uint8_t>(srcKind);
                 }
-                slotMode = targetSlot->mode;
+                slotMode    = targetSlot->mode;
+                slotOwnerId = targetSlot->ownerPluginId;
                 if (slotMode == kMhwRngSlotBypass ||
                     (slotMode == kMhwRngSlotMasterDerived &&
                      (engineMode == kMhwRngModeSelective ||
@@ -1119,6 +1134,9 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
             if (slotMode != kMhwRngSlotMasterDerived) {
                 out.overridden = true;
                 ctx.callFlags |= kMhwRngDrawFlagOverridden;
+                peer_beacon::MarkTainted(slotOwnerId);
+            } else if (engineMode == kMhwRngModeTakeover && !followOwnState) {
+                peer_beacon::MarkTainted(kMhwRngPluginIdKernel);
             }
             if (srcKind == kMhwRngSrcMt19937Range) {
                 const float uf = static_cast<float>(static_cast<std::int64_t>(static_cast<std::uint64_t>(v0)));
@@ -1156,6 +1174,9 @@ DrawExecResult ExecuteRngDraw(MhwRngSourceKind srcKind,
 
     if (chain || obsCount != 0U) {
         FirePostHooksAndObservers(chain, executedFilterMask, false, rva, srcKind, ctx, obsCount);
+    }
+    if (srcKind == kMhwRngSrcMtNrandGlobal && rva == mhw::kRvaCritSeedSite) {
+        out.val0 = peer_beacon::MaybeEncodeCritSeed(g_exeBase, rva, out.val0);
     }
     if (enteredInFlight) {
         g_inFlightHookCalls.fetch_sub(1U, std::memory_order_acq_rel);
@@ -1399,6 +1420,8 @@ void Shutdown() {
         delete[] toFree;
     }
     g_activeSlotCount.store(0U, std::memory_order_relaxed);
+    peer_beacon::ClearAllTaint();
+    peer_beacon::ResetDecoders();
 }
 
 void SetLifecycleEventSink(LifecycleEventSinkFn sink) noexcept {
@@ -2616,6 +2639,9 @@ MHW_RNG_API std::uint32_t MhwRng_GetApiVersion() {
 MHW_RNG_API void MhwRng_SetEngineMode(std::uint32_t mode) {
     const std::uint32_t clamped = (mode <= kMhwRngModeSelective) ? mode : kMhwRngModeSelective;
     const std::uint32_t prev    = rng::g_engineMode.exchange(clamped, std::memory_order_acq_rel);
+    if (clamped == kMhwRngModeOff || clamped == kMhwRngModeObserveOnly) {
+        peer_beacon::ClearAllTaint();
+    }
     rng::EmitLifecycleEvent(kMhwRngEventEngineMode, prev);
 }
 
@@ -2711,6 +2737,7 @@ MHW_RNG_API void MhwRng_ClearAllSlotOverrides() {
             delete[] toFree;
         }
     }
+    peer_beacon::ClearAllTaint();
     rng::EmitLifecycleEvent(kMhwRngEventClearAllRules, 0ULL);
 }
 
