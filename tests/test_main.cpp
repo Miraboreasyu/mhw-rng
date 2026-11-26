@@ -240,6 +240,10 @@ int main(int argc, char** argv) {
         std::printf("FAIL: sChat::move prologue mismatch at 0x%llX\n", static_cast<unsigned long long>(mhw::kRvaSChatMove));
         return 1;
     }
+    if (std::memcmp(img + mhw::kRvaUMhGuiMoveAfter, mhw::kPrologueUMhGuiMoveAfter, sizeof(mhw::kPrologueUMhGuiMoveAfter)) != 0) {
+        std::printf("FAIL: uMhGUI::moveAfter prologue mismatch at 0x%llX\n", static_cast<unsigned long long>(mhw::kRvaUMhGuiMoveAfter));
+        return 1;
+    }
 
     rng::SetOrigMtRandomNrand(origNrand);
     rng::SetOrigMtRandomCtorSeed(origCtor);

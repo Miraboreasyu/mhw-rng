@@ -2,10 +2,12 @@
 //  MHW Universal RNG Microkernel (mhw_rng.dll)
 //  Pure Interception + Composite Condition Slot Table + Hot-Reload Plugin Bus
 // ============================================================================
+#include "audio_mark.h"
 #include "command_router.h"
 #include "console_core.h"
 #include "console_overlay.h"
 #include "hook.h"
+#include "hud_mark.h"
 #include "log_config.h"
 #include "mhw_addresses.h"
 #include "mhw_rng_api.h"
@@ -34,6 +36,7 @@ using SChatMoveFn        = void(__fastcall*)(std::uintptr_t);
 using SChatShowMessageFn = void(__fastcall*)(std::uintptr_t, const char*, float, std::uint32_t, std::uint8_t);
 using D3DPresentFn       = std::uint64_t(__fastcall*)(std::uintptr_t, std::uint64_t, std::uint64_t, std::uint64_t);
 using SKeyboardMoveFn    = void(__fastcall*)(std::uintptr_t);
+using UMhGuiMoveAfterFn  = void(__fastcall*)(std::uintptr_t);
 
 struct ImmApi {
     using FnGetContext            = HIMC(WINAPI*)(HWND);
@@ -98,6 +101,8 @@ void*                       g_origChatDispatchRaw  = nullptr;
 void*                       g_origSChatMoveRaw     = nullptr;
 void*                       g_origPresentRaw       = nullptr;
 void*                       g_origSKeyboardMoveRaw = nullptr;
+void*                       g_origUMhGuiMoveAfterRaw = nullptr;
+void SetOrigUMhGuiMoveAfter(void* p) noexcept { g_origUMhGuiMoveAfterRaw = p; }
 std::uintptr_t              g_chatRelay            = 0;
 std::uintptr_t              g_chatMoveRelay        = 0;
 std::uintptr_t              g_presentRelay         = 0;
@@ -437,6 +442,16 @@ void __fastcall Hook_SChatMove(std::uintptr_t sChat) {
     if (const auto orig = reinterpret_cast<SChatMoveFn>(
             _InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(&g_origSChatMoveRaw), nullptr, nullptr))) {
         orig(sChat);
+    }
+}
+
+void __fastcall Hook_UMhGuiMoveAfter(std::uintptr_t uMhGui) {
+    if (!g_detaching.load(std::memory_order_relaxed)) {
+        hud_mark::OnUMhGuiMoveAfter(g_exeBase, uMhGui);
+    }
+    if (const auto orig = reinterpret_cast<UMhGuiMoveAfterFn>(
+            _InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(&g_origUMhGuiMoveAfterRaw), nullptr, nullptr))) {
+        orig(uMhGui);
     }
 }
 
@@ -1348,6 +1363,7 @@ bool TryInstallCoreRngHooks(HMODULE exe, std::uintptr_t& outBase, std::uintptr_t
         {"mt19937_heap_init",      mhw::kRvaMt19937HeapInit,     mhw::kPrologueMt19937HeapInit,     sizeof(mhw::kPrologueMt19937HeapInit),     reinterpret_cast<void*>(&MhwRngAsm_Mt19937HeapInit),     &rng::SetOrigMt19937HeapInit,     false},
         {"mt19937_heap_draw",      mhw::kRvaMt19937HeapDraw,     mhw::kPrologueMt19937HeapDraw,     sizeof(mhw::kPrologueMt19937HeapDraw),     reinterpret_cast<void*>(&MhwRngAsm_Mt19937HeapDraw),     &rng::SetOrigMt19937HeapDraw,     false},
         {"CRT_rand",               mhw::kRvaCrtRand,             mhw::kPrologueCrtRand,             sizeof(mhw::kPrologueCrtRand),             reinterpret_cast<void*>(&MhwRngAsm_CrtRand),             &rng::SetOrigCrtRand,             false},
+        {"uMhGUI::moveAfter",      mhw::kRvaUMhGuiMoveAfter,      mhw::kPrologueUMhGuiMoveAfter,      sizeof(mhw::kPrologueUMhGuiMoveAfter),      reinterpret_cast<void*>(&Hook_UMhGuiMoveAfter),          &SetOrigUMhGuiMoveAfter,          false},
     };
 
     std::size_t hookedCount = 0;
@@ -1383,6 +1399,7 @@ bool TryInstallCoreRngHooks(HMODULE exe, std::uintptr_t& outBase, std::uintptr_t
     // Initialize Console Core, Plugin Host & auto-load sub-plugins BEFORE activating UI hooks
     console::Init(&g_cfg);
     peer_beacon::Init(g_cfg.checkEnabled, g_cfg.selfCheckEnabled, &EnqueueForcedAsyncChat);
+    audio_mark::Init();
     plugin_host::Init(base, end, app::SubPluginDirectory(), &PostChatSystemNoticeSEH, &EnqueueAsyncChat);
     cmd_router::Init(&g_cfg, &PostChatSystemNoticeSEH);
     std::size_t loadedPlugins = 0U;
@@ -1662,8 +1679,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
             g_kbHook = nullptr;
         }
         console_overlay::Shutdown();
+        audio_mark::Shutdown();
         plugin_host::ShutdownAll();
         hook::RemoveAllHooks();
+        hud_mark::ResetState();
         rng::Shutdown();
         app::CloseLog();
     }

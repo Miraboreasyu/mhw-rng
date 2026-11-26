@@ -202,6 +202,7 @@ constexpr std::uintptr_t kRvaSMhRenderInstance      = 0x51C4480; // sMhRender*
 constexpr std::uintptr_t kRvaIsD3D12Byte            = 0x51CC080; // uint8_t: 0 = DX11, != 0 = DX12
 constexpr std::size_t    kOffRenderHdrOutput        = 0x21A;     // uint8_t
 constexpr std::size_t    kOffRenderHdrWhiteNits     = 0x21C;     // float
+constexpr std::size_t    kOffRenderAspectRatio      = 0x7B444U;  // float (default 16/9 = 0x3FE38E39, active W/H)
 
 // cD3DRender struct offsets (15.23)
 constexpr std::size_t kOffD3DDevice12               = 0x18;      // ID3D12Device*
@@ -256,5 +257,30 @@ constexpr std::size_t    kOffNetQuestNames          = 0x54E60U;
 constexpr std::size_t    kOffNetLobbyNames          = 0x54F00U;
 constexpr std::size_t    kStrideNetMemberName       = 0x28U;
 constexpr std::size_t    kMaxNetMemberNameBytes     = 35U;
+
+// ---- Persistent HUD Layout Hook (uMhGUI::moveAfter & cGUIInstAnimation, 15.23) ----
+// uMhGUI::moveAfter(uMhGUI* this) @ 0x141FB72D0 (7B: mov rax, rsp; mov [rax+20h], rbx)
+constexpr std::uintptr_t kRvaUMhGuiMoveAfter             = 0x1FB72D0;
+constexpr std::uint8_t   kPrologueUMhGuiMoveAfter[7]     = {
+    0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x20
+};
+// uGUI::getInstanceFromName(uGUI* this, const char* name) @ 0x1423537A0
+constexpr std::uintptr_t kRvaUGuiGetInstanceFromName     = 0x23537A0;
+
+// Target bottom-centered HUD vtable RVAs (widgets active even when native HUD is hidden):
+constexpr std::uintptr_t kRvaVftGuiHudItemWindow         = 0x3471BE0; // bottom-right item bar ("null_iwindow_Old")
+constexpr std::uintptr_t kRvaVftGuiHudItemRingShortcut   = 0x2FAAA08; // 8-way radial menu ("null_shortcut")
+constexpr std::uintptr_t kRvaVftGuiHudItemRingShortcutPC = 0x2FAAD10; // keyboard shortcut bar ("null_shortcut")
+
+// sMhGUI / uGUI / uMhGUI / cGUIInstAnimation offsets
+constexpr std::size_t    kOffSMhGuiWideUiMarginPx        = 0x1ECU;    // float: 0.5*(aspect*1080-1920)*clamp(marginRatio,0,1)
+constexpr std::size_t    kOffUGuiResource                = 0x290;     // rGUI*
+constexpr std::size_t    kOffUMhGuiRootAnim              = 0x1CE0;    // cGUIInstAnimation*
+constexpr std::size_t    kOffUMhGuiRootNullName          = 0x1CE8;    // const char*
+constexpr std::size_t    kOffGuiInstFlags                = 0x58;      // uint32_t (bit 0x10000 = transform dirty)
+constexpr std::size_t    kOffGuiInstLocalPosX            = 0xB0;      // float
+constexpr std::size_t    kOffGuiInstLocalPosY            = 0xB4;      // float
+constexpr std::size_t    kOffGuiInstLocalScaleX          = 0xC0;      // float
+constexpr std::size_t    kOffGuiInstLocalScaleY          = 0xC4;      // float
 
 } // namespace mhw

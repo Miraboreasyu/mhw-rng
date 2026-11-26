@@ -1,4 +1,6 @@
 #include "test_env.h"
+#include "audio_mark.h"
+#include "hud_mark.h"
 
 bool RunSuite_KernelThreads(TestEnv& env) {
     auto* const img = env.img;
@@ -1219,6 +1221,469 @@ bool RunSuite_KernelBeacon(TestEnv& env) {
             cleanupSynth();
             std::printf("FAIL [Wm-VisCmd]: self_check vis toggle failed\n");
             return false;
+        }
+
+        // Audio watermark packet builder + seqlock snapshot + EchoStreamProcessor tests
+        {
+            peer_beacon::AudioMarkPacket pkt{};
+            if (!peer_beacon::BuildAudioMarkPacket("crit,thk", pkt) || !pkt.active || pkt.slotCount != 39U) {
+                cleanupSynth();
+                std::printf("FAIL [AudioWm-Pkt]: expected active 39 slots for 'crit,thk', got active=%d slots=%u\n",
+                            pkt.active ? 1 : 0, pkt.slotCount);
+                return false;
+            }
+            for (std::uint32_t s = 0U; s < pkt.slotCount; ++s) {
+                if ((pkt.b1[s] != 1 && pkt.b1[s] != -1) || (pkt.b2[s] != 1 && pkt.b2[s] != -1)) {
+                    cleanupSynth();
+                    std::printf("FAIL [AudioWm-PktBits]: invalid polarity at slot %u\n", s);
+                    return false;
+                }
+            }
+
+            peer_beacon::ClearAllTaint();
+            *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerInstance) =
+                reinterpret_cast<std::uintptr_t>(fakeSPlayer.data());
+            peer_beacon::TickOnMainThread(base);
+            peer_beacon::AudioMarkPacket snap{};
+            if (peer_beacon::GetCurrentAudioMarkPacket(snap) || snap.active) {
+                cleanupSynth();
+                std::printf("FAIL [AudioWm-SnapClean]: expected inactive snapshot when clean\n");
+                return false;
+            }
+
+            peer_beacon::MarkTainted(sizeId);
+            peer_beacon::TickOnMainThread(base);
+            if (!peer_beacon::GetCurrentAudioMarkPacket(snap) || !snap.active || snap.slotCount == 0U) {
+                cleanupSynth();
+                std::printf("FAIL [AudioWm-SnapTainted]: expected active snapshot when tainted\n");
+                return false;
+            }
+
+            peer_beacon::ClearAllTaint();
+            peer_beacon::TickOnMainThread(base);
+            if (peer_beacon::GetCurrentAudioMarkPacket(snap) || snap.active) {
+                cleanupSynth();
+                std::printf("FAIL [AudioWm-SnapClear]: expected inactive after ClearAllTaint\n");
+                return false;
+            }
+
+            // EchoStreamProcessor clean passthrough & 48kHz / 44.1kHz embedding sanity
+            audio_mark::EchoStreamProcessor proc48{};
+            proc48.Configure(48000U, 2U);
+            std::vector<float> buf48(48000U * 2U, 0.0f);
+            for (std::size_t i = 0U; i < 48000U; ++i) {
+                const float v = 0.25f * std::sin(2.0f * 3.14159265f * 440.0f * static_cast<float>(i) / 48000.0f);
+                buf48[2U * i]      = v;
+                buf48[2U * i + 1U] = v;
+            }
+            const std::vector<float> orig48 = buf48;
+            peer_beacon::AudioMarkPacket cleanPkt{};
+            proc48.ProcessFloatInterleaved(buf48.data(), 48000U, cleanPkt);
+            if (buf48 != orig48) {
+                cleanupSynth();
+                std::printf("FAIL [AudioWm-CleanPass]: clean passthrough altered samples\n");
+                return false;
+            }
+
+            proc48.ProcessFloatInterleaved(buf48.data(), 48000U, pkt);
+            double diffEnergy48 = 0.0;
+            for (std::size_t i = 0U; i < buf48.size(); ++i) {
+                if (!std::isfinite(buf48[i]) || std::fabs(buf48[i]) > 0.9991f) {
+                    cleanupSynth();
+                    std::printf("FAIL [AudioWm-Finite48]: sample out of range at %zu (%f)\n", i, buf48[i]);
+                    return false;
+                }
+                const double d = static_cast<double>(buf48[i] - orig48[i]);
+                diffEnergy48 += d * d;
+            }
+            if (diffEnergy48 <= 1e-4) {
+                cleanupSynth();
+                std::printf("FAIL [AudioWm-Energy48]: watermark energy too small (%g)\n", diffEnergy48);
+                return false;
+            }
+
+            audio_mark::EchoStreamProcessor proc44{};
+            proc44.Configure(44100U, 2U);
+            std::vector<float> buf44(44100U * 2U, 0.0f);
+            for (std::size_t i = 0U; i < 44100U; ++i) {
+                const float v = 0.20f * std::cos(2.0f * 3.14159265f * 330.0f * static_cast<float>(i) / 44100.0f);
+                buf44[2U * i]      = v;
+                buf44[2U * i + 1U] = v;
+            }
+            const std::vector<float> orig44 = buf44;
+            proc44.ProcessFloatInterleaved(buf44.data(), 44100U, pkt);
+            double diffEnergy44 = 0.0;
+            for (std::size_t i = 0U; i < buf44.size(); ++i) {
+                const double d = static_cast<double>(buf44[i] - orig44[i]);
+                diffEnergy44 += d * d;
+            }
+            if (diffEnergy44 <= 1e-4) {
+                cleanupSynth();
+                std::printf("FAIL [AudioWm-Energy44]: 44.1kHz watermark energy too small (%g)\n", diffEnergy44);
+                return false;
+            }
+
+            audio_mark::EchoStreamProcessor proc16{};
+            proc16.Configure(48000U, 2U);
+            std::vector<std::int16_t> buf16(24000U * 2U, 0);
+            for (std::size_t i = 0U; i < 24000U; ++i) {
+                const auto v = static_cast<std::int16_t>(
+                    6000.0 * std::sin(2.0 * 3.14159265 * 500.0 * static_cast<double>(i) / 48000.0));
+                buf16[2U * i]      = v;
+                buf16[2U * i + 1U] = v;
+            }
+            const std::vector<std::int16_t> orig16 = buf16;
+            proc16.ProcessInt16Interleaved(buf16.data(), 24000U, pkt);
+            if (buf16 == orig16) {
+                cleanupSynth();
+                std::printf("FAIL [AudioWm-Int16]: int16 path left tainted buffer unchanged\n");
+                return false;
+            }
+
+            // Over-8ch rejection: must set channels=0 and leave buffer bit-exact untouched
+            audio_mark::EchoStreamProcessor proc10{};
+            proc10.Configure(48000U, 10U);
+            std::vector<float> buf10(4800U * 10U, 0.125f);
+            const std::vector<float> orig10 = buf10;
+            proc10.ProcessFloatInterleaved(buf10.data(), 4800U, pkt);
+            if (proc10.channels != 0U || buf10 != orig10) {
+                cleanupSynth();
+                std::printf("FAIL [AudioWm-Over8Ch]: expected over-8ch to be safe no-op\n");
+                return false;
+            }
+
+            // Silent buffer phase continuity: advances sampleCounter, ramps gain, flushes ring to zero
+            audio_mark::EchoStreamProcessor procSil{};
+            procSil.Configure(48000U, 2U);
+            std::vector<float> warm(4096U * 2U, 0.5f);
+            procSil.ProcessFloatInterleaved(warm.data(), 4096U, cleanPkt);
+            const std::uint64_t scBefore = procSil.sampleCounter;
+            procSil.AdvanceSilent(24000U, pkt);
+            bool ringZero = true;
+            for (std::size_t ch = 0U; ch < 2U && ringZero; ++ch) {
+                for (std::size_t k = 0U; k < audio_mark::EchoStreamProcessor::kRingCap; ++k) {
+                    if (procSil.ring[ch][k] != 0.0f) {
+                        ringZero = false;
+                        break;
+                    }
+                }
+            }
+            if (procSil.sampleCounter != scBefore + 24000ULL ||
+                std::fabs(procSil.currentGain - audio_mark::EchoStreamProcessor::kTargetAlpha) > 1e-5f ||
+                !ringZero) {
+                cleanupSynth();
+                std::printf("FAIL [AudioWm-SilentPhase]: silent phase advance/flush mismatch\n");
+                return false;
+            }
+        }
+
+        // Persistent-HUD shift state machine: zero writes when clean, drift-free when active, exact restore
+        {
+            bool applied = false;
+            float appliedDx = 0.0f;
+            float lwX = 0.0f, lwY = 0.0f, lwSx = 1.0f, lwSy = 1.0f;
+            float posX = 1600.0f, posY = 900.0f, scX = 1.0f, scY = 1.0f;
+            std::uint32_t flags = 0U;
+
+            if (hud_mark::ApplyHudShiftState(false, hud_mark::kHudShiftDeltaX, applied, appliedDx,
+                                             lwX, lwY, lwSx, lwSy, posX, posY, scX, scY, flags) ||
+                applied || appliedDx != 0.0f || posX != 1600.0f || posY != 900.0f || scX != 1.0f || scY != 1.0f || flags != 0U) {
+                cleanupSynth();
+                std::printf("FAIL [HudMark-Clean]: clean state modified HUD transform\n");
+                return false;
+            }
+
+            if (!hud_mark::ApplyHudShiftState(true, hud_mark::kHudShiftDeltaX, applied, appliedDx,
+                                              lwX, lwY, lwSx, lwSy, posX, posY, scX, scY, flags) ||
+                !applied || std::fabs(appliedDx - hud_mark::kHudShiftDeltaX) > 1e-4f ||
+                (flags & 0x10000U) == 0U ||
+                std::fabs(posX - (1600.0f + hud_mark::kHudShiftDeltaX)) > 1e-4f ||
+                std::fabs(posY - (900.0f + hud_mark::kHudShiftDeltaY)) > 1e-4f ||
+                std::fabs(scX - hud_mark::kHudShiftScale) > 1e-5f ||
+                std::fabs(scY - hud_mark::kHudShiftScale) > 1e-5f) {
+                cleanupSynth();
+                std::printf("FAIL [HudMark-Apply]: initial shift incorrect (pos=%.3f,%.3f sc=%.4f/%.4f)\n",
+                            posX, posY, scX, scY);
+                return false;
+            }
+
+            // Repeated frames with unchanged game values must not re-write or drift
+            flags = 0U;
+            if (hud_mark::ApplyHudShiftState(true, hud_mark::kHudShiftDeltaX, applied, appliedDx,
+                                             lwX, lwY, lwSx, lwSy, posX, posY, scX, scY, flags) ||
+                flags != 0U ||
+                std::fabs(posX - (1600.0f + hud_mark::kHudShiftDeltaX)) > 1e-4f ||
+                std::fabs(posY - (900.0f + hud_mark::kHudShiftDeltaY)) > 1e-4f) {
+                cleanupSynth();
+                std::printf("FAIL [HudMark-NoDrift]: steady frame unexpectedly mutated transform\n");
+                return false;
+            }
+
+            // Simulate game resetting posX/posY back to baseline (e.g. layout/ultrawide recalc)
+            posX = 1600.0f;
+            posY = 900.0f;
+            if (!hud_mark::ApplyHudShiftState(true, hud_mark::kHudShiftDeltaX, applied, appliedDx,
+                                              lwX, lwY, lwSx, lwSy, posX, posY, scX, scY, flags) ||
+                std::fabs(posX - (1600.0f + hud_mark::kHudShiftDeltaX)) > 1e-4f ||
+                std::fabs(posY - (900.0f + hud_mark::kHudShiftDeltaY)) > 1e-4f ||
+                (flags & 0x10000U) == 0U) {
+                cleanupSynth();
+                std::printf("FAIL [HudMark-Reapply]: failed to re-apply after game reset (pos=%.3f,%.3f)\n",
+                            posX, posY);
+                return false;
+            }
+
+            // Disable taint -> exact restore
+            flags = 0U;
+            if (!hud_mark::ApplyHudShiftState(false, hud_mark::kHudShiftDeltaX, applied, appliedDx,
+                                              lwX, lwY, lwSx, lwSy, posX, posY, scX, scY, flags) ||
+                applied || appliedDx != 0.0f || (flags & 0x10000U) == 0U ||
+                std::fabs(posX - 1600.0f) > 1e-3f ||
+                std::fabs(posY - 900.0f) > 1e-3f ||
+                std::fabs(scX - 1.0f) > 1e-4f ||
+                std::fabs(scY - 1.0f) > 1e-4f) {
+                cleanupSynth();
+                std::printf("FAIL [HudMark-Restore]: restore mismatch (pos=%.3f,%.3f sc=%.4f/%.4f)\n",
+                            posX, posY, scX, scY);
+                return false;
+            }
+
+            // Verify 21:9 ultrawide deltaX calculation across all 3 widget kinds & aspect/margin values
+            const float asp16_9 = 16.0f / 9.0f;
+            const float asp2560 = 2560.0f / 1080.0f;
+            const float asp3440 = 3440.0f / 1440.0f;
+            if (std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::ItemWindow, asp16_9, 0.0f) - 14.4f) > 1e-4f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcut, asp16_9, 0.0f) - 14.4f) > 1e-4f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcutPC, asp16_9, 0.0f) - 14.4f) > 1e-4f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcutPC, 1.6f, 0.0f) - 14.4f) > 1e-4f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcut, std::nanf(""), 0.0f) - 14.4f) > 1e-4f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcut, 0.0f, 0.0f) - 14.4f) > 1e-4f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcut, -1.0f, 0.0f) - 14.4f) > 1e-4f ||
+                // 2560x1080 (extraW = 640)
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::ItemWindow, asp2560, 0.0f) - 14.4f) > 1e-3f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::ItemWindow, asp2560, 320.0f) - 14.4f) > 1e-3f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcut, asp2560, 0.0f) - 19.2f) > 1e-3f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcut, asp2560, 320.0f) - 19.2f) > 1e-3f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcutPC, asp2560, 0.0f) - 24.0f) > 1e-3f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcutPC, asp2560, 320.0f) - 19.2f) > 1e-3f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcutPC, asp2560, 999.0f) - 19.2f) > 1e-3f ||
+                // 3440x1440 (extraW = 660)
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::ItemWindow, asp3440, 0.0f) - 14.4f) > 1e-3f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcut, asp3440, 0.0f) - 19.35f) > 1e-3f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcutPC, asp3440, 0.0f) - 24.3f) > 1e-3f ||
+                std::fabs(hud_mark::ComputeHudShiftDeltaX(hud_mark::HudWidgetKind::RingShortcutPC, asp3440, 330.0f) - 19.35f) > 1e-3f) {
+                cleanupSynth();
+                std::printf("FAIL [HudMark-21x9DeltaX]: ComputeHudShiftDeltaX mismatch\n");
+                return false;
+            }
+
+            // Live targetDeltaX transition in ApplyHudShiftState: 16:9 -> 21:9 center -> 21:9 edge -> clean restore
+            {
+                bool dynApplied = false;
+                float dynAppliedDx = 0.0f, dynLwX = 0.0f, dynLwY = 0.0f, dynLwSx = 1.0f, dynLwSy = 1.0f;
+                float dynX = 0.0f, dynY = 900.0f, dynSx = 1.0f, dynSy = 1.0f;
+                std::uint32_t dynFlags = 0U;
+                if (!hud_mark::ApplyHudShiftState(true, 14.4f, dynApplied, dynAppliedDx,
+                                                  dynLwX, dynLwY, dynLwSx, dynLwSy,
+                                                  dynX, dynY, dynSx, dynSy, dynFlags) ||
+                    std::fabs(dynX - 14.4f) > 1e-4f) {
+                    cleanupSynth();
+                    std::printf("FAIL [HudMark-DynDeltaX-Init]: initial apply failed\n");
+                    return false;
+                }
+                dynFlags = 0U;
+                if (!hud_mark::ApplyHudShiftState(true, 19.2f, dynApplied, dynAppliedDx,
+                                                  dynLwX, dynLwY, dynLwSx, dynLwSy,
+                                                  dynX, dynY, dynSx, dynSy, dynFlags) ||
+                    (dynFlags & 0x10000U) == 0U ||
+                    std::fabs(dynX - 19.2f) > 1e-4f || std::fabs(dynAppliedDx - 19.2f) > 1e-4f) {
+                    cleanupSynth();
+                    std::printf("FAIL [HudMark-DynDeltaX-Switch1]: failed live switch to 19.2f (got %.3f)\n", dynX);
+                    return false;
+                }
+                dynFlags = 0U;
+                if (hud_mark::ApplyHudShiftState(true, 19.2f, dynApplied, dynAppliedDx,
+                                                 dynLwX, dynLwY, dynLwSx, dynLwSy,
+                                                 dynX, dynY, dynSx, dynSy, dynFlags) ||
+                    dynFlags != 0U || std::fabs(dynX - 19.2f) > 1e-4f) {
+                    cleanupSynth();
+                    std::printf("FAIL [HudMark-DynDeltaX-Steady]: steady frame drifted\n");
+                    return false;
+                }
+                if (!hud_mark::ApplyHudShiftState(true, 24.0f, dynApplied, dynAppliedDx,
+                                                  dynLwX, dynLwY, dynLwSx, dynLwSy,
+                                                  dynX, dynY, dynSx, dynSy, dynFlags) ||
+                    std::fabs(dynX - 24.0f) > 1e-4f) {
+                    cleanupSynth();
+                    std::printf("FAIL [HudMark-DynDeltaX-Switch2]: failed live switch to 24.0f\n");
+                    return false;
+                }
+                dynFlags = 0U;
+                if (!hud_mark::ApplyHudShiftState(false, 14.4f, dynApplied, dynAppliedDx,
+                                                  dynLwX, dynLwY, dynLwSx, dynLwSy,
+                                                  dynX, dynY, dynSx, dynSy, dynFlags) ||
+                    dynApplied || std::fabs(dynAppliedDx) > 1e-5f ||
+                    std::fabs(dynX) > 1e-3f || std::fabs(dynY - 900.0f) > 1e-3f ||
+                    std::fabs(dynSx - 1.0f) > 1e-4f || std::fabs(dynSy - 1.0f) > 1e-4f) {
+                    cleanupSynth();
+                    std::printf("FAIL [HudMark-DynDeltaX-Restore]: restore after switch mismatch (x=%.3f)\n", dynX);
+                    return false;
+                }
+            }
+
+            // LRU eviction beyond 16 entries + stale rootAnim refresh + 21:9 end-to-end OnUMhGuiMoveAfter
+            peer_beacon::ClearAllTaint();
+            *reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSPlayerInstance) =
+                reinterpret_cast<std::uintptr_t>(fakeSPlayer.data());
+            peer_beacon::MarkTainted(sizeId);
+            peer_beacon::TickOnMainThread(base);
+            hud_mark::ResetState();
+
+            struct alignas(16) SynthRoot {
+                std::uint8_t pad[0x100]{};
+            };
+            struct alignas(16) SynthGui {
+                std::uint8_t pad[0x1D00]{};
+            };
+            std::vector<SynthRoot> roots(21);
+            std::vector<SynthGui>  guis(20);
+            auto initRoot = [](SynthRoot& r, float x = 1600.0f, float y = 900.0f) {
+                *reinterpret_cast<std::uint32_t*>(r.pad + mhw::kOffGuiInstFlags)  = 0U;
+                *reinterpret_cast<float*>(r.pad + mhw::kOffGuiInstLocalPosX)      = x;
+                *reinterpret_cast<float*>(r.pad + mhw::kOffGuiInstLocalPosY)      = y;
+                *reinterpret_cast<float*>(r.pad + mhw::kOffGuiInstLocalScaleX)    = 1.0f;
+                *reinterpret_cast<float*>(r.pad + mhw::kOffGuiInstLocalScaleY)    = 1.0f;
+            };
+            for (std::size_t i = 0U; i < roots.size(); ++i) initRoot(roots[i]);
+            for (std::size_t i = 0U; i < guis.size(); ++i) {
+                *reinterpret_cast<std::uintptr_t*>(guis[i].pad) = base + mhw::kRvaVftGuiHudItemWindow;
+                *reinterpret_cast<std::uintptr_t*>(guis[i].pad + mhw::kOffUGuiResource)  = 0x200000ULL;
+                *reinterpret_cast<std::uintptr_t*>(guis[i].pad + mhw::kOffUMhGuiRootAnim) =
+                    reinterpret_cast<std::uintptr_t>(&roots[i]);
+                hud_mark::OnUMhGuiMoveAfter(base, reinterpret_cast<std::uintptr_t>(&guis[i]));
+
+                const float rx = *reinterpret_cast<const float*>(roots[i].pad + mhw::kOffGuiInstLocalPosX);
+                const float ry = *reinterpret_cast<const float*>(roots[i].pad + mhw::kOffGuiInstLocalPosY);
+                const float rs = *reinterpret_cast<const float*>(roots[i].pad + mhw::kOffGuiInstLocalScaleX);
+                if (std::fabs(rx - (1600.0f + hud_mark::kHudShiftDeltaX)) > 1e-4f ||
+                    std::fabs(ry - (900.0f + hud_mark::kHudShiftDeltaY)) > 1e-4f ||
+                    std::fabs(rs - hud_mark::kHudShiftScale) > 1e-5f) {
+                    cleanupSynth();
+                    std::printf("FAIL [HudMark-LruAndRootRefresh]: widget %zu not shifted\n", i);
+                    return false;
+                }
+            }
+
+            // Swap rootAnim on gui[19] keeping same gui pointer and same mpResource
+            *reinterpret_cast<std::uintptr_t*>(guis[19].pad + mhw::kOffUMhGuiRootAnim) =
+                reinterpret_cast<std::uintptr_t>(&roots[20]);
+            hud_mark::OnUMhGuiMoveAfter(base, reinterpret_cast<std::uintptr_t>(&guis[19]));
+            const float newRx = *reinterpret_cast<const float*>(roots[20].pad + mhw::kOffGuiInstLocalPosX);
+            const float newRy = *reinterpret_cast<const float*>(roots[20].pad + mhw::kOffGuiInstLocalPosY);
+            const float newRs = *reinterpret_cast<const float*>(roots[20].pad + mhw::kOffGuiInstLocalScaleX);
+            if (std::fabs(newRx - (1600.0f + hud_mark::kHudShiftDeltaX)) > 1e-4f ||
+                std::fabs(newRy - (900.0f + hud_mark::kHudShiftDeltaY)) > 1e-4f ||
+                std::fabs(newRs - hud_mark::kHudShiftScale) > 1e-5f) {
+                cleanupSynth();
+                std::printf("FAIL [HudMark-LruAndRootRefresh]: swapped rootAnim not shifted\n");
+                return false;
+            }
+
+            // End-to-end 21:9 (2560x1080) Edge -> Center -> Clean restore across all 3 widget vtables
+            {
+                struct DisplayPtrGuard {
+                    std::uintptr_t* renderSlot;
+                    std::uintptr_t* guiSlot;
+                    std::uintptr_t  origRender;
+                    std::uintptr_t  origGui;
+                    ~DisplayPtrGuard() {
+                        *renderSlot = origRender;
+                        *guiSlot    = origGui;
+                    }
+                };
+                auto* renderSlot = reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSMhRenderInstance);
+                auto* guiSlot    = reinterpret_cast<std::uintptr_t*>(base + mhw::kRvaSMhGuiInstance);
+                DisplayPtrGuard dispGuard{renderSlot, guiSlot, *renderSlot, *guiSlot};
+
+                std::vector<std::uint8_t> fakeRender(0x7B450U, 0U);
+                std::vector<std::uint8_t> fakeGui(0x200U, 0U);
+                *renderSlot = reinterpret_cast<std::uintptr_t>(fakeRender.data());
+                *guiSlot    = reinterpret_cast<std::uintptr_t>(fakeGui.data());
+
+                *reinterpret_cast<float*>(fakeRender.data() + mhw::kOffRenderAspectRatio) = asp2560;
+                *reinterpret_cast<float*>(fakeGui.data() + mhw::kOffSMhGuiWideUiMarginPx) = 0.0f;
+
+                hud_mark::ResetState();
+                std::vector<SynthRoot> wideRoots(3);
+                std::vector<SynthGui>  wideGuis(3);
+                initRoot(wideRoots[0], 1600.0f, 900.0f); // ItemWindow
+                initRoot(wideRoots[1], 0.0f, 0.0f);      // RingShortcut
+                initRoot(wideRoots[2], 0.0f, 0.0f);      // RingShortcutPC
+
+                const std::uintptr_t vfts[3] = {
+                    base + mhw::kRvaVftGuiHudItemWindow,
+                    base + mhw::kRvaVftGuiHudItemRingShortcut,
+                    base + mhw::kRvaVftGuiHudItemRingShortcutPC
+                };
+                for (int i = 0; i < 3; ++i) {
+                    *reinterpret_cast<std::uintptr_t*>(wideGuis[i].pad) = vfts[i];
+                    *reinterpret_cast<std::uintptr_t*>(wideGuis[i].pad + mhw::kOffUGuiResource)  = 0x300000ULL + i * 0x100ULL;
+                    *reinterpret_cast<std::uintptr_t*>(wideGuis[i].pad + mhw::kOffUMhGuiRootAnim) =
+                        reinterpret_cast<std::uintptr_t>(&wideRoots[i]);
+                    hud_mark::OnUMhGuiMoveAfter(base, reinterpret_cast<std::uintptr_t>(&wideGuis[i]));
+                }
+                const float xIwEdge = *reinterpret_cast<const float*>(wideRoots[0].pad + mhw::kOffGuiInstLocalPosX);
+                const float xRsEdge = *reinterpret_cast<const float*>(wideRoots[1].pad + mhw::kOffGuiInstLocalPosX);
+                const float xPcEdge = *reinterpret_cast<const float*>(wideRoots[2].pad + mhw::kOffGuiInstLocalPosX);
+                if (std::fabs(xIwEdge - 1614.4f) > 1e-3f ||
+                    std::fabs(xRsEdge - 19.2f) > 1e-3f ||
+                    std::fabs(xPcEdge - 24.0f) > 1e-3f) {
+                    cleanupSynth();
+                    std::printf("FAIL [HudMark-21x9Edge]: got IW=%.3f RS=%.3f PC=%.3f\n",
+                                xIwEdge, xRsEdge, xPcEdge);
+                    return false;
+                }
+
+                // Switch UI Horizontal Margin from Edge (0) to Center (320px) in-place
+                *reinterpret_cast<float*>(fakeGui.data() + mhw::kOffSMhGuiWideUiMarginPx) = 320.0f;
+                for (int i = 0; i < 3; ++i) {
+                    hud_mark::OnUMhGuiMoveAfter(base, reinterpret_cast<std::uintptr_t>(&wideGuis[i]));
+                }
+                const float xIwCtr = *reinterpret_cast<const float*>(wideRoots[0].pad + mhw::kOffGuiInstLocalPosX);
+                const float xRsCtr = *reinterpret_cast<const float*>(wideRoots[1].pad + mhw::kOffGuiInstLocalPosX);
+                const float xPcCtr = *reinterpret_cast<const float*>(wideRoots[2].pad + mhw::kOffGuiInstLocalPosX);
+                if (std::fabs(xIwCtr - 1614.4f) > 1e-3f ||
+                    std::fabs(xRsCtr - 19.2f) > 1e-3f ||
+                    std::fabs(xPcCtr - 19.2f) > 1e-3f) {
+                    cleanupSynth();
+                    std::printf("FAIL [HudMark-21x9Center]: got IW=%.3f RS=%.3f PC=%.3f\n",
+                                xIwCtr, xRsCtr, xPcCtr);
+                    return false;
+                }
+
+                // Clear taint -> all 3 restore to exact baselines
+                peer_beacon::ClearAllTaint();
+                peer_beacon::TickOnMainThread(base);
+                for (int i = 0; i < 3; ++i) {
+                    hud_mark::OnUMhGuiMoveAfter(base, reinterpret_cast<std::uintptr_t>(&wideGuis[i]));
+                }
+                const float xIwClr = *reinterpret_cast<const float*>(wideRoots[0].pad + mhw::kOffGuiInstLocalPosX);
+                const float xRsClr = *reinterpret_cast<const float*>(wideRoots[1].pad + mhw::kOffGuiInstLocalPosX);
+                const float xPcClr = *reinterpret_cast<const float*>(wideRoots[2].pad + mhw::kOffGuiInstLocalPosX);
+                const float scPcClr = *reinterpret_cast<const float*>(wideRoots[2].pad + mhw::kOffGuiInstLocalScaleX);
+                if (std::fabs(xIwClr - 1600.0f) > 1e-3f ||
+                    std::fabs(xRsClr) > 1e-3f ||
+                    std::fabs(xPcClr) > 1e-3f ||
+                    std::fabs(scPcClr - 1.0f) > 1e-4f) {
+                    cleanupSynth();
+                    std::printf("FAIL [HudMark-21x9Restore]: got IW=%.3f RS=%.3f PC=%.3f sc=%.4f\n",
+                                xIwClr, xRsClr, xPcClr, scPcClr);
+                    return false;
+                }
+            }
+
+            hud_mark::ResetState();
+            peer_beacon::ClearAllTaint();
         }
     }
 

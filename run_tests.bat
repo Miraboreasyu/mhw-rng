@@ -37,9 +37,11 @@ cl.exe /nologo /std:c++17 /O2 /MP /W4 /EHsc /MT /utf-8 /D "NOMINMAX" /D "MHW_RNG
     "%ROOT%tests\test_plugin_size_thk_steam.cpp" ^
     "%ROOT%tests\test_plugin_endemic_crit.cpp" ^
     "%ROOT%tests\test_world_e2e.cpp" ^
+    "%SRCDIR%\audio_mark.cpp" ^
     "%SRCDIR%\command_router.cpp" ^
     "%SRCDIR%\console_core.cpp" ^
     "%SRCDIR%\hook.cpp" ^
+    "%SRCDIR%\hud_mark.cpp" ^
     "%SRCDIR%\log_config.cpp" ^
     "%SRCDIR%\peer_beacon.cpp" ^
     "%SRCDIR%\plugin_host.cpp" ^
@@ -47,7 +49,7 @@ cl.exe /nologo /std:c++17 /O2 /MP /W4 /EHsc /MT /utf-8 /D "NOMINMAX" /D "MHW_RNG
     "%OUTDIR%\rng_trampolines.obj" ^
     /Fe:"%OUTDIR%\test_rng_harness.exe" ^
     /Fo:"%OUTDIR%\\" ^
-    /link kernel32.lib user32.lib
+    /link kernel32.lib user32.lib ole32.lib
 
 if %ERRORLEVEL% NEQ 0 exit /b 1
 "%OUTDIR%\test_rng_harness.exe" %*

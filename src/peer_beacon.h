@@ -23,11 +23,19 @@ constexpr std::size_t  kWmCellCount       = kWmGridCols * kWmGridRows; // 192
 constexpr std::uint8_t kWmSync0           = 61U; // 0b111101
 constexpr std::uint8_t kWmSync1           = 42U; // 0b101010
 constexpr double       kWmFreqHz          = 4.0;
+constexpr std::size_t  kMaxAudioMarkSlots = 256U;
 
 struct VideoMarkFrame {
     bool  active       = false;
     bool  debugVisible = false;
     float cellWeights[kWmCellCount]{};
+};
+
+struct AudioMarkPacket {
+    bool          active    = false;
+    std::uint32_t slotCount = 0U;
+    std::int8_t   b1[kMaxAudioMarkSlots]{};
+    std::int8_t   b2[kMaxAudioMarkSlots]{};
 };
 
 void Init(bool checkEnabled, bool selfCheckEnabled, AlertSinkFn alertSink) noexcept;
@@ -72,6 +80,9 @@ bool BuildVideoMarkFrameAt(double tSec,
                            bool debugVisible,
                            VideoMarkFrame& out) noexcept;
 bool GetCurrentVideoMarkFrame(VideoMarkFrame& out) noexcept;
+bool BuildAudioMarkPacket(const std::string& payload, AudioMarkPacket& out) noexcept;
+void RefreshAudioMarkSnapshot() noexcept;
+bool GetCurrentAudioMarkPacket(AudioMarkPacket& out, bool* outBusy = nullptr) noexcept;
 DiagSnapshot GetDiagSnapshot() noexcept;
 
 } // namespace peer_beacon

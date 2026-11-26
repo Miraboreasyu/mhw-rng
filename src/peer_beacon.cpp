@@ -13,6 +13,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace peer_beacon {
@@ -86,6 +87,17 @@ std::atomic<std::uint32_t> g_rxLocalFrameCount{0U};
 std::once_flag             g_qpcOnce;
 std::int64_t               g_qpcOrigin = 0;
 std::int64_t               g_qpcFreq   = 0;
+
+static_assert(std::is_trivially_copyable_v<AudioMarkPacket>,
+              "AudioMarkPacket must be trivially copyable");
+constexpr std::size_t kAudioSnapWords =
+    (sizeof(AudioMarkPacket) + sizeof(std::uint64_t) - 1U) / sizeof(std::uint64_t);
+
+std::mutex                 g_audioPubMx;
+std::atomic<std::uint32_t> g_audioSnapSeq{0U};
+std::atomic<std::uint64_t> g_audioSnapWords[kAudioSnapWords]{};
+std::atomic<bool>          g_audioSnapDirty{true};
+std::atomic<bool>          g_audioSnapBuiltActive{false};
 
 std::mutex                 g_txMx;
 std::uint64_t              g_cachedTaintWords[kTaintWords]{};
@@ -648,8 +660,10 @@ void Init(bool checkEnabled, bool selfCheckEnabled, AlertSinkFn alertSink) noexc
     g_wmDebugVisible.store(false, std::memory_order_release);
     g_alertSink.store(alertSink, std::memory_order_release);
     g_txFrameCount.store(0U, std::memory_order_relaxed);
+    g_audioSnapDirty.store(true, std::memory_order_release);
     ClearAllTaint();
     ResetDecoders();
+    RefreshAudioMarkSnapshot();
 }
 
 void SetAlertSink(AlertSinkFn alertSink) noexcept {
@@ -678,6 +692,7 @@ void MarkTainted(MhwRngPluginId ownerId) noexcept {
     const std::uint64_t mask = 1ULL << (bitIdx & 63U);
     if ((g_taintWords[word].load(std::memory_order_relaxed) & mask) == 0ULL) {
         g_taintWords[word].fetch_or(mask, std::memory_order_release);
+        g_audioSnapDirty.store(true, std::memory_order_release);
     }
 }
 
@@ -687,6 +702,7 @@ void ClearTainted(MhwRngPluginId ownerId) noexcept {
     const std::uint64_t mask = 1ULL << (bitIdx & 63U);
     if ((g_taintWords[word].load(std::memory_order_relaxed) & mask) != 0ULL) {
         g_taintWords[word].fetch_and(~mask, std::memory_order_release);
+        g_audioSnapDirty.store(true, std::memory_order_release);
     }
 }
 
@@ -694,6 +710,7 @@ void ClearAllTaint() noexcept {
     for (auto& w : g_taintWords) {
         w.store(0ULL, std::memory_order_release);
     }
+    g_audioSnapDirty.store(true, std::memory_order_release);
 }
 
 bool HasAnyTaint() noexcept {
@@ -956,6 +973,107 @@ bool GetCurrentVideoMarkFrame(VideoMarkFrame& out) noexcept {
     return BuildVideoMarkFrameAt(tSec, payload, IsVideoMarkDebugVisible(), out);
 }
 
+bool BuildAudioMarkPacket(const std::string& payload, AudioMarkPacket& out) noexcept {
+    out = AudioMarkPacket{};
+    if (payload.empty()) return false;
+
+    const std::size_t len = (payload.size() > kMaxPayloadLen) ? kMaxPayloadLen : payload.size();
+    std::uint8_t crcBuf[kMaxPayloadLen + 1U]{};
+    crcBuf[0] = static_cast<std::uint8_t>(len);
+
+    std::uint8_t syms[kMaxPayloadLen + 5U]{};
+    syms[0] = kWmSync0;
+    syms[1] = kWmSync1;
+    syms[2] = static_cast<std::uint8_t>(len);
+    for (std::size_t i = 0U; i < len; ++i) {
+        std::uint8_t sym = 0U;
+        if (!EncodeSymbolChar(payload[i], sym)) return false;
+        crcBuf[1U + i] = sym;
+        syms[3U + i]   = sym;
+    }
+    const std::uint16_t crc12 = ComputeVideoMarkCrc12(crcBuf, 1U + len);
+    syms[3U + len] = static_cast<std::uint8_t>((crc12 >> 6U) & 0x3FU);
+    syms[4U + len] = static_cast<std::uint8_t>(crc12 & 0x3FU);
+
+    const std::size_t totalSyms  = len + 5U;
+    const std::size_t totalSlots = totalSyms * 3U;
+    if (totalSlots > kMaxAudioMarkSlots) return false;
+
+    for (std::size_t si = 0U; si < totalSyms; ++si) {
+        const std::uint8_t sym6 = syms[si];
+        for (unsigned sub = 0U; sub < 3U; ++sub) {
+            const std::size_t slot = si * 3U + sub;
+            const std::uint8_t bHi = (sym6 >> (5U - 2U * sub)) & 1U;
+            const std::uint8_t bLo = (sym6 >> (4U - 2U * sub)) & 1U;
+            out.b1[slot] = (bHi != 0U) ? 1 : -1;
+            out.b2[slot] = (bLo != 0U) ? 1 : -1;
+        }
+    }
+    out.slotCount = static_cast<std::uint32_t>(totalSlots);
+    out.active    = true;
+    return true;
+}
+
+void RefreshAudioMarkSnapshot() noexcept {
+    const bool shouldBeActive = IsVideoMarkActive();
+    if (!g_audioSnapDirty.load(std::memory_order_acquire) &&
+        shouldBeActive == g_audioSnapBuiltActive.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    AudioMarkPacket next{};
+    if (shouldBeActive) {
+        std::string payload;
+        {
+            std::lock_guard<std::mutex> lk(g_txMx);
+            SyncTxPayloadFromAtomicsLocked();
+            payload = g_txPayload;
+        }
+        if (!payload.empty()) {
+            (void)BuildAudioMarkPacket(payload, next);
+        }
+    }
+
+    std::uint64_t tmp[kAudioSnapWords]{};
+    std::memcpy(tmp, &next, sizeof(AudioMarkPacket));
+
+    std::lock_guard<std::mutex> pubLk(g_audioPubMx);
+    const std::uint32_t seq = g_audioSnapSeq.load(std::memory_order_relaxed);
+    g_audioSnapSeq.store(seq + 1U, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_release);
+    for (std::size_t i = 0U; i < kAudioSnapWords; ++i) {
+        g_audioSnapWords[i].store(tmp[i], std::memory_order_relaxed);
+    }
+    g_audioSnapBuiltActive.store(shouldBeActive, std::memory_order_release);
+    g_audioSnapDirty.store(false, std::memory_order_release);
+    g_audioSnapSeq.store(seq + 2U, std::memory_order_release);
+}
+
+bool GetCurrentAudioMarkPacket(AudioMarkPacket& out, bool* outBusy) noexcept {
+    out = AudioMarkPacket{};
+    if (outBusy) *outBusy = false;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const std::uint32_t s1 = g_audioSnapSeq.load(std::memory_order_acquire);
+        if ((s1 & 1U) != 0U) {
+            ::YieldProcessor();
+            continue;
+        }
+        std::uint64_t tmp[kAudioSnapWords]{};
+        for (std::size_t i = 0U; i < kAudioSnapWords; ++i) {
+            tmp[i] = g_audioSnapWords[i].load(std::memory_order_relaxed);
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const std::uint32_t s2 = g_audioSnapSeq.load(std::memory_order_acquire);
+        if (s1 == s2) {
+            std::memcpy(&out, tmp, sizeof(AudioMarkPacket));
+            return out.active && out.slotCount > 0U;
+        }
+        ::YieldProcessor();
+    }
+    if (outBusy) *outBusy = true;
+    return false;
+}
+
 DiagSnapshot GetDiagSnapshot() noexcept {
     std::uint64_t words[kTaintWords]{};
     for (std::size_t i = 0U; i < kTaintWords; ++i) {
@@ -1025,35 +1143,35 @@ void TickOnMainThread(std::uintptr_t exeBase) noexcept {
             g_lastQuestElapsed = 0;
         }
 
-        if (!okRead || (!checkOn && !selfCheckOn)) {
-            return;
-        }
+        if (okRead && (checkOn || selfCheckOn)) {
+            int remoteCounter = 1;
+            for (std::size_t idx = 0U; idx < playerCount; ++idx) {
+                const ObservedPlayer& p = players[idx];
+                if (p.isLocal) {
+                    if (!selfCheckOn) continue;
+                } else {
+                    if (!checkOn) continue;
+                }
+                const int fallbackSlot = p.isLocal ? 0 : (remoteCounter++);
+                PlayerDecoderSlot* slot = FindOrAllocSlotLocked(p.entityPtr, p.isLocal, tickSeq);
+                if (!slot) continue;
 
-        int remoteCounter = 1;
-        for (std::size_t idx = 0U; idx < playerCount; ++idx) {
-            const ObservedPlayer& p = players[idx];
-            if (p.isLocal) {
-                if (!selfCheckOn) continue;
-            } else {
-                if (!checkOn) continue;
+                if (p.seed27 != 0U && p.seed27 != slot->lastSeed27) {
+                    const std::string playerName = ResolvePlayerName(
+                        exeBase, p.isLocal, p.questIdx, p.lobbyIdx, fallbackSlot);
+                    ProcessFrameOnSlotLocked(*slot, p.seed27, playerName, alerts);
+                }
             }
-            const int fallbackSlot = p.isLocal ? 0 : (remoteCounter++);
-            PlayerDecoderSlot* slot = FindOrAllocSlotLocked(p.entityPtr, p.isLocal, tickSeq);
-            if (!slot) continue;
 
-            if (p.seed27 != 0U && p.seed27 != slot->lastSeed27) {
-                const std::string playerName = ResolvePlayerName(
-                    exeBase, p.isLocal, p.questIdx, p.lobbyIdx, fallbackSlot);
-                ProcessFrameOnSlotLocked(*slot, p.seed27, playerName, alerts);
-            }
-        }
-
-        for (auto& s : g_rxSlots) {
-            if (s.active && (tickSeq - s.lastSeenTick) > kStaleTickLimit) {
-                s.ClearSlot();
+            for (auto& s : g_rxSlots) {
+                if (s.active && (tickSeq - s.lastSeenTick) > kStaleTickLimit) {
+                    s.ClearSlot();
+                }
             }
         }
     }
+
+    RefreshAudioMarkSnapshot();
 
     if (alerts.empty()) return;
     const AlertSinkFn sink = g_alertSink.load(std::memory_order_acquire);
