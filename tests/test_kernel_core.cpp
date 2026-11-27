@@ -1062,6 +1062,78 @@ bool RunSuite_KernelBeacon(TestEnv& env) {
         }
     }
 
+    // 3a-solo. Verify solo online gate: `MaybeEncodeCritSeed` MUST NOT mutate crit seeds in a
+    //          1-player solo online session (`HasRemotePlayer()==false`, `selfCheck==false`),
+    //          while video/audio watermarks remain active, AND MUST encode when a remote player
+    //          joins (multiplayer/SOS) OR when `selfCheck==true`!
+    {
+        MhwRngPluginId sizeId = 0U;
+        for (const auto& p : plugin_host::ListLoadedPlugins()) {
+            if (p.shortName == "size") sizeId = p.id;
+        }
+        peer_beacon::ClearAllTaint();
+        peer_beacon::MarkTainted(sizeId);
+        peer_beacon::SetSelfCheckEnabled(false);
+        fakeSessionInner[mhw::kOffNetSessionOnlineByte] = 1U;
+
+        // Case 1: Solo online session (no remote player) -> crit seed MUST pass through untouched
+        setPlayerSlot(1U, 0ULL, -1);
+        peer_beacon::TickOnMainThread(base);
+        if (peer_beacon::HasRemotePlayer()) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-SoloGate]: expected HasRemotePlayer()==false in solo session\n");
+            return false;
+        }
+        const std::uint32_t kRawSeed = 0xA5123456U;
+        const std::uint32_t soloOut  = peer_beacon::MaybeEncodeCritSeed(base, mhw::kRvaCritSeedSite, kRawSeed);
+        if (soloOut != kRawSeed) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-SoloGate]: solo online crit seed mutated (0x%08X -> 0x%08X)\n",
+                        kRawSeed, soloOut);
+            return false;
+        }
+        // Video & audio watermarks MUST remain active in solo tainted scene!
+        peer_beacon::AudioMarkPacket soloAud{};
+        if (!peer_beacon::IsVideoMarkActive() || !peer_beacon::GetCurrentAudioMarkPacket(soloAud) || !soloAud.active) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-SoloGate]: video/audio watermark unexpectedly disabled in solo\n");
+            return false;
+        }
+
+        // Case 2: Multiplayer / mid-quest SOS join (remote player appears) -> MUST encode valid beacon
+        setPlayerSlot(1U, reinterpret_cast<std::uintptr_t>(fakeRemoteUPlayer.data()), 1);
+        peer_beacon::TickOnMainThread(base);
+        if (!peer_beacon::HasRemotePlayer()) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-CoopGate]: expected HasRemotePlayer()==true with remote player\n");
+            return false;
+        }
+        const std::uint32_t coopOut = peer_beacon::MaybeEncodeCritSeed(base, mhw::kRvaCritSeedSite, kRawSeed);
+        std::uint8_t cg = 0U, cp = 0U, cs = 0U;
+        if (coopOut == kRawSeed || !peer_beacon::UnpackFrame27(coopOut & 0x07FFFFFFU, cg, cp, cs)) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-CoopGate]: multiplayer crit seed failed beacon encode (0x%08X)\n", coopOut);
+            return false;
+        }
+
+        // Case 3: Solo + `selfCheck==true` -> MUST still encode valid beacon even with 0 remote players
+        setPlayerSlot(1U, 0ULL, -1);
+        peer_beacon::TickOnMainThread(base);
+        peer_beacon::SetSelfCheckEnabled(true);
+        const std::uint32_t selfOut = peer_beacon::MaybeEncodeCritSeed(base, mhw::kRvaCritSeedSite, kRawSeed);
+        if (selfOut == kRawSeed || !peer_beacon::UnpackFrame27(selfOut & 0x07FFFFFFU, cg, cp, cs)) {
+            cleanupSynth();
+            std::printf("FAIL [Beacon-SelfGate]: selfCheck solo crit seed failed beacon encode (0x%08X)\n", selfOut);
+            return false;
+        }
+
+        // Restore synthetic remote slot & flags for subsequent checks
+        peer_beacon::SetSelfCheckEnabled(false);
+        peer_beacon::ClearAllTaint();
+        setPlayerSlot(1U, reinterpret_cast<std::uintptr_t>(fakeRemoteUPlayer.data()), 1);
+        peer_beacon::TickOnMainThread(base);
+    }
+
     // 3b. Synthetic sQuest boundary & in-place restart reset (without clearing spawn-time taint!)
     {
         std::vector<std::uint8_t> fakeQuest(0x14000U, 0U);

@@ -78,6 +78,7 @@ struct PendingAlert {
 std::atomic<bool>          g_checkEnabled{true};
 std::atomic<bool>          g_selfCheckEnabled{false};
 std::atomic<bool>          g_inScene{false};
+std::atomic<bool>          g_hasRemotePlayer{false};
 std::atomic<bool>          g_wmDebugVisible{false};
 std::atomic<AlertSinkFn>   g_alertSink{nullptr};
 std::atomic<std::uint64_t> g_taintWords[kTaintWords]{};
@@ -657,6 +658,7 @@ void Init(bool checkEnabled, bool selfCheckEnabled, AlertSinkFn alertSink) noexc
     g_checkEnabled.store(checkEnabled, std::memory_order_release);
     g_selfCheckEnabled.store(selfCheckEnabled, std::memory_order_release);
     g_inScene.store(false, std::memory_order_release);
+    g_hasRemotePlayer.store(false, std::memory_order_release);
     g_wmDebugVisible.store(false, std::memory_order_release);
     g_alertSink.store(alertSink, std::memory_order_release);
     g_txFrameCount.store(0U, std::memory_order_relaxed);
@@ -725,6 +727,10 @@ bool IsInScene() noexcept {
     return g_inScene.load(std::memory_order_acquire);
 }
 
+bool HasRemotePlayer() noexcept {
+    return g_hasRemotePlayer.load(std::memory_order_acquire);
+}
+
 bool IsVideoMarkActive() noexcept {
     return IsInScene() && HasAnyTaint();
 }
@@ -739,6 +745,7 @@ bool IsVideoMarkDebugVisible() noexcept {
 
 void ResetDecoders() noexcept {
     g_rxLocalFrameCount.store(0U, std::memory_order_relaxed);
+    g_hasRemotePlayer.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> lk(g_rxMx);
     for (auto& s : g_rxSlots) {
         s.ClearSlot();
@@ -849,7 +856,9 @@ std::uint32_t MaybeEncodeCritSeed(std::uintptr_t exeBase,
     if (callSiteRva != mhw::kRvaCritSeedSite || !HasAnyTaint()) {
         return rawValue;
     }
-    const bool emitAllowed = g_selfCheckEnabled.load(std::memory_order_relaxed) || IsOnlineSessionSEH(exeBase);
+    const bool emitAllowed =
+        g_selfCheckEnabled.load(std::memory_order_relaxed) ||
+        (IsOnlineSessionSEH(exeBase) && g_hasRemotePlayer.load(std::memory_order_relaxed));
     if (!emitAllowed) {
         return rawValue;
     }
@@ -1098,6 +1107,16 @@ void TickOnMainThread(std::uintptr_t exeBase) noexcept {
     std::uintptr_t curLocalEntity = 0;
     const bool okRead = CollectPlayers(exeBase, players, playerCount, curLocalEntity);
     g_inScene.store(okRead && curLocalEntity != 0ULL, std::memory_order_release);
+    bool hasRemote = false;
+    if (okRead) {
+        for (std::size_t idx = 0U; idx < playerCount; ++idx) {
+            if (!players[idx].isLocal) {
+                hasRemote = true;
+                break;
+            }
+        }
+    }
+    g_hasRemotePlayer.store(hasRemote, std::memory_order_release);
 
     bool curInQuest = false;
     std::uint32_t curQuestId = 0U;

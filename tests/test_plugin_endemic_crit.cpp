@@ -285,6 +285,58 @@ bool RunSuite_PluginCrit(TestEnv& env) {
                 std::printf("FAIL [crit-seed27]: s27=0x%X s32=0x%X\n", s27, s32);
                 return false;
             }
+
+            // (b2) `kVanilla` (`crit off`) & `kObserve` (`crit observe`) under `kMhwRngModeTakeover` MUST
+            //      return `kMhwRngActionContinue` (deterministic MasterDerived seed, immune to vanilla sInst),
+            //      while `kMhwRngModeSelective` stays `kMhwRngActionBypass` (advances vanilla sInst).
+            img[0x01F606EFU] = 0xC3;
+            ::FlushInstructionCache(::GetCurrentProcess(), img + 0x01F606EFU, 1);
+
+            const std::uint32_t prevMode = host->GetEngineMode();
+            host->SetEngineMode(kMhwRngModeTakeover);
+            for (const char* subMode : {"off", "observe"}) {
+                plugin_host::DispatchPluginSubcommand("crit", {subMode}, subMode);
+                host->ResetEpoch();
+                fnSeedCall(fakeLocalPlayer, img + 0x01F606C1U);
+                const std::uint32_t a1 = *reinterpret_cast<const std::uint32_t*>(fakeLocalPlayer + 0x8818U);
+                fnSeedCall(fakeLocalPlayer, img + 0x01F606C1U);
+                const std::uint32_t a2 = *reinterpret_cast<const std::uint32_t*>(fakeLocalPlayer + 0x8818U);
+
+                // Perturb vanilla `MtRandom::sInstance` to prove TAKEOVER does not bypass to vanilla!
+                sInst[0] ^= 0x13579BDFU;
+                sInst[1] ^= 0x2468ACE0U;
+                host->ResetEpoch();
+                fnSeedCall(fakeLocalPlayer, img + 0x01F606C1U);
+                const std::uint32_t b1 = *reinterpret_cast<const std::uint32_t*>(fakeLocalPlayer + 0x8818U);
+                fnSeedCall(fakeLocalPlayer, img + 0x01F606C1U);
+                const std::uint32_t b2 = *reinterpret_cast<const std::uint32_t*>(fakeLocalPlayer + 0x8818U);
+                if (a1 != b1 || a2 != b2) {
+                    img[0x01F606EFU] = origSeedEnd;
+                    ::FlushInstructionCache(::GetCurrentProcess(), img + 0x01F606EFU, 1);
+                    restoreCritTestMem();
+                    std::printf("FAIL [crit-takeover-%s]: non-deterministic seed (0x%X,0x%X vs 0x%X,0x%X)\n",
+                                subMode, a1, a2, b1, b2);
+                    return false;
+                }
+            }
+
+            // In SELECTIVE mode with `crit off`, `OnCritSeedPre` MUST still bypass to vanilla `MtRandom::sInstance`
+            host->SetEngineMode(kMhwRngModeSelective);
+            plugin_host::DispatchPluginSubcommand("crit", {"off"}, "off");
+            const std::uint32_t sBefore[4] = {sInst[0], sInst[1], sInst[2], sInst[3]};
+            fnSeedCall(fakeLocalPlayer, img + 0x01F606C1U);
+            const bool vanillaStepped = (sInst[0] != sBefore[0] || sInst[1] != sBefore[1] ||
+                                         sInst[2] != sBefore[2] || sInst[3] != sBefore[3]);
+
+            img[0x01F606EFU] = origSeedEnd;
+            ::FlushInstructionCache(::GetCurrentProcess(), img + 0x01F606EFU, 1);
+            host->SetEngineMode(prevMode);
+            plugin_host::DispatchPluginSubcommand("crit", {"random"}, "random");
+            if (!vanillaStepped) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-selective-bypass]: expected vanilla sInst advance in SELECTIVE + crit off\n");
+                return false;
+            }
         }
 
         // (c) `rate +100 / 0 / -100` overrides + `rate auto` (`force100Crit=1`)

@@ -52,6 +52,7 @@ void ClearTainted(MhwRngPluginId ownerId) noexcept;
 void ClearAllTaint() noexcept;
 bool HasAnyTaint() noexcept;
 bool IsInScene() noexcept;
+bool HasRemotePlayer() noexcept;
 bool IsVideoMarkActive() noexcept;
 void SetVideoMarkDebugVisible(bool visible) noexcept;
 bool IsVideoMarkDebugVisible() noexcept;
