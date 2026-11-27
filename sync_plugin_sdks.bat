@@ -40,4 +40,22 @@ for %%P in (size inspector endemic thk crit) do (
     )
 )
 
+if exist "%ROOT%plugins\thk" (
+    copy /y "%INC%\mhw_thk_api.h" "%ROOT%plugins\thk\include\mhw_thk_api.h" >nul
+    if errorlevel 1 (
+        echo ERROR: Failed to sync mhw_thk_api.h to plugins\thk\include\
+        exit /b 1
+    )
+    echo [sync] Updated plugins\thk\include\mhw_thk_api.h
+)
+
+if exist "%ROOT%plugins\crit" (
+    copy /y "%INC%\mhw_crit_api.h" "%ROOT%plugins\crit\include\mhw_crit_api.h" >nul
+    if errorlevel 1 (
+        echo ERROR: Failed to sync mhw_crit_api.h to plugins\crit\include\
+        exit /b 1
+    )
+    echo [sync] Updated plugins\crit\include\mhw_crit_api.h
+)
+
 exit /b 0

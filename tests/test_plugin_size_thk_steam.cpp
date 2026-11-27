@@ -782,6 +782,179 @@ bool RunSuite_PluginThk(TestEnv& env) {
         }
         *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 101U;
 
+        // (7) Companion Service `"mhw.thk"` v1: SHA-256, preset body, disabled tags, custom cmds, in-memory ApplyConfig
+        {
+            const MhwRngHostApi* host = MhwRng_GetHostApi();
+            MhwRngServiceGuard<MhwThkServiceApi> thkSvc(host, kMhwThkServiceName, kMhwThkApiVersion);
+            if (!thkSvc || thkSvc->structSize != sizeof(MhwThkServiceApi) ||
+                thkSvc->apiVersion != kMhwThkApiVersion ||
+                !thkSvc->GetTotalDecisions || !thkSvc->GetConfigSnapshot || !thkSvc->ApplyConfig) {
+                std::printf("FAIL [thk-svc]: service `mhw.thk` v1 missing or invalid!\n");
+                return false;
+            }
+
+            plugin_host::DispatchPluginSubcommand("thk", {"clear"}, "clear");
+            plugin_host::DispatchPluginSubcommand("thk", {"reset"}, "reset");
+            if (thkSvc->GetTotalDecisions() != 0ULL) {
+                std::printf("FAIL [thk-svc]: expected 0 decisions after reset, got %llu\n",
+                            static_cast<unsigned long long>(thkSvc->GetTotalDecisions()));
+                return false;
+            }
+
+            // Load fatalis_p1_nasty, toggle tag, add/delete/re-add custom rules & seq
+            plugin_host::DispatchPluginSubcommand("thk", {"preset", "load", "fatalis_p1_nasty"}, "preset load fatalis_p1_nasty");
+            plugin_host::DispatchPluginSubcommand("thk", {"preset", "tag", "bipedal_lock", "on"}, "preset tag bipedal_lock on");
+            plugin_host::DispatchPluginSubcommand("thk", {"rule", "add", "91", "12", "1", "55:297", "after=2", "until=3"},
+                                                 "rule add 91 12 1 55:297 after=2 until=3");
+            plugin_host::DispatchPluginSubcommand("thk", {"seq", "91", "12", "1", "55:172,55:185", "loop"},
+                                                 "seq 91 12 1 55:172,55:185 loop");
+            // Delete the first rule added above (#7 since `nextCustomRuleId` is monotonic across earlier subtests)
+            plugin_host::DispatchPluginSubcommand("thk", {"rule", "del", "7"}, "rule del 7");
+            plugin_host::DispatchPluginSubcommand("thk", {"rule", "add", "91", "12", "1", "55:297", "label=two words"},
+                                                 "rule add 91 12 1 55:297 label=\"two words\"");
+
+            // Probe buffer sizes first
+            char pName[128]{}, pSha[65]{}, pTags[256]{};
+            std::size_t bodyNeed = 0U, cmdsNeed = 0U;
+            if (!thkSvc->GetConfigSnapshot(pName, sizeof(pName), pSha, sizeof(pSha), pTags, sizeof(pTags),
+                                           nullptr, 0U, &bodyNeed, nullptr, 0U, &cmdsNeed)) {
+                std::printf("FAIL [thk-svc]: probe GetConfigSnapshot failed!\n");
+                return false;
+            }
+            if (std::string(pName) != "fatalis_p1_nasty" || std::strlen(pSha) != 64U ||
+                std::string(pTags) != "far_multi" || bodyNeed < 100U || cmdsNeed < 20U) {
+                std::printf("FAIL [thk-svc]: unexpected probe snapshot name='%s' shaLen=%zu tags='%s' bodyNeed=%zu cmdsNeed=%zu\n",
+                            pName, std::strlen(pSha), pTags, bodyNeed, cmdsNeed);
+                return false;
+            }
+
+            // Verify small buffer returns false, NUL-terminates, and still fills exact need
+            char tinyBuf[8]{};
+            std::size_t tinyNeed = 0U;
+            const bool tinyOk = thkSvc->GetConfigSnapshot(nullptr, 0U, nullptr, 0U, nullptr, 0U,
+                                                          tinyBuf, sizeof(tinyBuf), &tinyNeed,
+                                                          nullptr, 0U, nullptr);
+            if (tinyOk || tinyNeed != bodyNeed || tinyBuf[sizeof(tinyBuf) - 1U] != '\0') {
+                std::printf("FAIL [thk-svc]: small buffer probe check failed (ok=%d need=%zu exp=%zu)\n",
+                            tinyOk ? 1 : 0, tinyNeed, bodyNeed);
+                return false;
+            }
+
+            // Full fetch
+            std::vector<char> bodyBuf(bodyNeed, '\0');
+            std::vector<char> cmdsBuf(cmdsNeed, '\0');
+            if (!thkSvc->GetConfigSnapshot(pName, sizeof(pName), pSha, sizeof(pSha), pTags, sizeof(pTags),
+                                           bodyBuf.data(), bodyBuf.size(), &bodyNeed,
+                                           cmdsBuf.data(), cmdsBuf.size(), &cmdsNeed)) {
+                std::printf("FAIL [thk-svc]: full GetConfigSnapshot failed!\n");
+                return false;
+            }
+            const std::string expectedCmds =
+                "seq 91 12 1 55:172,55:185 loop\n"
+                "rule add 91 12 1 55:297 \"label=two words\"";
+            if (std::string(cmdsBuf.data()) != expectedCmds) {
+                std::printf("FAIL [thk-svc]: custom cmds mismatch:\n  got: '%s'\n  exp: '%s'\n",
+                            cmdsBuf.data(), expectedCmds.c_str());
+                return false;
+            }
+
+            // In-memory custom preset + disabled tags + custom seq ApplyConfig (must be quiet & never touch disk!)
+            const std::string customPresetBody =
+                "name = inmem_custom_test\n"
+                "disable_tag = opt_off\n"
+                "rule mon=91 d=0 f=0 node=12 seg0=1 -> 55:185 tag=opt_off\n"
+                "rule mon=91 d=0 f=0 node=12 seg0=1 -> 55:297 tag=active_rule\n";
+            const std::string customReplayCmds =
+                "# comment ignored\n"
+                "seq 91 12 1 55:172,55:185 loop\n";
+
+            g_capturedChatLines.clear();
+            char errBuf[256]{};
+            if (!thkSvc->ApplyConfig("inmem_custom_test", customPresetBody.c_str(), "opt_off",
+                                     customReplayCmds.c_str(), errBuf, sizeof(errBuf))) {
+                std::printf("FAIL [thk-svc]: in-memory ApplyConfig failed: %s\n", errBuf);
+                return false;
+            }
+            if (!g_capturedChatLines.empty()) {
+                std::printf("FAIL [thk-svc]: ApplyConfig emitted unexpected chat spam (%zu lines)!\n",
+                            g_capturedChatLines.size());
+                return false;
+            }
+
+            // Confirm no disk file was created in `thk_presets\`
+            const std::string forbiddenDiskPath = plugDir + "\\thk_presets\\inmem_custom_test.txt";
+            if (::GetFileAttributesA(forbiddenDiskPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                std::printf("FAIL [thk-svc]: in-memory ApplyConfig unexpectedly wrote disk file %s!\n",
+                            forbiddenDiskPath.c_str());
+                return false;
+            }
+
+            // Snapshot must match verbatim in-memory body + canonical cmds + SHA-256
+            std::size_t mBodyNeed = 0U, mCmdsNeed = 0U;
+            if (!thkSvc->GetConfigSnapshot(pName, sizeof(pName), pSha, sizeof(pSha), pTags, sizeof(pTags),
+                                           nullptr, 0U, &mBodyNeed, nullptr, 0U, &mCmdsNeed)) {
+                std::printf("FAIL [thk-svc]: post-ApplyConfig probe failed!\n");
+                return false;
+            }
+            std::vector<char> mBody(mBodyNeed, '\0');
+            std::vector<char> mCmds(mCmdsNeed, '\0');
+            if (!thkSvc->GetConfigSnapshot(pName, sizeof(pName), pSha, sizeof(pSha), pTags, sizeof(pTags),
+                                           mBody.data(), mBody.size(), &mBodyNeed,
+                                           mCmds.data(), mCmds.size(), &mCmdsNeed) ||
+                std::string(pName) != "inmem_custom_test" ||
+                std::strlen(pSha) != 64U ||
+                std::string(pTags) != "opt_off" ||
+                std::string(mBody.data()) != customPresetBody ||
+                std::string(mCmds.data()) != "seq 91 12 1 55:172,55:185 loop") {
+                std::printf("FAIL [thk-svc]: post-ApplyConfig snapshot mismatch (name='%s' tags='%s' cmds='%s')\n",
+                            pName, pTags, mCmds.data());
+                return false;
+            }
+
+            // Verify live behavior & GetTotalDecisions()
+            *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 91U;
+            if (runThkNode(true, 0, 0, -1, 1, node12) != 1 ||
+                runThkNode(true, 0, 0, -1, 1, node12) != 2 ||
+                runThkNode(true, 0, 0, -1, 1, node12) != 1 ||
+                thkSvc->GetTotalDecisions() != 3ULL) {
+                std::printf("FAIL [thk-svc]: live in-memory seq/decisions check failed (dec=%llu)\n",
+                            static_cast<unsigned long long>(thkSvc->GetTotalDecisions()));
+                return false;
+            }
+
+            // Error isolation: malformed custom cmd must fail without mutating active state!
+            if (thkSvc->ApplyConfig("bad_preset", "rule mon=91 bad_key=1 -> 55:172\n", nullptr, nullptr,
+                                    errBuf, sizeof(errBuf)) || errBuf[0] == '\0') {
+                std::printf("FAIL [thk-svc]: invalid preset body unexpectedly succeeded!\n");
+                return false;
+            }
+            if (thkSvc->ApplyConfig(nullptr, nullptr, nullptr, "not_a_cmd 1 2 3",
+                                    errBuf, sizeof(errBuf)) || errBuf[0] == '\0') {
+                std::printf("FAIL [thk-svc]: invalid custom cmd unexpectedly succeeded!\n");
+                return false;
+            }
+            if (!thkSvc->GetConfigSnapshot(pName, sizeof(pName), nullptr, 0U, nullptr, 0U,
+                                           nullptr, 0U, nullptr, nullptr, 0U, nullptr) ||
+                std::string(pName) != "inmem_custom_test") {
+                std::printf("FAIL [thk-svc]: failed ApplyConfig mutated previous preset name to '%s'!\n", pName);
+                return false;
+            }
+
+            // Empty ApplyConfig clears state & preserves TAKEOVER mode (never forces OFF!)
+            const std::uint32_t prevMode = host->GetEngineMode();
+            host->SetEngineMode(kMhwRngModeTakeover);
+            if (!thkSvc->ApplyConfig("", nullptr, "", "", errBuf, sizeof(errBuf)) ||
+                host->GetEngineMode() != kMhwRngModeTakeover ||
+                thkSvc->GetTotalDecisions() != 0ULL) {
+                host->SetEngineMode(prevMode);
+                std::printf("FAIL [thk-svc]: empty ApplyConfig failed or clobbered TAKEOVER mode!\n");
+                return false;
+            }
+            host->SetEngineMode(prevMode);
+            *reinterpret_cast<std::uint32_t*>(monFatalis + 0x12280U) = 101U;
+            std::printf("[OK] Companion service `mhw.thk` v1 (SHA-256, body/tags/cmds snapshot, in-memory ApplyConfig, error isolation) verified!\n");
+        }
+
         plugin_host::DispatchPluginSubcommand("thk", {"clear"}, "clear");
         std::printf("[OK] Generic THK probe/counter/sequence/weighted/preset/auto-reset engine verified on real 0x14132B838 machine code!\n");
     }

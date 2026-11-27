@@ -576,6 +576,121 @@ bool RunSuite_PluginCrit(TestEnv& env) {
             return false;
         }
 
+        // (i2) Companion Service `"mhw.crit"` v1: GetTotalHits, GetConfigSnapshot & ApplyConfig across all 8 modes
+        {
+            MhwRngServiceGuard<MhwCritServiceApi> critSvc(host, kMhwCritServiceName, kMhwCritApiVersion);
+            if (!critSvc || critSvc->structSize != sizeof(MhwCritServiceApi) ||
+                critSvc->apiVersion != kMhwCritApiVersion ||
+                !critSvc->GetTotalHits || !critSvc->GetConfigSnapshot || !critSvc->ApplyConfig) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-svc]: service `mhw.crit` v1 missing or invalid!\n");
+                return false;
+            }
+            if (critSvc->GetTotalHits() == 0ULL) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-svc]: expected non-zero GetTotalHits before ApplyConfig reset!\n");
+                return false;
+            }
+
+            struct CritCase {
+                const char* modeIn;
+                const char* rateIn;
+                const char* modeExp;
+                const char* rateExp;
+            };
+            static constexpr CritCase kCases[] = {
+                { "vanilla",                            "auto", "vanilla",                            "auto" },
+                { "vanilla",                            "50",   "vanilla",                            "50"   },
+                { "observe",                            "auto", "observe",                            "auto" },
+                { "random",                             "75",   "random",                             "75"   },
+                { "ratio 3:2 block",                    "auto", "ratio 3:2 block",                    "auto" },
+                { "ratio 3:2 spread",                   "-30",  "ratio 3:2 spread",                   "-30"  },
+                { "seq 10-1",                           "auto", "seq 10-1",                           "auto" },
+                { "mv_bank 50 1.5",                     "50",   "mv_bank 50 1.5",                     "50"   },
+                { "mv_tier 25 60 delta=-50,0,50",       "50",   "mv_tier 25 60 delta=-50,0,50",       "50"   },
+                { "mv_tier 50 125 200 rate=0,100,0,100","auto", "mv_tier 50 125 200 rate=0,100,0,100","auto" },
+                { "bag 12",                             "35",   "bag 12",                             "35"   },
+                { "prd",                                "25",   "prd",                                "25"   },
+            };
+
+            g_capturedChatLines.clear();
+            char errBuf[256]{};
+            char modeOut[256]{};
+            char rateOut[32]{};
+            for (const auto& tc : kCases) {
+                if (!critSvc->ApplyConfig(tc.modeIn, tc.rateIn, errBuf, sizeof(errBuf))) {
+                    restoreCritTestMem();
+                    std::printf("FAIL [crit-svc]: ApplyConfig('%s','%s') failed: %s\n", tc.modeIn, tc.rateIn, errBuf);
+                    return false;
+                }
+                if (critSvc->GetTotalHits() != 0ULL) {
+                    restoreCritTestMem();
+                    std::printf("FAIL [crit-svc]: ApplyConfig('%s') did not reset totalHits!\n", tc.modeIn);
+                    return false;
+                }
+                if (!critSvc->GetConfigSnapshot(modeOut, sizeof(modeOut), rateOut, sizeof(rateOut)) ||
+                    std::string(modeOut) != tc.modeExp || std::string(rateOut) != tc.rateExp) {
+                    restoreCritTestMem();
+                    std::printf("FAIL [crit-svc]: snapshot mismatch for ('%s','%s'): got ('%s','%s') exp ('%s','%s')\n",
+                                tc.modeIn, tc.rateIn, modeOut, rateOut, tc.modeExp, tc.rateExp);
+                    return false;
+                }
+            }
+            if (!g_capturedChatLines.empty()) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-svc]: ApplyConfig emitted unexpected chat spam (%zu lines)!\n",
+                            g_capturedChatLines.size());
+                return false;
+            }
+
+            // Live hit verification after ApplyConfig("seq 10-1", "auto")
+            if (!critSvc->ApplyConfig("seq 10-1", "auto", errBuf, sizeof(errBuf))) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-svc]: ApplyConfig seq 10-1 failed: %s\n", errBuf);
+                return false;
+            }
+            static constexpr std::int8_t kExpSvcSeq[4] = { 1, 0, -1, 1 };
+            for (int i = 0; i < 4; ++i) {
+                runHit(&ctxLocal, 50.0f, 0U, res, mv);
+                if (res != kExpSvcSeq[i]) {
+                    restoreCritTestMem();
+                    std::printf("FAIL [crit-svc]: seq hit %d got %d exp %d\n", i, res, kExpSvcSeq[i]);
+                    return false;
+                }
+            }
+            if (critSvc->GetTotalHits() != 4ULL) {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-svc]: expected GetTotalHits()==4, got %llu\n",
+                            static_cast<unsigned long long>(critSvc->GetTotalHits()));
+                return false;
+            }
+
+            // Error isolation: invalid rate & invalid modes must fail without mutating active ("seq 10-1", "auto")
+            if (critSvc->ApplyConfig("random", "200", errBuf, sizeof(errBuf)) || errBuf[0] == '\0' ||
+                critSvc->ApplyConfig("bogus_mode", "auto", errBuf, sizeof(errBuf)) || errBuf[0] == '\0' ||
+                critSvc->ApplyConfig("mv_tier 50 25", "auto", errBuf, sizeof(errBuf)) || errBuf[0] == '\0' ||
+                critSvc->ApplyConfig("mv_tier 50 delta=1,2,3", "auto", errBuf, sizeof(errBuf)) || errBuf[0] == '\0') {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-svc]: invalid ApplyConfig unexpectedly succeeded!\n");
+                return false;
+            }
+            if (!critSvc->GetConfigSnapshot(modeOut, sizeof(modeOut), rateOut, sizeof(rateOut)) ||
+                std::string(modeOut) != "seq 10-1" || std::string(rateOut) != "auto") {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-svc]: failed ApplyConfig mutated active state to ('%s','%s')!\n", modeOut, rateOut);
+                return false;
+            }
+            // Small buffer check
+            char smallMode[4]{};
+            if (critSvc->GetConfigSnapshot(smallMode, sizeof(smallMode), rateOut, sizeof(rateOut)) ||
+                smallMode[sizeof(smallMode) - 1U] != '\0') {
+                restoreCritTestMem();
+                std::printf("FAIL [crit-svc]: small buffer check failed!\n");
+                return false;
+            }
+            std::printf("[OK] Companion service `mhw.crit` v1 (all 8 modes + rate round-trip, GetTotalHits, error isolation) verified!\n");
+        }
+
         // (j) Hot-unload restores exact 5-byte prologue & hot-reload re-hooks cleanly
         std::string critMsg;
         if (!plugin_host::UnloadSingle("crit", critMsg) ||
@@ -584,9 +699,20 @@ bool RunSuite_PluginCrit(TestEnv& env) {
             std::printf("FAIL [crit-unload]: prologue at 0x01F51380 not restored (%s)\n", critMsg.c_str());
             return false;
         }
+        std::uint64_t dummyHits = 0ULL;
+        if (MhwCrit_TryGetTotalHits(host, &dummyHits)) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-unload]: service `mhw.crit` remained registered after unload!\n");
+            return false;
+        }
         if (!plugin_host::LoadOrReloadSingle("crit", critMsg) || img[0x01F51380U] != 0xE9U) {
             restoreCritTestMem();
             std::printf("FAIL [crit-reload]: failed to re-hook 0x01F51380 (%s)\n", critMsg.c_str());
+            return false;
+        }
+        if (!MhwCrit_TryGetTotalHits(host, &dummyHits)) {
+            restoreCritTestMem();
+            std::printf("FAIL [crit-reload]: service `mhw.crit` not re-registered after reload!\n");
             return false;
         }
 

@@ -13,6 +13,8 @@
 #include "mhw_1523_world.h"
 #include "mhw_world_api.h"
 #include "mhw_catalog_api.h"
+#include "mhw_thk_api.h"
+#include "mhw_crit_api.h"
 #include "peer_beacon.h"
 #include "plugin_host.h"
 #include "rng_engine.h"
